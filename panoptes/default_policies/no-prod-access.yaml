@@ -1,0 +1,19 @@
+# Block tool calls that access production configurations
+name: "no-prod-access"
+description: "Block tool calls that access production configs"
+enabled: true
+scope:
+  agents: ["hermes", "claude_code", "codex"]
+  sessions: []
+rule:
+  event_type: "tool_call"
+  conditions:
+    - field: "action.data_accessed"
+      operator: "contains"
+      value: "prod"
+    - field: "action.tool_name"
+      operator: "in"
+      value: ["terminal", "write_file", "browser_navigate"]
+  logic: "AND"
+action: block
+message: "Production access blocked by policy 'no-prod-access'. Request approval first."
