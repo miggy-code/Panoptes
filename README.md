@@ -7,9 +7,9 @@
 
 ---
 
-Panoptes watches your AI agents and tells you what they actually did — every tool call, every file read, every shell command, every decision. It captures agent activity across multiple agent frameworks into a single, queryable audit trail, and can **block dangerous actions before they execute** via configurable policies.
+Panoptes watches your AI agents and tells you what they actually did. Recording every tool call, every file read, every shell command, every decision. It captures agent activity across multiple agent frameworks into a single, queryable audit trail, and can also **block dangerous actions before they execute** via configurable policies.
 
-Named after [Argos Panoptes](https://en.wikipedia.org/wiki/Argus_Panoptes), the all-seeing giant of Greek mythology with a hundred eyes — because your agents need a watcher that never blinks.
+Named after [Panoptes](https://en.wikipedia.org/wiki/Argus_Panoptes), the all-seeing giant of Greek mythology with a hundred eyes, because your agents need a watcher that never blinks.
 
 ## Why
 
