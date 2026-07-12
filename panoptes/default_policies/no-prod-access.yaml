@@ -1,6 +1,12 @@
-# Block tool calls that access production configurations
+# Block any tool call whose resolved data_accessed includes production resources.
+# data_accessed is automatically derived by normalize_event from command strings,
+# file paths, and URLs in action.parameters and action.target — so this policy
+# fires on real agent events without manual tagging.
 name: "no-prod-access"
-description: "Block tool calls that access production configs"
+description: >
+  Block tool calls that touch production resources (detected via data_accessed
+  classification). Applies to all tool_call events where the classifier tagged
+  the command or file path with 'prod', regardless of which tool was used.
 enabled: true
 scope:
   agents: ["hermes", "claude_code", "codex"]
@@ -11,9 +17,6 @@ rule:
     - field: "action.data_accessed"
       operator: "contains"
       value: "prod"
-    - field: "action.tool_name"
-      operator: "in"
-      value: ["terminal", "write_file", "browser_navigate"]
   logic: "AND"
 action: block
 message: "Production access blocked by policy 'no-prod-access'. Request approval first."

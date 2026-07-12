@@ -1,11 +1,32 @@
 """
-proxy.py — MITM HTTP forward proxy for agent LLM API traffic.
+proxy.py — HTTP reverse-proxy and forward-proxy for agent LLM API traffic.
 
 Intercepts agent LLM API requests/responses and writes normalized audit events
 to a SQLite database via the storage module.
 
 Supports OpenAI, Anthropic, and Google (Gemini) API formats.
-HTTP-only for v1 (no HTTPS CONNECT tunneling).
+
+Reverse-proxy mode (recommended — works with HTTPS):
+    Point your agent's base URL at the proxy:
+        ANTHROPIC_BASE_URL=http://127.0.0.1:8081
+        OPENAI_BASE_URL=http://127.0.0.1:8081/v1
+    The proxy auto-routes to the correct upstream based on path patterns.
+    Override upstreams via env vars:
+        PANOPTES_UPSTREAM_ANTHROPIC=https://api.anthropic.com
+        PANOPTES_UPSTREAM_OPENAI=https://api.openai.com
+        PANOPTES_UPSTREAM_GEMINI=https://generativelanguage.googleapis.com
+
+Forward-proxy mode (HTTP only):
+    export HTTP_PROXY=http://127.0.0.1:8081
+    (HTTPS CONNECT tunneling not supported — use reverse-proxy mode for HTTPS)
+
+Streaming policy limitation:
+    When upstream responds with SSE streaming (content-type: text/event-stream),
+    bytes are relayed to the client immediately. If a post-flight policy check
+    triggers a BLOCK decision, the response has already been sent and cannot be
+    recalled. Panoptes logs a warning and records the violation event but cannot
+    retroactively block the streamed response. Pre-flight policy checks (on
+    request events) DO block before any bytes are sent.
 
 Usage:
     panoptes proxy --port 8081 --db-path ./audit.db
@@ -13,51 +34,26 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import http.server
 import json
 import logging
 import os
 import re
-import socket
-import sys
+import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
-from http import HTTPStatus
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-# ---------------------------------------------------------------------------
-# Storage stub — the real AuditDB is built in parallel at panoptes/db.py
-# ---------------------------------------------------------------------------
+from panoptes.db import AuditDB
+from panoptes.policy import PolicyEngine, PolicyResult
+from panoptes.schema import redact_secrets, utcnow_iso
 
-try:
-    from panoptes.db import AuditDB
-except ImportError:
-    AuditDB = None  # type: ignore[assignment,misc]
-
-try:
-    from panoptes.policy import PolicyEngine
-except ImportError:
-    PolicyEngine = None  # type: ignore[assignment,misc]
-
-
-class _AuditDBStub:
-    """In-memory fallback when panoptes.db is not yet available."""
-
-    def __init__(self, _db_path: str = ":memory:") -> None:
-        self.events: list[dict] = []
-
-    def insert_event(self, event: dict) -> None:
-        self.events.append(event)
-
-    def query(self, _filters: dict | None = None) -> list[dict]:
-        return list(self.events)
-
+import panoptes.providers as _providers
+from panoptes.providers.base import _parse_sse_events  # noqa: F401 — re-exported for callers
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -65,12 +61,31 @@ class _AuditDBStub:
 
 log = logging.getLogger("panoptes")
 
+# ---------------------------------------------------------------------------
+# Raw-payload helpers
+# ---------------------------------------------------------------------------
+
+_RAW_MAX = 64 * 1024  # 64 KB cap on stored raw payloads
+
+
+def _cap_raw(body: dict | None) -> str | None:
+    """Serialize body to JSON, redact secrets, cap at 64 KB."""
+    if body is None:
+        return None
+    try:
+        redacted = redact_secrets(body)
+        s = json.dumps(redacted, ensure_ascii=False, default=str)
+        if len(s) > _RAW_MAX:
+            return s[:_RAW_MAX] + "...[truncated]"
+        return s
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Agent detection
 # ---------------------------------------------------------------------------
 
-# Known agent-signalling User-Agent prefixes
 _AGENT_UA_PATTERNS: list[tuple[str, str]] = [
     ("claude-code", "claude_code"),
     ("codex", "codex"),
@@ -80,7 +95,6 @@ _AGENT_UA_PATTERNS: list[tuple[str, str]] = [
     ("google-code-assist", "antigravity"),
 ]
 
-# Path-based agent detection
 _AGENT_PATH_PATTERNS: list[tuple[str, str]] = [
     (r"/v1beta/models/.*:(?:streamGenerateContent|generateContent)", "antigravity"),
     (r"/v1alpha/models/.*:(?:streamGenerateContent|generateContent)", "antigravity"),
@@ -88,220 +102,65 @@ _AGENT_PATH_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+def _lower_keys(headers: dict[str, str]) -> dict[str, str]:
+    """Lowercase header names so lookups are case-insensitive."""
+    return {k.lower(): v for k, v in headers.items()}
+
+
 def detect_agent_type(
     path: str,
     headers: dict[str, str],
     req_body: dict | None,
 ) -> str:
-    """Detect which agent CLI is making the request.
-
-    Uses a combination of User-Agent header, request path patterns,
-    request body format, and model name.
-    """
-    # 1. User-Agent header (strongest signal)
-    user_agent = headers.get("user-agent", headers.get("User-Agent", ""))
+    user_agent = _lower_keys(headers).get("user-agent", "")
     if user_agent:
         ua_lower = user_agent.lower()
         for pattern, agent_type in _AGENT_UA_PATTERNS:
             if pattern in ua_lower:
                 return agent_type
 
-    # 2. Path-based detection
     for pattern, agent_type in _AGENT_PATH_PATTERNS:
         if re.search(pattern, path):
             return agent_type
 
-    # 3. Body format + model name detection
     if isinstance(req_body, dict):
-        req_format = _detect_format(path, req_body)
+        provider = _providers.detect(path, req_body)
         model = str(req_body.get("model", "")).lower()
 
-        if req_format == "anthropic":
+        if provider.name == "anthropic":
             if "hermes" in model:
                 return "hermes"
             return "claude_code"
 
-        if req_format == "openai":
-            if any(kw in model for kw in ("gpt", "o1", "o3", "o4", "codex")):
-                return "codex"
-            return "codex"  # default OpenAI-format to codex
+        if provider.name == "openai":
+            return "codex"
 
-        if req_format == "gemini":
+        if provider.name == "gemini":
             return "antigravity"
 
     return "unknown"
 
 
 # ---------------------------------------------------------------------------
-# Normalizer: converts provider-specific data to universal audit events
+# SSE parsing and reassembly
 # ---------------------------------------------------------------------------
 
 
-def _extract_model_request_info(
-    req_body: dict | None, req_format: str
-) -> dict[str, Any]:
-    """Extract model request info from the request body."""
-    if not isinstance(req_body, dict):
-        return {"messages_count": 0, "tools_count": 0, "stream": False, "model": "unknown"}
-
-    model = req_body.get("model", "unknown")
-
-    # Messages
-    messages = req_body.get("messages", [])
-    system_prompt = req_body.get("system", req_body.get("system_instruction"))
-    if system_prompt:
-        messages_count = len(messages) + 1
-    else:
-        messages_count = len(messages)
-
-    # Tools
-    tools = req_body.get("tools", req_body.get("functions"))
-    tools_count = len(tools) if isinstance(tools, list) else 0
-
-    # Streaming
-    stream = bool(
-        req_body.get("stream", False)
-        or "streamGenerateContent" in req_format
-    )
-
-    return {
-        "messages_count": messages_count,
-        "tools_count": tools_count,
-        "stream": stream,
-        "model": model,
-    }
-
-
-def _extract_tool_calls_from_openai(resp_body: dict) -> list[dict]:
-    """Extract tool calls from an OpenAI chat completion response."""
-    events: list[dict] = []
-    choices = resp_body.get("choices", [])
-    for choice in choices:
-        message = choice.get("message", {})
-        tool_calls = message.get("tool_calls", [])
-        for tc in tool_calls:
-            func = tc.get("function", {})
-            events.append({
-                "tool_name": func.get("name", "unknown"),
-                "parameters": json.loads(func.get("arguments", "{}"))
-                if isinstance(func.get("arguments"), str)
-                else func.get("arguments", {}),
-                "call_id": tc.get("id", ""),
-            })
-    return events
-
-
-def _extract_tool_calls_from_anthropic(resp_body: dict) -> list[dict]:
-    """Extract tool calls from an Anthropic message response."""
-    events: list[dict] = []
-    content = resp_body.get("content", [])
-    if isinstance(content, str):
-        return events
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "tool_use":
-            events.append({
-                "tool_name": block.get("name", "unknown"),
-                "parameters": block.get("input", {}),
-                "call_id": block.get("id", ""),
-            })
-    return events
-
-
-def _extract_tool_results_from_openai(req_body: dict) -> list[dict]:
-    """Extract tool results from an OpenAI request's messages array."""
-    events: list[dict] = []
-    messages = req_body.get("messages", [])
-    for msg in messages:
-        if msg.get("role") == "tool":
-            events.append({
-                "tool_name": msg.get("name", "unknown"),
-                "result": msg.get("content", ""),
-                "call_id": msg.get("tool_call_id", ""),
-            })
-    return events
-
-
-def _extract_tool_results_from_anthropic(req_body: dict) -> list[dict]:
-    """Extract tool results from an Anthropic request's messages array."""
-    events: list[dict] = []
-    messages = req_body.get("messages", [])
-    for msg in messages:
-        content = msg.get("content", [])
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    events.append({
-                        "tool_name": block.get("tool_use_id", "unknown"),
-                        "result": block.get("content", ""),
-                        "call_id": block.get("tool_use_id", ""),
-                    })
-    return events
-
-
-def _extract_usage_openai(resp_body: dict) -> dict:
-    """Extract usage from OpenAI response."""
-    usage = resp_body.get("usage", {})
-    return {
-        "tokens_in": usage.get("prompt_tokens", 0),
-        "tokens_out": usage.get("completion_tokens", 0),
-    }
-
-
-def _extract_usage_anthropic(resp_body: dict) -> dict:
-    """Extract usage from Anthropic response."""
-    usage = resp_body.get("usage", {})
-    return {
-        "tokens_in": usage.get("input_tokens", 0),
-        "tokens_out": usage.get("output_tokens", 0),
-    }
-
-
-def _extract_usage_gemini(resp_body: dict) -> dict:
-    """Extract usage from Gemini response."""
-    usage = resp_body.get("usageMetadata", {})
-    return {
-        "tokens_in": usage.get("promptTokenCount", 0),
-        "tokens_out": usage.get("candidatesTokenCount", 0),
-    }
-
-
-def _detect_format(path: str, req_body: dict | None) -> str:
-    """Detect the API format from the request path and body."""
-    if not isinstance(req_body, dict):
-        # Fall back to path-only detection
-        if "/chat/completions" in path:
-            return "openai"
-        if "/v1/messages" in path:
-            return "anthropic"
-        if any(p in path for p in ("generateContent", "streamGenerateContent")):
-            return "gemini"
-        return "unknown"
-
-    # Anthropic: has "system" key at top level OR messages have "content" as list
-    if "system" in req_body or (
-        isinstance(req_body.get("messages"), list)
-        and req_body["messages"]
-        and isinstance(req_body["messages"][0].get("content"), list)
-    ):
-        return "anthropic"
-
-    # OpenAI: messages have "role":"system"/"user" and "content" as string
-    if isinstance(req_body.get("messages"), list):
-        return "openai"
-
-    # Gemini: has "contents" key
-    if "contents" in req_body or "system_instruction" in req_body:
-        return "gemini"
-
-    # Path-based fallback
-    if "/chat/completions" in path or "/responses" in path:
-        return "openai"
-    if "/v1/messages" in path:
-        return "anthropic"
-    if any(p in path for p in ("generateContent", "streamGenerateContent")):
-        return "gemini"
-
-    return "unknown"
+def _parse_sse_response(raw: bytes, req_format: str) -> dict | None:
+    """Parse accumulated SSE bytes into a response dict for auditing."""
+    if not raw:
+        return None
+    for provider in _providers.REGISTRY:
+        if provider.name == req_format:
+            return provider.reassemble_sse(raw)
+    # Unknown format: try SSE then raw JSON
+    events = _parse_sse_events(raw)
+    if events:
+        return events[-1]
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -317,17 +176,11 @@ class AuditEventWriter:
     def __init__(self, db: Any, policies_dir: str | None = None) -> None:
         self.db = db
         self._session_id: str | None = None
-
-        # Initialize policy engine if policies directory is provided
         self.policy_engine: Any = None
-        if policies_dir and PolicyEngine is not None:
+        if policies_dir:
             try:
                 self.policy_engine = PolicyEngine(policies_dir=policies_dir, db=db)
-                log.debug(
-                    "Policy engine initialized with %d policies from %s",
-                    len(self.policy_engine.policies),
-                    policies_dir,
-                )
+                log.debug("Policy engine initialized with %d policies", len(self.policy_engine.policies))
             except Exception:
                 log.exception("Failed to initialize policy engine — policies disabled")
 
@@ -339,6 +192,189 @@ class AuditEventWriter:
 
     def set_session_id(self, sid: str) -> None:
         self._session_id = sid
+
+    # ------------------------------------------------------------------
+    # Build helpers
+    # ------------------------------------------------------------------
+
+    def _make_base_event(self, event_type: str, *, run_id: str, session_id: str, agent_type: str, turn_number: int) -> dict:
+        return {
+            "event_id": uuid.uuid4().hex,
+            "timestamp": utcnow_iso(),
+            "agent": {"type": agent_type, "session_id": session_id, "run_id": run_id},
+            "event_type": event_type,
+            "action": {},
+            "outcome": {},
+            "context": {"turn_number": turn_number},
+            "cost": {},
+        }
+
+    def build_request_events(
+        self,
+        *,
+        path: str,
+        method: str,
+        req_headers: dict[str, str],
+        req_body: dict | None,
+        run_id: str | None = None,
+    ) -> tuple[list[dict], dict]:
+        """Build request-side audit events (model_request + tool_result).
+
+        Returns (events, exchange_ctx). Pass exchange_ctx to build_response_events
+        to share run_id, session_id, agent_type, req_format, and turn_number.
+        """
+        if run_id is None:
+            run_id = uuid.uuid4().hex
+
+        provider = _providers.detect(path, req_body)
+        req_format = provider.name
+        agent_type = detect_agent_type(path, req_headers, req_body)
+        req_info = provider.extract_request_info(req_body)
+        # Streaming can be signalled by the path (Gemini), not just the body.
+        req_info["stream"] = provider.is_streaming(path, req_body)
+        turn_number = provider.estimate_turn_number(req_body)
+        session_id = (
+            _lower_keys(req_headers).get("x-panoptes-session") or self.session_id
+        )
+
+        exchange_ctx = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "agent_type": agent_type,
+            "req_format": req_format,
+            "req_info": req_info,
+            "turn_number": turn_number,
+        }
+
+        def _base(event_type: str) -> dict:
+            return self._make_base_event(
+                event_type, run_id=run_id, session_id=session_id,
+                agent_type=agent_type, turn_number=turn_number,
+            )
+
+        events: list[dict] = []
+
+        # model_request event
+        req_event = _base("model_request")
+        req_event["action"] = {
+            "method": method,
+            "path": path,
+            "model": req_info["model"],
+            "messages_count": req_info["messages_count"],
+            "tools_count": req_info["tools_count"],
+            "streaming": req_info["stream"],
+        }
+        req_event["outcome"] = {"status": "success"}
+        req_event["raw_request"] = _cap_raw(req_body)
+        events.append(req_event)
+
+        # tool_result events (from request body)
+        if isinstance(req_body, dict):
+            tool_results = provider.extract_tool_results(req_body)
+            for tr in tool_results:
+                tr_event = _base("tool_result")
+                tr_event["action"] = {
+                    "tool_name": tr.get("tool_name", "unknown"),
+                    "target": tr.get("call_id", ""),
+                    "call_id": tr.get("call_id", ""),
+                }
+                result_str = str(tr.get("result", ""))
+                tr_event["outcome"] = {"status": "success", "summary": result_str[:500]}
+                events.append(tr_event)
+
+        return events, exchange_ctx
+
+    def build_response_events(
+        self,
+        *,
+        path: str,
+        req_body: dict | None,
+        resp_status: int,
+        resp_headers: dict[str, str],
+        resp_body: dict | None,
+        duration_ms: int,
+        exchange_ctx: dict,
+    ) -> list[dict]:
+        """Build response-side audit events (model_response + tool_call)."""
+        run_id = exchange_ctx.get("run_id") or uuid.uuid4().hex
+        session_id = exchange_ctx.get("session_id") or self.session_id
+        agent_type = exchange_ctx.get("agent_type", "unknown")
+        turn_number = exchange_ctx.get("turn_number", 0)
+
+        # Resolve provider for tool extraction (re-detect only if ctx is missing it)
+        req_format = exchange_ctx.get("req_format")
+        if req_format is None:
+            provider = _providers.detect(path, req_body)
+        else:
+            provider = next(
+                (p for p in _providers.REGISTRY if p.name == req_format),
+                _providers._UNKNOWN,
+            )
+        req_info = exchange_ctx.get("req_info")
+        if req_info is None:
+            req_info = provider.extract_request_info(req_body)
+
+        def _base(event_type: str) -> dict:
+            return self._make_base_event(
+                event_type, run_id=run_id, session_id=session_id,
+                agent_type=agent_type, turn_number=turn_number,
+            )
+
+        events: list[dict] = []
+
+        # model_response event
+        resp_event = _base("model_response")
+        resp_event["action"] = {
+            "model": req_info["model"],
+            "status_code": resp_status,
+            "duration_ms": duration_ms,
+        }
+        if resp_status < 400:
+            resp_event["outcome"] = {"status": "success", "summary": f"HTTP {resp_status}"}
+        elif resp_status < 500:
+            resp_event["outcome"] = {"status": "error", "summary": f"Client error HTTP {resp_status}"}
+        else:
+            resp_event["outcome"] = {"status": "error", "summary": f"Server error HTTP {resp_status}"}
+
+        if isinstance(resp_body, dict):
+            resp_event["cost"] = provider.extract_usage(resp_body)
+
+        resp_event["raw_response"] = _cap_raw(resp_body)
+        events.append(resp_event)
+
+        # tool_call events (from response body)
+        if isinstance(resp_body, dict):
+            tool_calls = provider.extract_tool_calls(resp_body)
+            for tc in tool_calls:
+                tc_event = _base("tool_call")
+                tc_event["action"] = {
+                    "tool_name": tc["tool_name"],
+                    "parameters": tc["parameters"],
+                    "target": tc.get("call_id", ""),
+                    "call_id": tc.get("call_id", ""),
+                }
+                tc_event["outcome"] = {"status": "success", "summary": ""}
+                events.append(tc_event)
+
+        return events
+
+    # ------------------------------------------------------------------
+    # Write and policy helpers
+    # ------------------------------------------------------------------
+
+    def write(self, events: list[dict]) -> None:
+        """Write a list of audit events to the database."""
+        if hasattr(self.db, "insert_events"):
+            try:
+                self.db.insert_events(events)
+                return
+            except Exception:
+                log.exception("Batch write failed — falling back to per-event writes")
+        for event in events:
+            try:
+                self.db.insert_event(event)
+            except Exception:
+                log.exception("Failed to write audit event")
 
     def write_events(
         self,
@@ -352,144 +388,32 @@ class AuditEventWriter:
         resp_body: dict | None,
         duration_ms: int,
     ) -> list[dict]:
-        """Parse request/response, normalize to audit events, and write to DB.
+        """Build all events for an exchange and write them.
 
-        Returns the list of events written.
+        Backward-compatible wrapper — generates a fresh run_id per call.
         """
-        req_format = _detect_format(path, req_body)
-        agent_type = detect_agent_type(path, req_headers, req_body)
-        req_info = _extract_model_request_info(req_body, req_format)
-        events: list[dict] = []
-
-        # Extract session_id from headers if present
-        session_id = (
-            req_headers.get("x-panoptes-session")
-            or req_headers.get("X-Panoptes-Session")
-            or self.session_id
+        run_id = uuid.uuid4().hex
+        req_events, exchange_ctx = self.build_request_events(
+            path=path, method=method, req_headers=req_headers,
+            req_body=req_body, run_id=run_id,
         )
-
-        def _base_event(event_type: str) -> dict:
-            return {
-                "event_id": uuid.uuid4().hex,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "agent": {
-                    "type": agent_type,
-                    "session_id": session_id,
-                    "run_id": uuid.uuid4().hex,
-                },
-                "event_type": event_type,
-                "action": {},
-                "outcome": {},
-                "context": {},
-                "cost": {},
-            }
-
-        # --- model_request event ---
-        req_event = _base_event("model_request")
-        req_event["action"] = {
-            "method": method,
-            "path": path,
-            "model": req_info["model"],
-            "messages_count": req_info["messages_count"],
-            "tools_count": req_info["tools_count"],
-            "streaming": req_info["stream"],
-        }
-        req_event["outcome"] = {"status": "success"}
-        req_event["cost"] = {}
-        events.append(req_event)
-
-        # --- model_response event ---
-        resp_event = _base_event("model_response")
-        resp_event["action"] = {
-            "model": req_info["model"],
-            "status_code": resp_status,
-            "duration_ms": duration_ms,
-        }
-
-        # Outcome
-        if resp_status < 400:
-            resp_event["outcome"] = {"status": "success", "summary": f"HTTP {resp_status}"}
-        elif resp_status < 500:
-            resp_event["outcome"] = {
-                "status": "error",
-                "summary": f"Client error HTTP {resp_status}",
-            }
-        else:
-            resp_event["outcome"] = {
-                "status": "error",
-                "summary": f"Server error HTTP {resp_status}",
-            }
-
-        # Cost (tokens)
-        if isinstance(resp_body, dict):
-            if req_format == "anthropic":
-                cost = _extract_usage_anthropic(resp_body)
-            elif req_format == "gemini":
-                cost = _extract_usage_gemini(resp_body)
-            else:
-                cost = _extract_usage_openai(resp_body)
-            resp_event["cost"] = cost
-
-        events.append(resp_event)
-
-        # --- tool_call events (extracted from response) ---
-        if isinstance(resp_body, dict):
-            if req_format == "anthropic":
-                tool_calls = _extract_tool_calls_from_anthropic(resp_body)
-            else:
-                tool_calls = _extract_tool_calls_from_openai(resp_body)
-            for tc in tool_calls:
-                tc_event = _base_event("tool_call")
-                tc_event["action"] = {
-                    "tool_name": tc["tool_name"],
-                    "parameters": tc["parameters"],
-                    "target": tc.get("call_id", ""),
-                }
-                tc_event["outcome"] = {"status": "success", "summary": ""}
-                events.append(tc_event)
-
-        # --- tool_result events (extracted from request body) ---
-        if isinstance(req_body, dict):
-            if req_format == "anthropic":
-                tool_results = _extract_tool_results_from_anthropic(req_body)
-            else:
-                tool_results = _extract_tool_results_from_openai(req_body)
-            for tr in tool_results:
-                tr_event = _base_event("tool_result")
-                tr_event["action"] = {
-                    "tool_name": tr.get("tool_name", "unknown"),
-                    "target": tr.get("call_id", ""),
-                }
-                result_str = str(tr.get("result", ""))
-                tr_event["outcome"] = {
-                    "status": "success",
-                    "summary": result_str[:500],
-                }
-                events.append(tr_event)
-
-        # Write all events to DB
-        for event in events:
-            try:
-                self.db.insert_event(event)
-            except Exception:
-                log.exception("Failed to write audit event")
-
-        return events
+        resp_events = self.build_response_events(
+            path=path, req_body=req_body, resp_status=resp_status,
+            resp_headers=resp_headers, resp_body=resp_body,
+            duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+        )
+        all_events = req_events + resp_events
+        self.write(all_events)
+        return all_events
 
     def check_policies(self, events: list[dict]) -> Any:
-        """Check all events against loaded policies.
+        """Check events against loaded policies.
 
-        Returns a PolicyResult (or stub with action="allow" if no policy engine).
+        Returns a PolicyResult (action="allow" if no policy engine).
         """
         if not self.policy_engine:
-            # No policy engine — allow everything
-            return type("_AllowResult", (), {
-                "action": "allow",
-                "violated_policies": [],
-                "warnings": [],
-            })()
+            return PolicyResult(action="allow", violated_policies=[], warnings=[])
 
-        # Aggregate results across all events
         all_violated: list[dict] = []
         all_warnings: list[str] = []
         final_action = "allow"
@@ -503,80 +427,159 @@ class AuditEventWriter:
             elif result.action == "warn" and final_action != "block":
                 final_action = "warn"
 
-        from panoptes.policy import PolicyResult
-
-        return PolicyResult(
-            action=final_action,
-            violated_policies=all_violated,
-            warnings=all_warnings,
-        )
+        return PolicyResult(action=final_action, violated_policies=all_violated, warnings=all_warnings)
 
 
 # ---------------------------------------------------------------------------
-# HTTP Proxy Handler
+# Upstream routing (reverse-proxy mode)
 # ---------------------------------------------------------------------------
 
-# Hop-by-hop headers we strip when forwarding
+_ENV_ANTHROPIC = "PANOPTES_UPSTREAM_ANTHROPIC"
+_ENV_OPENAI = "PANOPTES_UPSTREAM_OPENAI"
+_ENV_GEMINI = "PANOPTES_UPSTREAM_GEMINI"
+
+_PROVIDER_ENV: dict[str, str] = {
+    "anthropic": _ENV_ANTHROPIC,
+    "openai": _ENV_OPENAI,
+    "gemini": _ENV_GEMINI,
+}
+
+
+class NoUpstreamError(ValueError):
+    """Raised when no upstream can be determined for a reverse-proxy path."""
+    pass
+
+
+def _parse_upstream_url(url: str, default_scheme: str = "https") -> tuple[str, str, int]:
+    """Parse a base URL string into (scheme, host, port)."""
+    p = urlparse(url)
+    scheme = p.scheme or default_scheme
+    host = p.hostname or ""
+    port = p.port or (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+# ---------------------------------------------------------------------------
+# HTTP proxy handler
+# ---------------------------------------------------------------------------
+
 HOP_BY_HOP = frozenset({
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-    "upgrade",
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
 })
 
 
 def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
-    """Remove hop-by-hop headers from a header dict."""
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
 
+def _block_payload(policy_result: PolicyResult) -> tuple[str, dict]:
+    """Build the (message, extra-fields) pair for a policy-block response."""
+    messages = [
+        vp.get("message", "Blocked by policy")
+        for vp in policy_result.violated_policies
+    ]
+    block_msg = "; ".join(messages) or "Blocked by policy"
+    extra = {
+        "violated_policies": [
+            vp.get("policy_name", "") for vp in policy_result.violated_policies
+        ],
+    }
+    return block_msg, extra
+
+
+def _log_policy_warnings(policy_result: PolicyResult) -> None:
+    if policy_result.action == "warn":
+        for w in policy_result.warnings:
+            log.warning("Policy warning: %s", w)
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    """HTTP forward proxy request handler.
+    """HTTP proxy request handler supporting both forward and reverse-proxy modes."""
 
-    Handles requests from agent CLIs configured to use this proxy
-    via HTTP_PROXY / HTTPS_PROXY environment variables.
-    """
-
-    # Class-level reference set by ProxyServer
     writer: AuditEventWriter | None = None
+    http_client: httpx.Client | None = None  # shared per-server instance
     upstream_timeout: float = 120.0
+    default_upstream: str | None = None  # set by ProxyServer
 
     def log_message(self, fmt: str, *args: Any) -> None:
         log.info(fmt % args)
 
-    def _parse_target(self) -> tuple[str, str, int]:
-        """Parse the absolute URL from the proxy request line.
+    # ------------------------------------------------------------------
+    # Target parsing
+    # ------------------------------------------------------------------
 
-        In forward proxy mode, the request line contains the full URL:
-            POST https://api.openai.com/v1/chat/completions HTTP/1.1
+    def _parse_target(self) -> tuple[str, str, int, str]:
+        """Parse the request line into (scheme, host, port, path).
 
-        Returns:
-            (scheme, host, port, path)
+        Forward-proxy mode: self.path is an absolute URL with scheme.
+        Reverse-proxy mode: self.path is a relative path; route by pattern.
         """
-        # self.path is the full URL in proxy mode
         parsed = urlparse(self.path)
-        scheme = parsed.scheme or "https"
-        host = parsed.hostname or "api.openai.com"
-        port = parsed.port or (443 if scheme == "https" else 80)
-        path = parsed.path or "/"
-        if parsed.query:
-            path += "?" + parsed.query
-        return scheme, host, port, path
+
+        # Forward-proxy mode — absolute URL
+        if parsed.scheme and parsed.hostname:
+            scheme = parsed.scheme
+            host = parsed.hostname
+            port = parsed.port or (443 if scheme == "https" else 80)
+            path = parsed.path or "/"
+            if parsed.query:
+                path += "?" + parsed.query
+            return scheme, host, port, path
+
+        # Reverse-proxy mode — relative path; consult provider registry
+        path = self.path
+
+        for provider in _providers.REGISTRY:
+            if provider.matches_path(path):
+                env_var = _PROVIDER_ENV.get(provider.name)
+                env_val = os.environ.get(env_var) if env_var else None
+                if env_val:
+                    s, h, p = _parse_upstream_url(env_val)
+                else:
+                    s, h, p = _parse_upstream_url(provider.default_upstream)
+                return s, h, p, path
+
+        # Fallback: default_upstream or 502
+        default = self.default_upstream
+        if not default:
+            raise NoUpstreamError(
+                f"No upstream route for path '{path}'. "
+                f"Set PANOPTES_UPSTREAM_ANTHROPIC / PANOPTES_UPSTREAM_OPENAI / "
+                f"PANOPTES_UPSTREAM_GEMINI or use --default-upstream."
+            )
+        s, h, p = _parse_upstream_url(default)
+        return s, h, p, path
+
+    # ------------------------------------------------------------------
+    # Request body
+    # ------------------------------------------------------------------
 
     def _read_body(self) -> bytes:
-        """Read the request body based on Content-Length."""
         content_length = self.headers.get("Content-Length")
         if content_length:
             try:
-                length = int(content_length)
-                return self.rfile.read(length)
+                return self.rfile.read(int(content_length))
             except (ValueError, OSError):
                 return b""
         return b""
+
+    # ------------------------------------------------------------------
+    # Upstream forwarding
+    # ------------------------------------------------------------------
+
+    def _build_fwd_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        fwd = _filter_headers(dict(headers))
+        fwd.pop("host", None)
+        fwd.pop("Host", None)
+        fwd["Accept-Encoding"] = "identity"
+        return fwd
+
+    def _get_client(self) -> tuple[httpx.Client, bool]:
+        """Return (client, owned). If owned=True, caller must close it."""
+        if self.http_client is not None:
+            return self.http_client, False
+        return httpx.Client(timeout=self.upstream_timeout, follow_redirects=False), True
 
     def _forward_request(
         self,
@@ -588,124 +591,281 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         headers: dict[str, str],
         body: bytes,
     ) -> tuple[int, dict[str, str], bytes]:
-        """Forward the request to the upstream server using httpx.
+        """Buffered forward: return (status, headers, body_bytes)."""
+        upstream_url = f"{scheme}://{host}:{port}{path}"
+        fwd_headers = self._build_fwd_headers(headers)
+        client, owned = self._get_client()
+        try:
+            resp = client.request(method=method, url=upstream_url, headers=fwd_headers, content=body)
+            return resp.status_code, dict(resp.headers), resp.content
+        except httpx.TimeoutException:
+            log.error("Upstream timeout: %s %s", method, upstream_url)
+            return 504, {"content-type": "application/json"}, json.dumps({"error": "Gateway Timeout"}).encode()
+        except httpx.ConnectError:
+            log.error("Upstream connect error: %s %s", method, upstream_url)
+            return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
+        except Exception:
+            log.exception("Upstream error: %s %s", method, upstream_url)
+            return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
+        finally:
+            if owned:
+                client.close()
 
-        Returns:
-            (status_code, response_headers, response_body_bytes)
+    def _forward_streaming(
+        self,
+        method: str,
+        scheme: str,
+        host: str,
+        port: int,
+        path: str,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Streaming forward: relay chunks to client as they arrive, accumulate bytes.
+
+        Sends HTTP status + headers to the client, then streams the body.
+        Returns (status, headers, accumulated_bytes) for auditing.
         """
         upstream_url = f"{scheme}://{host}:{port}{path}"
-        fwd_headers = _filter_headers(dict(headers))
-        fwd_headers.pop("host", None)
-        fwd_headers.pop("Host", None)
-        fwd_headers["Accept-Encoding"] = "identity"
+        fwd_headers = self._build_fwd_headers(headers)
+        accumulated = bytearray()
+        client, owned = self._get_client()
 
         try:
-            with httpx.Client(timeout=self.upstream_timeout, follow_redirects=False) as client:
-                resp = client.request(
-                    method=method,
-                    url=upstream_url,
-                    headers=fwd_headers,
-                    content=body,
-                )
-                resp_headers = dict(resp.headers)
-                resp_body = resp.content
-                return resp.status_code, resp_headers, resp_body
+            with client.stream(method, upstream_url, headers=fwd_headers, content=body) as resp:
+                # Send status and headers to client (strip Content-Length — unknown)
+                resp_headers = _filter_headers(dict(resp.headers))
+                resp_headers.pop("content-length", None)
+                self.send_response(resp.status_code)
+                for k, v in resp_headers.items():
+                    self.send_header(k, v)
+                self.end_headers()
+
+                # Stream body
+                try:
+                    for chunk in resp.iter_bytes():
+                        if chunk:
+                            accumulated.extend(chunk)
+                            self.wfile.write(chunk)
+                    self.wfile.flush()
+                except Exception:
+                    log.exception("Error mid-stream from %s", upstream_url)
+
+                return resp.status_code, dict(resp.headers), bytes(accumulated)
+
         except httpx.TimeoutException:
-            log.error(f"Upstream timeout: {method} {upstream_url}")
-            return 504, {"content-type": "text/plain"}, b"Gateway Timeout"
+            log.error("Upstream timeout (streaming): %s %s", method, upstream_url)
+            self._send_json_error(504, "Gateway Timeout")
+            return 504, {"content-type": "application/json"}, b""
         except httpx.ConnectError:
-            log.error(f"Upstream connection refused: {method} {upstream_url}")
-            return 502, {"content-type": "text/plain"}, b"Bad Gateway"
+            log.error("Upstream connect error (streaming): %s %s", method, upstream_url)
+            self._send_json_error(502, "Bad Gateway")
+            return 502, {"content-type": "application/json"}, b""
         except Exception:
-            log.exception(f"Upstream error: {method} {upstream_url}")
-            return 502, {"content-type": "text/plain"}, b"Bad Gateway"
+            log.exception("Upstream streaming error: %s %s", method, upstream_url)
+            self._send_json_error(502, "Bad Gateway")
+            return 502, {"content-type": "application/json"}, b""
+        finally:
+            if owned:
+                client.close()
+
+    # ------------------------------------------------------------------
+    # Response helpers
+    # ------------------------------------------------------------------
+
+    def _send_json_error(self, status: int, message: str, extra: dict | None = None) -> None:
+        body: dict[str, Any] = {"error": message}
+        if extra:
+            body.update(extra)
+        body_bytes = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body_bytes)))
+        self.end_headers()
+        self.wfile.write(body_bytes)
+
+    # ------------------------------------------------------------------
+    # Main request handler
+    # ------------------------------------------------------------------
 
     def _handle_request(self, method: str) -> None:
-        """Handle a single proxied request: parse, forward, capture, respond."""
+        """Handle a proxied request: parse → pre-flight → forward → post-flight → respond."""
         t0 = time.monotonic()
 
+        # 1. Parse target and read body
         try:
             scheme, host, port, path = self._parse_target()
-            req_headers = {k: v for k, v in self.headers.items()}
+            req_headers = dict(self.headers.items())
             body = self._read_body()
+        except NoUpstreamError as exc:
+            self._send_json_error(502, str(exc))
+            return
         except Exception:
             log.exception("Failed to parse proxy request")
             self.send_error(400, "Bad Request")
             return
 
-        # Parse request body
+        # 2. Parse request body
         req_body: dict | None = None
         if body:
             try:
                 req_body = json.loads(body)
             except (json.JSONDecodeError, ValueError):
-                req_body = None
+                pass
 
-        # Forward to upstream
-        resp_status, resp_headers, resp_body_bytes = self._forward_request(
-            method, scheme, host, port, path, req_headers, body
+        # 3. Build request events and run pre-flight policy check
+        writer = self.writer
+        req_events: list[dict] = []
+        exchange_ctx: dict = {}
+
+        if writer:
+            try:
+                req_events, exchange_ctx = writer.build_request_events(
+                    path=path, method=method, req_headers=req_headers,
+                    req_body=req_body,
+                )
+                policy_result = writer.check_policies(req_events)
+                if policy_result.action == "block":
+                    writer.write(req_events)  # engine already recorded violation
+                    block_msg, extra = _block_payload(policy_result)
+                    log.warning("Policy PRE-FLIGHT BLOCK: %s", block_msg)
+                    self._send_json_error(403, block_msg, extra)
+                    return
+            except Exception:
+                log.exception("Pre-flight policy check failed — allowing request through")
+
+        # 4. Forward to upstream (streaming decided by the provider — body
+        #    flag for OpenAI/Anthropic, URL path for Gemini)
+        handler = (
+            self._handle_streaming
+            if _providers.detect(path, req_body).is_streaming(path, req_body)
+            else self._handle_buffered
+        )
+        handler(
+            method=method, scheme=scheme, host=host, port=port, path=path,
+            req_headers=req_headers, body=body, req_body=req_body,
+            req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
         )
 
+    def _handle_streaming(
+        self,
+        *,
+        method: str,
+        scheme: str,
+        host: str,
+        port: int,
+        path: str,
+        req_headers: dict[str, str],
+        body: bytes,
+        req_body: dict | None,
+        req_events: list[dict],
+        exchange_ctx: dict,
+        t0: float,
+    ) -> None:
+        """Streaming path: relay chunks to the client, then audit post-hoc.
+
+        The response is sent to the client by _forward_streaming as bytes
+        arrive, so post-flight policy can only warn — never block.
+        """
+        resp_status, resp_headers_raw, accumulated = self._forward_streaming(
+            method, scheme, host, port, path, req_headers, body
+        )
         duration_ms = int((time.monotonic() - t0) * 1000)
 
-        # Parse response body
-        resp_body: dict | None = None
-        if resp_body_bytes:
+        # Parse accumulated SSE for auditing
+        ct = resp_headers_raw.get("content-type", "")
+        if "text/event-stream" in ct:
+            req_format = exchange_ctx.get("req_format") or _providers.detect(path, req_body).name
+            resp_body: dict | None = _parse_sse_response(accumulated, req_format)
+        else:
             try:
-                resp_body = json.loads(resp_body_bytes)
+                resp_body = json.loads(accumulated) if accumulated else None
             except (json.JSONDecodeError, ValueError):
                 resp_body = None
 
-        # Write audit events
-        events_written: list[dict] = []
-        if self.writer:
-            try:
-                events_written = self.writer.write_events(
-                    path=path,
-                    method=method,
-                    req_headers=req_headers,
-                    req_body=req_body,
-                    resp_status=resp_status,
-                    resp_headers=resp_headers,
-                    resp_body=resp_body,
-                    duration_ms=duration_ms,
-                )
-            except Exception:
-                log.exception("Failed to write audit events — continuing")
+        writer = self.writer
+        if not writer:
+            return
+        try:
+            resp_events = writer.build_response_events(
+                path=path, req_body=req_body, resp_status=resp_status,
+                resp_headers=resp_headers_raw, resp_body=resp_body,
+                duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+            )
+            writer.write(req_events + resp_events)
 
-        # Check policies against written events
-        if self.writer and events_written:
+            # Post-flight policy: warn only — bytes already sent
+            policy_result = writer.check_policies(resp_events)
+            if policy_result.action == "block":
+                log.warning(
+                    "Policy BLOCK after streaming response — bytes already sent to client; "
+                    "violation recorded but cannot be retroactively enforced. "
+                    "Use pre-flight request policies to block before forwarding."
+                )
+            else:
+                _log_policy_warnings(policy_result)
+        except Exception:
+            log.exception("Failed to process streaming audit events — continuing")
+
+    def _handle_buffered(
+        self,
+        *,
+        method: str,
+        scheme: str,
+        host: str,
+        port: int,
+        path: str,
+        req_headers: dict[str, str],
+        body: bytes,
+        req_body: dict | None,
+        req_events: list[dict],
+        exchange_ctx: dict,
+        t0: float,
+    ) -> None:
+        """Buffered path: forward, audit, optionally replace a blocked response."""
+        resp_status, resp_headers_raw, resp_body_bytes = self._forward_request(
+            method, scheme, host, port, path, req_headers, body
+        )
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        resp_body_parsed: dict | None = None
+        if resp_body_bytes:
             try:
-                policy_result = self.writer.check_policies(events_written)
+                resp_body_parsed = json.loads(resp_body_bytes)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        writer = self.writer
+        if writer:
+            try:
+                resp_events = writer.build_response_events(
+                    path=path, req_body=req_body, resp_status=resp_status,
+                    resp_headers=resp_headers_raw, resp_body=resp_body_parsed,
+                    duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+                )
+                writer.write(req_events + resp_events)
+
+                # Post-flight policy check — response events only; request
+                # events were already checked (and violations recorded)
+                # pre-flight, so re-checking them would double-count.
+                policy_result = writer.check_policies(resp_events)
                 if policy_result.action == "block":
-                    # Override response — block the agent from seeing the result
-                    messages = [
-                        vp.get("message", "Blocked by policy")
-                        for vp in policy_result.violated_policies
-                    ]
-                    block_msg = "; ".join(messages) if messages else "Blocked by policy"
-                    log.warning("Policy BLOCK: %s", block_msg)
+                    block_msg, extra = _block_payload(policy_result)
+                    log.warning("Policy POST-FLIGHT BLOCK: %s", block_msg)
                     resp_status = 403
-                    resp_body_bytes = json.dumps({
-                        "error": block_msg,
-                        "violated_policies": [
-                            vp["policy_name"] for vp in policy_result.violated_policies
-                        ],
-                    }).encode()
-                    resp_headers = {
+                    resp_body_bytes = json.dumps({"error": block_msg, **extra}).encode()
+                    resp_headers_raw = {
                         "content-type": "application/json",
                         "x-policy-blocked": "true",
                     }
-                elif policy_result.action == "warn":
-                    for w in policy_result.warnings:
-                        log.warning("Policy warning: %s", w)
+                else:
+                    _log_policy_warnings(policy_result)
             except Exception:
                 log.exception("Policy check failed — allowing request through")
 
-        # Send response back to client
+        # Send response to client
         self.send_response(resp_status)
-        resp_headers_out = _filter_headers(dict(resp_headers))
-        for key, val in resp_headers_out.items():
+        for key, val in _filter_headers(dict(resp_headers_raw)).items():
             self.send_header(key, val)
         self.end_headers()
         self.wfile.write(resp_body_bytes)
@@ -732,14 +892,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._handle_request("OPTIONS")
 
     def do_CONNECT(self) -> None:
-        """CONNECT is not supported in v1 (HTTP-only proxy).
+        """CONNECT tunneling is not supported.
 
-        Return 405 Method Not Allowed so the client falls back.
+        Use reverse-proxy mode instead — point your agent's base URL at the proxy:
+            ANTHROPIC_BASE_URL=http://127.0.0.1:<PORT>
+            OPENAI_BASE_URL=http://127.0.0.1:<PORT>/v1
+        The proxy forwards over HTTPS to the real upstream without CONNECT tunneling.
         """
+        msg = (
+            b"CONNECT tunneling not supported. Use reverse-proxy mode:\n"
+            b"  ANTHROPIC_BASE_URL=http://127.0.0.1:<PORT>\n"
+            b"  OPENAI_BASE_URL=http://127.0.0.1:<PORT>/v1\n"
+            b"  GEMINI_API_BASE=http://127.0.0.1:<PORT>\n"
+            b"The proxy routes paths to the correct upstream over HTTPS.\n"
+        )
         self.send_response(405)
         self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(msg)))
         self.end_headers()
-        self.wfile.write(b"CONNECT tunneling not supported in v1. Use HTTP proxy mode.")
+        self.wfile.write(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -748,12 +919,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ProxyServer:
-    """Runs a local HTTP forward proxy server.
-
-    Agent CLIs are configured to route through it via HTTP_PROXY env var.
-    The proxy intercepts LLM API requests/responses and writes normalized
-    audit events to the SQLite database.
-    """
+    """Runs a local HTTP proxy server in a background thread."""
 
     def __init__(
         self,
@@ -761,53 +927,60 @@ class ProxyServer:
         port: int = 8081,
         db_path: str = ":memory:",
         policies_dir: str | None = None,
+        default_upstream: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.db_path = db_path
         self.policies_dir = policies_dir
+        self.default_upstream = default_upstream
         self._server: http.server.HTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._db: Any = None
+        self._db: AuditDB | None = None
+        self._http_client: httpx.Client | None = None
+        self._tmp_db_path: str | None = None  # set when db_path == ":memory:"
         self.writer: AuditEventWriter | None = None
 
     def start(self) -> int:
-        """Start the proxy server in a background thread.
-
-        Returns the actual port the server is listening on.
-        """
-        # Initialize storage
-        if AuditDB is not None:
-            self._db = AuditDB(self.db_path)
+        """Start the proxy in a background thread. Returns the listening port."""
+        # Resolve database path — AuditDB cannot use ":memory:" (it calls makedirs)
+        if self.db_path == ":memory:":
+            fd, self._tmp_db_path = tempfile.mkstemp(suffix=".panoptes.db")
+            os.close(fd)
+            actual_db_path = self._tmp_db_path
+            log.debug("Using temporary DB for :memory: mode: %s", actual_db_path)
         else:
-            log.warning("panoptes.db not available — using in-memory stub")
-            self._db = _AuditDBStub(self.db_path)
+            actual_db_path = self.db_path
 
+        self._db = AuditDB(actual_db_path)
+        self._http_client = httpx.Client(timeout=120.0, follow_redirects=False)
         self.writer = AuditEventWriter(self._db, policies_dir=self.policies_dir)
 
-        # Configure the handler class
-        class _ConfiguredHandler(ProxyHandler):
-            writer = self.writer
+        _writer = self.writer
+        _default_upstream = self.default_upstream
+        _http_client = self._http_client
 
-        self._server = http.server.ThreadingHTTPServer(
-            (self.host, self.port), _ConfiguredHandler
-        )
+        class _ConfiguredHandler(ProxyHandler):
+            writer = _writer
+            default_upstream = _default_upstream
+            http_client = _http_client
+
+        self._server = http.server.ThreadingHTTPServer((self.host, self.port), _ConfiguredHandler)
         self.port = self._server.server_address[1]
 
         self._thread = threading.Thread(
-            target=self._server.serve_forever,
-            name="panoptes-proxy",
-            daemon=True,
+            target=self._server.serve_forever, name="panoptes-proxy", daemon=True,
         )
         self._thread.start()
 
-        log.info(f"Panoptes proxy listening on {self.host}:{self.port}")
-        log.info(f"Configure agents with: export HTTP_PROXY=http://{self.host}:{self.port}")
-        log.info(f"                       export HTTPS_PROXY=http://{self.host}:{self.port}")
+        log.info("Panoptes proxy listening on %s:%d", self.host, self.port)
+        log.info("Reverse-proxy mode: ANTHROPIC_BASE_URL=http://%s:%d", self.host, self.port)
+        log.info("Reverse-proxy mode: OPENAI_BASE_URL=http://%s:%d/v1", self.host, self.port)
+        log.info("Forward-proxy mode: HTTP_PROXY=http://%s:%d", self.host, self.port)
         return self.port
 
     def stop(self) -> None:
-        """Stop the proxy server."""
+        """Stop the proxy server and release resources."""
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -815,55 +988,66 @@ class ProxyServer:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        if self._http_client is not None:
+            self._http_client.close()
+            self._http_client = None
+        if self._tmp_db_path is not None:
+            try:
+                os.unlink(self._tmp_db_path)
+            except OSError:
+                pass
+            self._tmp_db_path = None
         log.info("Panoptes proxy stopped")
 
     @property
     def events(self) -> list[dict]:
-        """Return all captured events (for testing)."""
         if self._db is not None:
             return self._db.query()
         return []
 
 
 # ---------------------------------------------------------------------------
-# CLI (also exported as start_proxy for panoptes.cli integration)
+# Public start function (called from panoptes.cli)
 # ---------------------------------------------------------------------------
 
 
 def start_proxy(
     port: int = 8081,
+    host: str = "127.0.0.1",
     db_path: str = "~/.panoptes/audit.db",
     policies_dir: str | None = None,
+    default_upstream: str | None = None,
+    log_level: str = "INFO",
 ) -> None:
     """Start the audit proxy server (called from panoptes.cli)."""
-
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
-    # Expand ~ in db_path
     db_path_expanded = os.path.expanduser(db_path)
-
-    port = port if port else _find_free_port()
+    # port 0 (or None) lets the OS pick a free port; ProxyServer.start()
+    # reads the actual bound port back from the socket.
+    port = port or 0
 
     server = ProxyServer(
-        host="127.0.0.1",
-        port=port,
-        db_path=db_path_expanded,
-        policies_dir=policies_dir,
+        host=host, port=port, db_path=db_path_expanded,
+        policies_dir=policies_dir, default_upstream=default_upstream,
     )
     actual_port = server.start()
 
-    print(f"Panoptes proxy running on http://127.0.0.1:{actual_port}")
+    print(f"Panoptes proxy running on http://{host}:{actual_port}")
     print(f"Database: {db_path_expanded}")
     if policies_dir:
         print(f"Policies: {policies_dir}")
     print()
-    print("Configure your agent to use this proxy:")
-    print(f"  export HTTP_PROXY=http://127.0.0.1:{actual_port}")
-    print(f"  export HTTPS_PROXY=http://127.0.0.1:{actual_port}")
+    print("Reverse-proxy mode (recommended — captures HTTPS traffic):")
+    print(f"  export ANTHROPIC_BASE_URL=http://{host}:{actual_port}")
+    print(f"  export OPENAI_BASE_URL=http://{host}:{actual_port}/v1")
+    print()
+    print("Forward-proxy mode (HTTP only):")
+    print(f"  export HTTP_PROXY=http://{host}:{actual_port}")
+    print(f"  export HTTPS_PROXY=http://{host}:{actual_port}")
     print()
     print("Press Ctrl+C to stop")
 
@@ -874,91 +1058,3 @@ def start_proxy(
         print("\nShutting down...")
     finally:
         server.stop()
-
-
-def _find_free_port(start: int = 8081, max_attempts: int = 10) -> int:
-    """Find a free port starting from `start`."""
-    for port in range(start, start + max_attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", port)) != 0:
-                return port
-    return start  # fallback
-
-
-def main(argv: list[str] | None = None) -> None:
-    """CLI entry point for `panoptes proxy`."""
-
-    parser = argparse.ArgumentParser(
-        prog="panoptes",
-        description="Universal panoptes trail — proxy capture adapter",
-    )
-    subparsers = parser.add_subparsers(dest="command", help="sub-commands")
-
-    # 'proxy' subcommand
-    proxy_parser = subparsers.add_parser("proxy", help="Start the audit proxy server")
-    proxy_parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Port to listen on (default: auto-select from 8081)",
-    )
-    proxy_parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host to bind to (default: 127.0.0.1)",
-    )
-    proxy_parser.add_argument(
-        "--db-path",
-        type=str,
-        default="audit.db",
-        help="Path to SQLite database (default: audit.db)",
-    )
-    proxy_parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: INFO)",
-    )
-
-    args = parser.parse_args(argv)
-
-    if args.command != "proxy":
-        parser.print_help()
-        sys.exit(1)
-
-    # Configure logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Resolve port
-    port = args.port if args.port else _find_free_port()
-
-    # Start server
-    server = ProxyServer(host=args.host, port=port, db_path=args.db_path)
-    actual_port = server.start()
-
-    print(f"Panoptes proxy running on http://{args.host}:{actual_port}")
-    print(f"Database: {args.db_path}")
-    print()
-    print("Configure your agent to use this proxy:")
-    print(f"  export HTTP_PROXY=http://{args.host}:{actual_port}")
-    print(f"  export HTTPS_PROXY=http://{args.host}:{actual_port}")
-    print()
-    print("Press Ctrl+C to stop")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    finally:
-        server.stop()
-
-
-if __name__ == "__main__":
-    main()

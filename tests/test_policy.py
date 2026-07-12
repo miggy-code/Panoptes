@@ -1027,7 +1027,11 @@ rule:
 
 
 def test_no_prod_access_policy():
-    """The bundled no-prod-access policy works correctly."""
+    """The bundled no-prod-access policy works correctly.
+
+    After fix #3, the policy is data-driven: it fires on ANY tool_call whose
+    data_accessed contains 'prod', regardless of which specific tool was used.
+    """
     print("--- test_no_prod_access_policy ---")
 
     import yaml
@@ -1050,7 +1054,7 @@ def test_no_prod_access_policy():
     assert policy.action == "block"
     assert policy.enabled is True
 
-    # Test against a terminal call that accesses prod
+    # Terminal call with prod data — should match
     event_prod = _make_event(
         agent={"type": "hermes", "session_id": "s1", "run_id": "r1"},
         action={
@@ -1062,8 +1066,7 @@ def test_no_prod_access_policy():
     matched, reason = policy.evaluate_conditions(event_prod)
     assert matched, f"Should block prod access via terminal: {reason}"
 
-    # Test against a read_file call that accesses prod — should NOT match
-    # because tool_name isn't in the list
+    # read_file with prod data — NOW ALSO MATCHES (no tool_name filter in updated policy)
     event_read = _make_event(
         agent={"type": "hermes", "session_id": "s1", "run_id": "r1"},
         action={
@@ -1072,10 +1075,25 @@ def test_no_prod_access_policy():
             "data_accessed": ["prod"],
         },
     )
-    matched2, _ = policy.evaluate_conditions(event_read)
-    assert not matched2, "read_file should not match the tool_name list"
+    matched2, reason2 = policy.evaluate_conditions(event_read)
+    assert matched2, (
+        f"read_file with prod data_accessed should now match (policy is data-driven, "
+        f"no tool_name filter): {reason2}"
+    )
 
-    # Test against terminal without prod access
+    # Write tool with prod data — also matches
+    event_write = _make_event(
+        agent={"type": "hermes", "session_id": "s1", "run_id": "r1"},
+        action={
+            "tool_name": "Write",
+            "parameters": {},
+            "data_accessed": ["prod", "infra"],
+        },
+    )
+    matched3, _ = policy.evaluate_conditions(event_write)
+    assert matched3, "Write with prod data_accessed should match"
+
+    # Tool call without prod access — should NOT match
     event_safe = _make_event(
         agent={"type": "hermes", "session_id": "s1", "run_id": "r1"},
         action={
@@ -1084,8 +1102,69 @@ def test_no_prod_access_policy():
             "data_accessed": ["dev"],
         },
     )
-    matched3, _ = policy.evaluate_conditions(event_safe)
-    assert not matched3, "terminal without prod should not match"
+    matched4, _ = policy.evaluate_conditions(event_safe)
+    assert not matched4, "terminal without prod should not match"
+
+    # model_request with prod in data_accessed — should NOT match (event_type filter)
+    event_mr = _make_event(
+        event_type="model_request",
+        agent={"type": "hermes", "session_id": "s1", "run_id": "r1"},
+        action={
+            "tool_name": None,
+            "parameters": {},
+            "data_accessed": ["prod"],
+        },
+    )
+    matched5, _ = policy.evaluate_conditions(event_mr)
+    assert not matched5, "model_request should not match (event_type=tool_call filter)"
+
+    print("  PASSED")
+
+
+def test_no_prod_access_with_derived_data_accessed():
+    """no-prod-access policy fires on events with derived data_accessed from normalize_event."""
+    print("--- test_no_prod_access_with_derived_data_accessed ---")
+
+    import yaml
+    from panoptes.schema import normalize_event
+
+    default_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "panoptes",
+        "default_policies",
+        "no-prod-access.yaml",
+    )
+    with open(default_path, "r") as f:
+        raw = yaml.safe_load(f)
+    policy = Policy(raw)
+
+    # Raw event with no data_accessed — but command contains "prod"
+    raw_event = {
+        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+        "event_type": "tool_call",
+        "action": {
+            "tool_name": "bash",
+            "parameters": {"command": "kubectl apply -f /prod/deployment.yaml"},
+            "data_accessed": [],
+        },
+        "outcome": {"status": "success"},
+        "context": {},
+    }
+    # normalize_event derives data_accessed from the command string
+    normalized = normalize_event(raw_event)
+    assert "prod" in normalized["action"]["data_accessed"], (
+        f"Expected 'prod' derived from command, got {normalized['action']['data_accessed']}"
+    )
+    assert "infra" in normalized["action"]["data_accessed"], (
+        f"Expected 'infra' derived from 'kubectl', got {normalized['action']['data_accessed']}"
+    )
+
+    # Policy should match the normalized event
+    matched, reason = policy.evaluate_conditions(normalized)
+    assert matched, (
+        f"no-prod-access should fire on derived 'prod' in data_accessed: {reason}"
+    )
 
     print("  PASSED")
 
@@ -1125,4 +1204,5 @@ if __name__ == "__main__":
     test_rule_event_type_filter()
     test_test_policy_method()
     test_no_prod_access_policy()
+    test_no_prod_access_with_derived_data_accessed()
     print("\n=== ALL POLICY TESTS PASSED ===")

@@ -13,19 +13,13 @@ Plugin structure (written by install_hermes_plugin.py):
   └── plugin.py        — hook handlers registering with Hermes context
 """
 
-import datetime
-import json
 import os
 import uuid
 
 from panoptes.db import AuditDB
+from panoptes.schema import utcnow_iso as _utcnow_iso
 
 DB_PATH = os.path.expanduser("~/.panoptes/audit.db")
-
-
-def _utcnow_iso() -> str:
-    """Return current UTC time as ISO8601 string with Z suffix."""
-    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 class AuditPlugin:
@@ -158,5 +152,21 @@ class AuditPlugin:
             )
 
 
-# Default plugin instance for direct import
-plugin = AuditPlugin()
+# Default plugin instance, created lazily via PEP 562 module __getattr__ so
+# that merely importing this module doesn't create ~/.panoptes/ or open the
+# audit database. `from panoptes.hermes_plugin import plugin` still works.
+_plugin = None
+
+
+def get_plugin() -> AuditPlugin:
+    """Return the shared default AuditPlugin, creating it on first use."""
+    global _plugin
+    if _plugin is None:
+        _plugin = AuditPlugin()
+    return _plugin
+
+
+def __getattr__(name: str):
+    if name == "plugin":
+        return get_plugin()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

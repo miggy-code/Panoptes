@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── Schema version ────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 # ── Allowed values ────────────────────────────────────────────────────────────
 ALLOWED_AGENT_TYPES = frozenset({
@@ -65,16 +65,51 @@ _CONTENT_PATTERNS: List[Tuple[re.Pattern, str]] = [
 
 _REDACT_REPLACEMENT = "[REDACTED]"
 
+# Compiled regex for camelCase splitting (used in key tokenization)
+_CAMEL_SPLIT_RE = re.compile(r'([a-z])([A-Z])')
+_DELIMITER_SPLIT_RE = re.compile(r'[_\-\s]+')
+
+
+def _tokenize_key(key: str) -> List[str]:
+    """Tokenize a key name into lower-case word parts.
+
+    Handles snake_case, kebab-case, space-separated, and camelCase names.
+    Examples:
+        "author"            → ["author"]
+        "authorization"     → ["authorization"]
+        "db_password"       → ["db", "password"]
+        "apiKey"            → ["api", "key"]
+        "AWS-SECRET-KEY"    → ["aws", "secret", "key"]
+    """
+    # Split camelCase boundaries before lowercasing
+    camel_split = _CAMEL_SPLIT_RE.sub(r'\1_\2', key)
+    parts = _DELIMITER_SPLIT_RE.split(camel_split)
+    return [p.lower() for p in parts if p]
+
 
 def _is_sensitive_key(key: str) -> bool:
-    """Check if a key name indicates a sensitive value."""
+    """Check if a key name indicates a sensitive value.
+
+    Uses token-based matching to avoid false positives like 'author' matching
+    'auth'. Checks:
+      1. Full normalized key direct match (fast path).
+      2. Any single token in the set.
+      3. Any adjacent token pair joined by '_' in the set.
+    """
     key_lower = key.lower().replace("-", "_").replace(" ", "_")
-    # Direct match
+    # Direct match on full normalized key
     if key_lower in _SENSITIVE_KEYS:
         return True
-    # Substring match (e.g. "db_password", "aws_secret_key")
-    for sensitive in _SENSITIVE_KEYS:
-        if sensitive in key_lower:
+
+    # Token-based matching — avoids "auth" matching "author"
+    tokens = _tokenize_key(key)
+    for token in tokens:
+        if token in _SENSITIVE_KEYS:
+            return True
+    # Adjacent token-pair matching — catches "api_key", "private_key", etc.
+    for i in range(len(tokens) - 1):
+        pair = tokens[i] + "_" + tokens[i + 1]
+        if pair in _SENSITIVE_KEYS:
             return True
     return False
 
@@ -83,10 +118,7 @@ def _redact_string(value: str) -> str:
     """Apply content-based patterns to redact secrets from a string."""
     result = value
     for pattern, replacement in _CONTENT_PATTERNS:
-        if callable(replacement):
-            result = pattern.sub(replacement, result)
-        else:
-            result = pattern.sub(replacement, result)
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -114,6 +146,83 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_secrets(item) for item in value]
     return value
+
+
+# ── Data access classifiers ────────────────────────────────────────────────────
+# Each entry is (compiled_regex, tag). During normalize_event, when
+# action.data_accessed is empty on a tool_call/tool_result, all string values
+# inside action.parameters (recursively) and action.target are scanned against
+# these patterns. Matching tags are collected into data_accessed as a sorted,
+# deduped list. Keep strings > _CLASSIFIER_STRING_MAX_LEN unscanned for perf.
+#
+# This table is intentionally module-level so users can extend it at import time:
+#   from panoptes.schema import DATA_ACCESS_CLASSIFIERS
+#   DATA_ACCESS_CLASSIFIERS.append((re.compile(r'\bstaging\b'), 'staging'))
+
+DATA_ACCESS_CLASSIFIERS: List[Tuple[re.Pattern, str]] = [
+    # prod: production paths, namespaces, hostnames, or env names
+    (re.compile(r'\bprod(?:uction)?\b', re.IGNORECASE), 'prod'),
+    # secrets: credential files, private keys, secret-named paths/vars
+    (re.compile(
+        r'\.env\b|id_rsa|\.pem\b|\.key\b|/etc/passwd|/etc/shadow'
+        r'|credential|AWS_SECRET|/vault/',
+        re.IGNORECASE
+    ), 'secrets'),
+    # infra: infrastructure orchestration CLI tools
+    (re.compile(r'\b(?:kubectl|helm|terraform|gcloud)\b', re.IGNORECASE), 'infra'),
+    # database: database clients and connection-string env vars
+    (re.compile(r'\b(?:psql|mysql|mongosh?|redis-cli)\b|DATABASE_URL', re.IGNORECASE), 'database'),
+    # network: HTTP transfer tools and URLs
+    (re.compile(r'\b(?:curl|wget)\b|https?://', re.IGNORECASE), 'network'),
+]
+
+_CLASSIFIER_STRING_MAX_LEN = 10_000
+
+
+def _collect_string_values(
+    obj: Any,
+    max_len: int = _CLASSIFIER_STRING_MAX_LEN,
+    _out: Optional[List[str]] = None,
+) -> List[str]:
+    """Recursively collect string values from a nested dict/list/str.
+
+    Uses a shared accumulator to avoid building intermediate lists at
+    every level of the recursion.
+    """
+    out: List[str] = [] if _out is None else _out
+    if isinstance(obj, str):
+        if len(obj) <= max_len:
+            out.append(obj)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _collect_string_values(v, max_len, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_string_values(item, max_len, out)
+    return out
+
+
+def _derive_data_accessed(action: Dict[str, Any], event_type: str) -> List[str]:
+    """Scan action parameters and target for data-access tags.
+
+    Only called when action.data_accessed is empty and event_type is
+    'tool_call' or 'tool_result'. Returns a sorted deduplicated list of tags.
+    """
+    if event_type not in ("tool_call", "tool_result"):
+        return []
+
+    strings_to_scan = _collect_string_values(action.get("parameters") or {})
+    target = action.get("target")
+    if target and isinstance(target, str) and len(target) <= _CLASSIFIER_STRING_MAX_LEN:
+        strings_to_scan.append(target)
+
+    tags: set = set()
+    for s in strings_to_scan:
+        for pattern, tag in DATA_ACCESS_CLASSIFIERS:
+            if tag not in tags and pattern.search(s):
+                tags.add(tag)
+
+    return sorted(tags)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -215,12 +324,45 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
+def _format_utc(dt: datetime) -> str:
+    """Format a datetime as ISO8601 UTC with millisecond precision and Z suffix."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def utcnow_iso() -> str:
+    """Current UTC time in the canonical event timestamp format.
+
+    All event producers (proxy, policy engine, agent plugins) should use this
+    so stored timestamps sort consistently.
+    """
+    return _format_utc(datetime.now(timezone.utc))
+
+
+def _normalize_timestamp(ts: Any) -> str:
+    """Normalize a timestamp to a Z-suffixed ISO8601 UTC string.
+
+    Events are ordered by string comparison of this column, so all sources
+    must agree on one suffix: '+00:00' sorts before 'Z' at the same instant,
+    which would interleave events from different producers incorrectly.
+    """
+    if ts is None:
+        return _format_utc(datetime.now(timezone.utc))
+    if isinstance(ts, datetime):
+        return _format_utc(ts)
+    s = str(ts)
+    if s.endswith("+00:00"):
+        return s[:-6] + "Z"
+    return s
+
+
 def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a raw event dict into the canonical schema.
 
     This fills in defaults, generates missing fields, redacts secrets,
-    and truncates long fields. Returns a fully normalized event dict ready
-    for storage.
+    truncates long fields, and derives data_accessed tags when empty.
+    Returns a fully normalized event dict ready for storage.
     """
     event: Dict[str, Any] = {}
 
@@ -228,13 +370,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     event["event_id"] = raw_event.get("event_id") or uuid.uuid4().hex
 
     # --- timestamp ---
-    ts = raw_event.get("timestamp")
-    if ts is None:
-        event["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    elif isinstance(ts, datetime):
-        event["timestamp"] = ts.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    else:
-        event["timestamp"] = str(ts)
+    event["timestamp"] = _normalize_timestamp(raw_event.get("timestamp"))
 
     # --- agent ---
     agent = raw_event.get("agent", {})
@@ -253,17 +389,27 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     # --- event_type ---
-    event["event_type"] = raw_event.get("event_type", "unknown")
+    event_type = raw_event.get("event_type", "unknown")
+    event["event_type"] = event_type
 
     # --- action (with secret redaction) ---
     action = raw_event.get("action", {}) or {}
     parameters = redact_secrets(action.get("parameters", {}) or {})
+    data_accessed = list(action.get("data_accessed", []) or [])
+
     event["action"] = {
         "tool_name": action.get("tool_name"),
         "parameters": parameters,
         "target": action.get("target"),
-        "data_accessed": action.get("data_accessed", []),
+        "call_id": action.get("call_id"),  # preserve explicit call_id for dedup
+        "data_accessed": data_accessed,
     }
+
+    # --- derive data_accessed tags when not explicitly set ---
+    if not data_accessed and event_type in ("tool_call", "tool_result"):
+        derived = _derive_data_accessed(event["action"], event_type)
+        if derived:
+            event["action"]["data_accessed"] = derived
 
     # --- outcome ---
     outcome = raw_event.get("outcome", {}) or {}
@@ -307,13 +453,20 @@ def extract_index_fields(event: Dict[str, Any]) -> Dict[str, Any]:
 
     SQLite stores nested dicts as JSON TEXT, but we also extract key fields
     into dedicated columns for indexing and fast filtering.
+
+    call_id is used for deduplication of replayed tool_call/tool_result events:
+      - prefer action.call_id (set by proxy from provider call id)
+      - fall back to action.target (legacy behavior)
+      - empty string if neither
     """
     agent = event.get("agent", {})
     action = event.get("action", {})
+    call_id = action.get("call_id") or action.get("target") or ""
     return {
         "agent_type": agent.get("type"),
         "session_id": agent.get("session_id"),
         "run_id": agent.get("run_id"),
         "tool_name": action.get("tool_name"),
         "data_accessed": ",".join(action.get("data_accessed", []) or []),
+        "call_id": call_id,
     }

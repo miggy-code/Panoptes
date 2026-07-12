@@ -170,15 +170,8 @@ def cmd_policy_add(args):
 
 def cmd_policy_test(args):
     """Test a policy file against a JSON event string."""
-    engine = PolicyEngine.__new__(PolicyEngine)
-    engine._db = None
-    import threading
-    engine._rate_lock = threading.Lock()
-    engine._rate_limits = {}
-    engine.policies = []
-
     try:
-        result = engine.test_policy(args.policy_file, args.event_json)
+        result = PolicyEngine.test_policy(args.policy_file, args.event_json)
     except ValueError as exc:
         print(f"Error: {exc}")
         sys.exit(1)
@@ -215,18 +208,23 @@ def _format_scope(scope: dict) -> str:
     return ", ".join(parts)
 
 
-def _resolve_policies_dir(args) -> str:
-    """Resolve policies directory from args, with default."""
-    if hasattr(args, "policies_dir") and args.policies_dir:
-        return args.policies_dir
-    return DEFAULT_POLICIES_DIR
-
-
 # ── Main CLI ──────────────────────────────────────────────────────────────────
 
 
 def main(argv=None):
     """Entry point for the panoptes CLI."""
+    # Shared options — inherited by subparsers via parents=[...]
+    db_opts = argparse.ArgumentParser(add_help=False)
+    db_opts.add_argument(
+        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
+    )
+    policy_opts = argparse.ArgumentParser(add_help=False)
+    policy_opts.add_argument(
+        "--policies-dir",
+        default=None,
+        help="Path to policy definitions directory",
+    )
+
     parser = argparse.ArgumentParser(
         prog="panoptes",
         description="Panoptes — universal agent observability, audit trail, and policy enforcement.",
@@ -234,19 +232,30 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # --- proxy ---
-    proxy_parser = subparsers.add_parser("proxy", help="Start the MITM audit proxy")
+    proxy_parser = subparsers.add_parser(
+        "proxy", help="Start the MITM audit proxy", parents=[db_opts, policy_opts]
+    )
     proxy_parser.add_argument("--port", default=8081, type=int, help="Proxy listen port")
     proxy_parser.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
+        "--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)"
     )
     proxy_parser.add_argument(
-        "--policies-dir",
+        "--default-upstream",
         default=None,
-        help="Path to policy definitions directory",
+        help="Default upstream base URL for unmatched paths (e.g. https://api.openai.com). "
+             "If not set, unmatched paths return 502.",
+    )
+    proxy_parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: INFO)",
     )
 
     # --- query ---
-    query_parser = subparsers.add_parser("query", help="Query audit events")
+    query_parser = subparsers.add_parser(
+        "query", help="Query audit events", parents=[db_opts]
+    )
     query_parser.add_argument("--agent", help="Filter by agent type (e.g. hermes)")
     query_parser.add_argument(
         "--event-type",
@@ -256,69 +265,48 @@ def main(argv=None):
     query_parser.add_argument("--since", help="ISO8601 start time")
     query_parser.add_argument("--until", help="ISO8601 end time")
     query_parser.add_argument("--limit", default=50, type=int, help="Max results")
-    query_parser.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
-    )
 
     # --- status ---
-    status_parser = subparsers.add_parser("status", help="Show audit statistics")
-    status_parser.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
-    )
+    subparsers.add_parser("status", help="Show audit statistics", parents=[db_opts])
 
     # --- session ---
-    session_parser = subparsers.add_parser("session", help="Show session timeline")
-    session_parser.add_argument("session_id", help="Session ID to inspect")
-    session_parser.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
+    session_parser = subparsers.add_parser(
+        "session", help="Show session timeline", parents=[db_opts]
     )
+    session_parser.add_argument("session_id", help="Session ID to inspect")
 
     # --- evidence ---
-    evidence_parser = subparsers.add_parser("evidence", help="Show evidence chain")
-    evidence_parser.add_argument("event_id", help="Event ID to inspect")
-    evidence_parser.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
+    evidence_parser = subparsers.add_parser(
+        "evidence", help="Show evidence chain", parents=[db_opts]
     )
+    evidence_parser.add_argument("event_id", help="Event ID to inspect")
 
     # --- policy ---
     policy_parser = subparsers.add_parser("policy", help="Policy management commands")
     policy_subs = policy_parser.add_subparsers(dest="policy_command")
 
     # policy check
-    policy_check = policy_subs.add_parser("check", help="Check policies against events")
+    policy_check = policy_subs.add_parser(
+        "check", help="Check policies against events", parents=[db_opts, policy_opts]
+    )
     policy_check.add_argument("--event-type", help="Filter by event type")
     policy_check.add_argument("--since", help="ISO8601 start time")
     policy_check.add_argument("--until", help="ISO8601 end time")
     policy_check.add_argument(
         "--limit", default=100, type=int, help="Max events to check"
     )
-    policy_check.add_argument(
-        "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
-    )
-    policy_check.add_argument(
-        "--policies-dir",
-        default=None,
-        help="Path to policy definitions directory",
-    )
 
     # policy list
-    policy_list = policy_subs.add_parser("list", help="List all loaded policies")
-    policy_list.add_argument(
-        "--policies-dir",
-        default=None,
-        help="Path to policy definitions directory",
+    policy_subs.add_parser(
+        "list", help="List all loaded policies", parents=[policy_opts]
     )
 
     # policy add
     policy_add = policy_subs.add_parser(
-        "add", help="Add a policy file to the policies directory"
+        "add", help="Add a policy file to the policies directory",
+        parents=[policy_opts],
     )
     policy_add.add_argument("source", help="Path to the policy YAML file to add")
-    policy_add.add_argument(
-        "--policies-dir",
-        default=None,
-        help="Path to policy definitions directory",
-    )
 
     # policy test
     policy_test = policy_subs.add_parser(
@@ -338,30 +326,36 @@ def main(argv=None):
 
         start_proxy(
             port=args.port,
+            host=args.host,
             db_path=args.db_path,
             policies_dir=args.policies_dir,
+            default_upstream=args.default_upstream,
+            log_level=args.log_level,
         )
-    elif args.command == "query":
-        cmd_query(args)
-    elif args.command == "status":
-        cmd_status(args)
-    elif args.command == "session":
-        cmd_session(args)
-    elif args.command == "evidence":
-        cmd_evidence(args)
     elif args.command == "policy":
-        if args.policy_command == "check":
-            cmd_policy_check(args)
-        elif args.policy_command == "list":
-            cmd_policy_list(args)
-        elif args.policy_command == "add":
-            cmd_policy_add(args)
-        elif args.policy_command == "test":
-            cmd_policy_test(args)
+        policy_commands = {
+            "check": cmd_policy_check,
+            "list": cmd_policy_list,
+            "add": cmd_policy_add,
+            "test": cmd_policy_test,
+        }
+        handler = policy_commands.get(args.policy_command)
+        if handler:
+            handler(args)
         else:
             policy_parser.print_help()
     else:
-        parser.print_help()
+        commands = {
+            "query": cmd_query,
+            "status": cmd_status,
+            "session": cmd_session,
+            "evidence": cmd_evidence,
+        }
+        handler = commands.get(args.command)
+        if handler:
+            handler(args)
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":

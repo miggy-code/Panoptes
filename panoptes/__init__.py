@@ -5,6 +5,7 @@ Normalizes events from any agent (Claude Code, Codex, Hermes, etc.)
 into a canonical schema and stores them in SQLite with a rich query API.
 """
 
+from .config import ConfigError, load_config
 from .db import AuditDB
 from .policy import (
     Policy,
@@ -21,6 +22,8 @@ from .schema import (
 
 __all__ = [
     "AuditDB",
+    "ConfigError",
+    "load_config",
     "Policy",
     "PolicyEngine",
     "PolicyResult",
