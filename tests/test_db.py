@@ -9,24 +9,34 @@ Covers:
   - Session listing and statistics
   - Validation errors
   - Thread safety (basic)
-  - Deduplication of replayed tool_result events (call_id unique index)
+  - Replay preservation (call_id is correlation, not idempotency)
   - Migration from a v1 database (no call_id column)
 """
 
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
 import time
 import uuid
 
+import pytest
+
 # Ensure local package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from panoptes import AuditDB, ValidationError, normalize_event, validate_event
-from panoptes.schema import redact_secrets
+from panoptes.capture import HERMES_AUTHORIZER_CAPABILITIES
+from panoptes.db import (
+    ChainIntegrityError,
+    EventConflictError,
+    UnsupportedSchemaVersionError,
+    _load_chain_for_append,
+)
+from panoptes.schema import SCHEMA_VERSION, redact_secrets
 
 
 def test_redact_secrets():
@@ -96,8 +106,9 @@ def test_normalize_event():
     assert "secret123" not in params_str, f"Secret leak in normalized event: {params_str}"
     assert "[REDACTED]" in params_str, f"Secret not redacted: {params_str}"
 
-    # data_accessed preserved when explicitly set (no derivation override)
-    assert norm["action"]["data_accessed"] == ["prod_config"]
+    # Declared tags are preserved and authoritative derivation is additive.
+    assert "prod_config" in norm["action"]["data_accessed"]
+    assert "secrets" in norm["action"]["data_accessed"]
 
     # Truncation of user_message
     long_msg = "x" * 600
@@ -187,9 +198,12 @@ def test_db_lifecycle():
         db_path = os.path.join(tmpdir, "test_audit.db")
         db = AuditDB(db_path)
 
-        # Schema version should be 3
+        # Schema version should match this build.
         stats = db.get_stats()
-        assert stats["schema_version"] == 3, f"Expected schema_version=3, got {stats['schema_version']}"
+        assert stats["schema_version"] == SCHEMA_VERSION, (
+            f"Expected schema_version={SCHEMA_VERSION}, "
+            f"got {stats['schema_version']}"
+        )
         assert stats["total_events"] == 0
 
         # Insert events from different agent types
@@ -225,6 +239,28 @@ def test_db_lifecycle():
 
         db.close()
         print("  PASSED")
+
+
+def test_in_memory_database_persists_across_operation_connections():
+    """The documented :memory: path shares state across DB operations."""
+    print("--- test_in_memory_database_persists_across_operation_connections ---")
+
+    db = AuditDB(":memory:")
+    event_id = db.insert_event({
+        "agent": {"type": "hermes", "session_id": "memory", "run_id": "run-1"},
+        "event_type": "model_request",
+        "action": {},
+        "outcome": {"status": "success"},
+        "context": {},
+    })
+    assert event_id
+    assert db.get_stats()["total_events"] == 1
+    assert [event["event_id"] for event in db.query()] == [event_id]
+    assert db.get_chain_checkpoint()["event_count"] == 1
+    assert db.verify_chain()["valid"]
+    db.close()
+
+    print("  PASSED")
 
 
 def test_query_filters():
@@ -468,9 +504,47 @@ def test_evidence_chain_via_call_id():
         print("  PASSED")
 
 
-def test_tool_result_dedup():
-    """Replayed tool_result events with the same call_id are deduplicated."""
-    print("--- test_tool_result_dedup ---")
+def test_evidence_chain_temporal_fallback_parses_iso8601():
+    """The no-turn fallback compares timestamp instants, not text formats."""
+    print("--- test_evidence_chain_temporal_fallback_parses_iso8601 ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "evidence-time.db"))
+        timestamps = {
+            "before": "2026-07-10T09:59:30.000Z",
+            "anchor": "2026-07-10T10:00:00.000Z",
+            "after": "2026-07-10T10:00:45.000Z",
+            "outside": "2026-07-10T10:01:30.000Z",
+        }
+        for event_id, timestamp in timestamps.items():
+            db.insert_event({
+                "event_id": event_id,
+                "timestamp": timestamp,
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "time-window",
+                    "run_id": event_id,
+                },
+                "event_type": "model_request",
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {},
+            })
+
+        chain = db.get_evidence_chain("anchor")
+        assert [event["event_id"] for event in chain] == [
+            "before",
+            "anchor",
+            "after",
+        ]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_tool_result_replays_are_preserved():
+    """Repeated tool_result observations with one call_id remain distinct."""
+    print("--- test_tool_result_replays_are_preserved ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup.db")
@@ -492,32 +566,24 @@ def test_tool_result_dedup():
             "context": {"turn_number": 1},
         }
 
-        # Insert the same logical tool_result twice (as happens when agents replay history)
+        # Re-delivery is itself audit evidence, even when the payload matches.
         eid1 = db.insert_event(dict(base_event))
         eid2 = db.insert_event(dict(base_event))
 
-        # Both calls should return an event_id (the first one's id on dedup)
-        assert eid1, "First insert should return event_id"
-        assert eid2, "Second insert should return event_id"
-
-        # Second insert should return the SAME event_id (the original row)
-        assert eid1 == eid2, (
-            f"Duplicate tool_result should return same event_id, got {eid1!r} vs {eid2!r}"
-        )
-
-        # Only one row should exist in the DB
+        assert eid1 and eid2
+        assert eid1 != eid2
         stats = db.get_stats()
-        assert stats["total_events"] == 1, (
-            f"Expected 1 event after dedup, got {stats['total_events']}"
-        )
+        assert stats["total_events"] == 2
+        assert db.get_chain_checkpoint()["event_count"] == 2
+        assert db.verify_chain()["valid"]
 
         db.close()
         print("  PASSED")
 
 
-def test_tool_call_dedup():
-    """Replayed tool_call events with the same call_id are also deduplicated."""
-    print("--- test_tool_call_dedup ---")
+def test_tool_call_replays_are_preserved():
+    """Repeated tool_call observations with one call_id remain distinct."""
+    print("--- test_tool_call_replays_are_preserved ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup_call.db")
@@ -541,22 +607,96 @@ def test_tool_call_dedup():
 
         eid1 = db.insert_event(dict(base))
         eid2 = db.insert_event(dict(base))
-        eid3 = db.insert_event(dict(base))  # Third replay
+        eid3 = db.insert_event(dict(base))
 
-        assert eid1 == eid2 == eid3, (
-            f"All replays should return same event_id, got {eid1!r}, {eid2!r}, {eid3!r}"
-        )
+        assert len({eid1, eid2, eid3}) == 3
 
         results = db.query(event_type="tool_call")
-        assert len(results) == 1, f"Expected 1 row after dedup, got {len(results)}"
+        assert len(results) == 3
+        assert db.get_chain_checkpoint()["event_count"] == 3
+        assert db.verify_chain()["valid"]
 
         db.close()
         print("  PASSED")
 
 
-def test_dedup_different_sessions():
-    """Same call_id in different sessions is NOT deduplicated."""
-    print("--- test_dedup_different_sessions ---")
+def test_call_id_is_correlation_not_idempotency():
+    """A call_id never suppresses a distinct event, matching or changed."""
+    print("--- test_call_id_is_correlation_not_idempotency ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "semantic-dedup.db"))
+        base = {
+            "event_id": "call-observation-1",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {
+                "type": "claude_code",
+                "session_id": "semantic-session",
+                "run_id": "run-1",
+            },
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "Write",
+                "parameters": {
+                    "file_path": "/tmp/test.txt",
+                    "content": "hello",
+                },
+                "call_id": "provider-call-stable",
+                "data_accessed": [],
+            },
+            "outcome": {"status": "success"},
+            "context": {"turn_number": 1, "user_message": "first observation"},
+        }
+
+        first_id = db.insert_event(base)
+        before = db.get_chain_checkpoint()
+
+        # Replayed history can be observed in a later run/turn and receive a
+        # new event envelope while still representing the exact same call.
+        replay = {
+            **base,
+            "event_id": "call-observation-2",
+            "timestamp": "2026-07-10T10:05:00.000Z",
+            "agent": {
+                **base["agent"],
+                "run_id": "run-2",
+            },
+            "context": {
+                "turn_number": 9,
+                "user_message": "history replay",
+            },
+        }
+        replay_id = db.insert_event(replay)
+        assert replay_id != first_id
+        after_replay = db.get_chain_checkpoint()
+        assert after_replay["event_count"] == before["event_count"] + 1
+        assert after_replay["head"] != before["head"]
+        assert db.get_stats()["total_events"] == 2
+
+        changed_work = {
+            **replay,
+            "event_id": "call-observation-3",
+            "action": {
+                **base["action"],
+                "parameters": {
+                    "file_path": "/tmp/test.txt",
+                    "content": "different content",
+                },
+            },
+        }
+        changed_id = db.insert_event(changed_work)
+        assert len({first_id, replay_id, changed_id}) == 3
+        assert db.get_chain_checkpoint()["event_count"] == 3
+        assert db.get_stats()["total_events"] == 3
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_call_id_correlation_across_sessions():
+    """The same call_id can correlate events without imposing uniqueness."""
+    print("--- test_call_id_correlation_across_sessions ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup_sessions.db")
@@ -578,7 +718,6 @@ def test_dedup_different_sessions():
                 "context": {},
             })
 
-        # Two rows, different sessions — no dedup
         results = db.query(event_type="tool_result")
         assert len(results) == 2, (
             f"Same call_id in different sessions should produce 2 rows, got {len(results)}"
@@ -589,7 +728,7 @@ def test_dedup_different_sessions():
 
 
 def test_migration_v1_to_v2():
-    """Opening a v1 database triggers migration: adds call_id, index, and deduplicates."""
+    """Opening a v1 DB adds call_id without treating targets as replay keys."""
     print("--- test_migration_v1_to_v2 ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -625,7 +764,7 @@ def test_migration_v1_to_v2():
             )
         """)
 
-        # Two duplicate tool_result rows for the same logical call
+        # Two legitimate tool_result rows happen to share a resource target.
         action_json = json.dumps({
             "tool_name": "bash",
             "parameters": {},
@@ -653,10 +792,11 @@ def test_migration_v1_to_v2():
         # ── Open with AuditDB — migration should run ──────────────────────
         db = AuditDB(db_path)
 
-        # Verify schema version updated to 3 (v1 → v2 → v3 in one pass)
+        # Verify migration reached the current schema in one transaction.
         stats = db.get_stats()
-        assert stats["schema_version"] == 3, (
-            f"Expected schema_version=3 after migration, got {stats['schema_version']}"
+        assert stats["schema_version"] == SCHEMA_VERSION, (
+            f"Expected schema_version={SCHEMA_VERSION} after migration, "
+            f"got {stats['schema_version']}"
         )
 
         db.close()
@@ -668,28 +808,24 @@ def test_migration_v1_to_v2():
         col_names = {r[1] for r in raw.execute("PRAGMA table_info(events)")}
         assert "call_id" in col_names, "call_id column missing after migration"
 
-        # Dedup index must exist
+        # call_id is indexed for correlation but never constrained unique.
         index_names = {r[1] for r in raw.execute("PRAGMA index_list(events)")}
-        assert "idx_events_dedup" in index_names, "Dedup index missing after migration"
+        assert "idx_events_call_id" in index_names
+        assert "idx_events_dedup" not in index_names
 
-        # Duplicate tool_result rows collapsed to the earliest one
+        # A target is not a true idempotency key, so both rows survive.
         rows = list(raw.execute(
             "SELECT event_id FROM events WHERE event_type = 'tool_result'"
         ))
-        assert len(rows) == 1, (
-            f"Expected 1 tool_result after dedup, got {len(rows)}: {rows}"
-        )
-        assert rows[0][0] == "dup-1", (
-            f"Earliest row (dup-1) should survive, got {rows[0][0]}"
-        )
+        assert {row[0] for row in rows} == {"dup-1", "dup-2"}
 
-        # call_id backfilled from target
-        row = raw.execute(
-            "SELECT call_id FROM events WHERE event_id = 'dup-1'"
-        ).fetchone()
-        assert row[0] == "call-legacy-001", (
-            f"call_id not backfilled from target, got {row[0]!r}"
-        )
+        # No explicit action.call_id existed, so no replay key is fabricated.
+        call_ids = {
+            row[0] for row in raw.execute(
+                "SELECT call_id FROM events WHERE event_type = 'tool_result'"
+            )
+        }
+        assert call_ids == {""}
 
         # Non-duplicate model_request row still present
         rows2 = list(raw.execute(
@@ -699,6 +835,110 @@ def test_migration_v1_to_v2():
 
         raw.close()
         print("  PASSED")
+
+
+def test_migration_preserves_all_duplicate_call_ids():
+    """Migration never erases matching or conflicting legacy call deliveries."""
+    print("--- test_migration_preserves_all_duplicate_call_ids ---")
+
+    def create_v1(path, second_content):
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (1)")
+        conn.execute("""
+            CREATE TABLE events (
+                event_id        TEXT PRIMARY KEY,
+                timestamp       TEXT NOT NULL,
+                agent_type      TEXT NOT NULL DEFAULT 'unknown',
+                session_id      TEXT NOT NULL,
+                run_id          TEXT,
+                event_type      TEXT NOT NULL,
+                tool_name       TEXT,
+                data_accessed   TEXT DEFAULT '',
+                agent           TEXT NOT NULL,
+                user_info       TEXT NOT NULL,
+                action          TEXT NOT NULL,
+                outcome         TEXT NOT NULL,
+                context         TEXT NOT NULL,
+                cost            TEXT NOT NULL,
+                raw_request     TEXT,
+                raw_response    TEXT
+            )
+        """)
+        for index, content in enumerate(("same", second_content), start=1):
+            action = json.dumps({
+                "tool_name": "Write",
+                "parameters": {"path": "/tmp/a", "content": content},
+                "call_id": "legacy-provider-call",
+            })
+            agent = json.dumps({
+                "type": "hermes",
+                "session_id": "legacy-session",
+                "run_id": f"run-{index}",
+            })
+            context = json.dumps({"turn_number": index})
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, timestamp, agent_type, session_id, run_id,
+                    event_type, tool_name, data_accessed, agent, user_info,
+                    action, outcome, context, cost, raw_request, raw_response
+                ) VALUES (?, ?, 'hermes', 'legacy-session', ?, 'tool_call',
+                          'Write', '', ?, '{}', ?, '{"status":"success"}',
+                          ?, '{}', NULL, NULL)
+                """,
+                (
+                    f"legacy-{index}",
+                    f"2026-07-10T10:0{index}:00.000Z",
+                    f"run-{index}",
+                    agent,
+                    action,
+                    context,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        replay_path = os.path.join(tmpdir, "replay.db")
+        create_v1(replay_path, "same")
+        replay_db = AuditDB(replay_path)
+        replay_rows = replay_db.query(event_type="tool_call", limit=10)
+        assert {row["event_id"] for row in replay_rows} == {
+            "legacy-1",
+            "legacy-2",
+        }
+        checkpoint = replay_db.get_chain_checkpoint()
+        assert checkpoint["legacy_event_count"] == 2
+        assert checkpoint["event_count"] == 0
+        replay_db.close()
+
+        conflict_path = os.path.join(tmpdir, "conflict.db")
+        create_v1(conflict_path, "changed")
+        conflict_db = AuditDB(conflict_path)
+        conflict_rows = conflict_db.query(event_type="tool_call", limit=10)
+        assert {row["event_id"] for row in conflict_rows} == {
+            "legacy-1",
+            "legacy-2",
+        }
+        assert {
+            row["action"]["parameters"]["content"] for row in conflict_rows
+        } == {"same", "changed"}
+        assert conflict_db.get_chain_checkpoint()["legacy_event_count"] == 2
+        conflict_db.close()
+
+        raw = sqlite3.connect(conflict_path)
+        indexes = {row[1] for row in raw.execute("PRAGMA index_list(events)")}
+        raw.close()
+        assert "idx_events_call_id" in indexes
+        assert "idx_events_dedup" not in indexes
+
+    print("  PASSED")
 
 
 def test_session_access():
@@ -822,9 +1062,87 @@ def test_concurrent_access():
         stats = db.get_stats()
         expected = 4 * count_per_thread
         assert stats["total_events"] == expected, f"Expected {expected} events, got {stats['total_events']}"
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["event_count"] == expected
+        verification = db.verify_chain()
+        assert verification["valid"], verification
+        assert verification["checked_events"] == expected
 
         db.close()
         print("  PASSED")
+
+
+def test_concurrent_batches_across_db_instances_do_not_fork_chain():
+    """Independent writers serialize the shared chain head transactionally."""
+    print("--- test_concurrent_batches_across_db_instances_do_not_fork_chain ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "multi-writer.db")
+        first = AuditDB(db_path)
+        second = AuditDB(db_path)
+        errors = []
+
+        def write_batch(db, start):
+            try:
+                db.insert_events([
+                    {
+                        "event_id": f"concurrent-{i}",
+                        "timestamp": f"2026-07-10T10:00:{i:02d}.000Z",
+                        "agent": {
+                            "type": "hermes",
+                            "session_id": "shared-session",
+                            "run_id": f"run-{i}",
+                        },
+                        "event_type": "model_request",
+                        "action": {},
+                        "outcome": {"status": "success"},
+                        "context": {"turn_number": i},
+                    }
+                    for i in range(start, start + 20)
+                ])
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=write_batch, args=(first, 0)),
+            threading.Thread(target=write_batch, args=(second, 20)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, errors
+        checkpoint = first.get_chain_checkpoint()
+        assert checkpoint["event_count"] == 40
+        verification = second.verify_chain()
+        assert verification["valid"], verification
+        assert verification["checked_events"] == 40
+
+        first.close()
+        second.close()
+        reopened = AuditDB(db_path)
+        assert reopened.verify_chain()["valid"]
+        reopened.close()
+
+    print("  PASSED")
+
+
+def test_short_lived_threads_release_connections():
+    """A request thread must not leave its SQLite connection open forever."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "connections.db"))
+
+        def read_stats():
+            db.get_stats()
+
+        for _ in range(25):
+            thread = threading.Thread(target=read_stats)
+            thread.start()
+            thread.join()
+
+        assert len(db._all_conns) == 0
+        db.close()
 
 
 def test_schema_version_table():
@@ -839,12 +1157,54 @@ def test_schema_version_table():
         conn = sqlite3.connect(db_path)
         cur = conn.execute("SELECT version, applied_at FROM schema_version ORDER BY version DESC LIMIT 1")
         row = cur.fetchone()
-        assert row[0] == 3, f"Expected version 3, got {row[0]}"
+        assert row[0] == SCHEMA_VERSION, (
+            f"Expected version {SCHEMA_VERSION}, got {row[0]}"
+        )
         assert row[1] is not None
         conn.close()
 
         db.close()
         print("  PASSED")
+
+
+def test_future_schema_version_is_rejected():
+    """A newer database must not be interpreted with older code."""
+    print("--- test_future_schema_version_is_rejected ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "future.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?)",
+            (SCHEMA_VERSION + 1,),
+        )
+        # A future release is free to change the events layout. Version
+        # rejection must happen before today's indexes inspect these columns.
+        conn.execute("CREATE TABLE events (future_only TEXT)")
+        conn.commit()
+        conn.close()
+
+        try:
+            AuditDB(db_path)
+            assert False, "A future schema version must be rejected"
+        except UnsupportedSchemaVersionError as exc:
+            message = str(exc)
+            assert str(SCHEMA_VERSION + 1) in message
+            assert str(SCHEMA_VERSION) in message
+            assert "refusing to open" in message
+
+        check = sqlite3.connect(db_path)
+        columns = [row[1] for row in check.execute("PRAGMA table_info(events)")]
+        check.close()
+        assert columns == ["future_only"]
+
+    print("  PASSED")
 
 
 def test_insert_events_batch():
@@ -883,6 +1243,12 @@ def test_insert_events_batch():
         # All events must be in the DB
         stats = db.get_stats()
         assert stats["total_events"] == 3
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["event_count"] == 3
+        assert checkpoint["coverage"] == "complete"
+        assert checkpoint["checkpoint_scope"] == "database_internal"
+        assert checkpoint["external_anchor_required"] is True
+        assert db.verify_chain()["valid"]
 
         # insert_event (single) still works and shares the code path
         eid_single = db.insert_event(_evt(99))
@@ -892,9 +1258,515 @@ def test_insert_events_batch():
         print("  PASSED")
 
 
-def test_insert_events_dedup_within_batch():
-    """Two events with the same dedup key in one batch: both return the first's id."""
-    print("--- test_insert_events_dedup_within_batch ---")
+def test_event_id_conflicts_and_invalid_events_are_never_silent():
+    """Only an identical canonical payload may reuse an event_id."""
+    print("--- test_event_id_conflicts_and_invalid_events_are_never_silent ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "conflicts.db"))
+        event = {
+            "event_id": "fixed-event-id",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success", "summary": "original"},
+            "context": {"turn_number": 1},
+        }
+
+        first = db.insert_event(event)
+        before = db.get_chain_checkpoint()
+        assert db.insert_event(event) == first
+        assert db.get_chain_checkpoint() == before
+
+        conflicting = {
+            **event,
+            "outcome": {"status": "error", "summary": "rewritten"},
+        }
+        try:
+            db.insert_event(conflicting)
+            assert False, "A conflicting event_id must not be silently ignored"
+        except EventConflictError as exc:
+            assert "different canonical payload" in str(exc)
+
+        invalid = {
+            "event_id": "invalid-null-session",
+            "agent": {"type": "hermes", "session_id": None, "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        }
+        try:
+            db.insert_event(invalid)
+            assert False, "An invalid NOT NULL field must fail visibly"
+        except (ValidationError, sqlite3.IntegrityError):
+            pass
+
+        rows = db.query(limit=20)
+        assert len(rows) == 1
+        assert rows[0]["outcome"]["summary"] == "original"
+        assert db.get_chain_checkpoint() == before
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_redaction_cannot_collapse_distinct_secret_bearing_event_replays():
+    """Duplicate IDs with erased secret differences must fail, never disappear."""
+    print("--- test_redaction_cannot_collapse_distinct_secret_bearing_event_replays ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "redacted-conflicts.db"))
+        base = {
+            "event_id": "secret-bearing-event",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "database_login",
+                "parameters": {"username": "alice", "password": "first-secret"},
+            },
+            "outcome": {"status": "pending"},
+            "context": {},
+        }
+
+        db.insert_event(base)
+        before = db.get_chain_checkpoint()
+
+        for retry in (
+            base,
+            {
+                **base,
+                "action": {
+                    **base["action"],
+                    "parameters": {
+                        "username": "alice",
+                        "password": "different-secret",
+                    },
+                },
+            },
+        ):
+            try:
+                db.insert_event(retry)
+                assert False, "A raw secret-bearing duplicate ID must conflict"
+            except EventConflictError as exc:
+                assert "cannot be proven identical" in str(exc)
+
+        # A canonical read-back contains only the placeholder and is safe to
+        # replay idempotently for transport recovery.
+        stored = db.query(limit=1)[0]
+        assert stored["action"]["parameters"]["password"] == "[REDACTED]"
+        assert db.insert_event(stored) == base["event_id"]
+        assert db.get_chain_checkpoint() == before
+        assert db.get_stats()["total_events"] == 1
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_explicit_event_id_requires_stable_timestamp():
+    """Generated timestamps cannot underpin stable event_id idempotency."""
+    print("--- test_explicit_event_id_requires_stable_timestamp ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "stable-envelope.db"))
+        event = {
+            "event_id": "stable-id",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        }
+        for _ in range(2):
+            try:
+                db.insert_event(event)
+                assert False, "A stable event_id needs a stable timestamp"
+            except ValidationError as exc:
+                assert "timestamp is required when event_id is provided" in str(exc)
+
+        assert db.get_stats()["total_events"] == 0
+        assert db.get_chain_checkpoint()["event_count"] == 0
+        db.close()
+
+    print("  PASSED")
+
+
+def test_query_round_trip_is_idempotent_with_derived_metadata():
+    """A stored canonical event can be replayed without advancing the chain."""
+    print("--- test_query_round_trip_is_idempotent_with_derived_metadata ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "round-trip.db"))
+        event = {
+            "event_id": "round-trip-prod",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {
+                "type": "hermes",
+                "session_id": "round-trip-session",
+                "run_id": "round-trip-run",
+            },
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "read_file",
+                "parameters": {"path": "/srv/prod/config.json"},
+                "target": "/srv/prod/config.json",
+            },
+            "outcome": {"status": "success"},
+            "context": {"turn_number": 1},
+        }
+
+        assert db.insert_event(event) == "round-trip-prod"
+        stored = db.query(limit=1)[0]
+        assert "prod" in stored["action"]["derived_data_accessed"]
+        assert "prod" in stored["action"]["data_accessed"]
+        before = db.get_chain_checkpoint()
+
+        assert db.insert_event(stored) == "round-trip-prod"
+        assert db.get_chain_checkpoint() == before
+        assert db.get_stats()["total_events"] == 1
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_query_round_trip_is_idempotent_with_safe_capture_metadata():
+    """A safe authorization phase label is not mistaken for lost credentials."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "capture-replay.db"))
+        event = normalize_event({
+            "event_id": "capture-replay-event",
+            "timestamp": "2026-07-17T12:00:00Z",
+            "agent": {
+                "type": "hermes",
+                "session_id": "capture-session",
+                "run_id": "capture-run",
+            },
+            "event_type": "decision_point",
+            "action": {
+                "tool_name": "read_file",
+                "parameters": {"path": "README.md"},
+            },
+            "outcome": {"status": "success"},
+            "context": {
+                "capture": HERMES_AUTHORIZER_CAPABILITIES.as_context(
+                    authorization_check="pre_execution",
+                ),
+            },
+        })
+
+        event_id = db.insert_event(event)
+        before = db.get_chain_checkpoint()
+        stored = db.query(event_type="decision_point", limit=1)[0]
+
+        assert db.insert_event(stored) == event_id
+        assert db.get_chain_checkpoint() == before
+        db.close()
+
+
+def test_shared_target_without_call_id_is_not_deduplicated():
+    """Repeated calls to one resource remain distinct without a true call_id."""
+    print("--- test_shared_target_without_call_id_is_not_deduplicated ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "targets.db"))
+        ids = []
+        for i, content in enumerate(("first", "second")):
+            ids.append(db.insert_event({
+                "event_id": f"target-event-{i}",
+                "timestamp": f"2026-07-10T10:00:0{i}.000Z",
+                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                "event_type": "tool_call",
+                "action": {
+                    "tool_name": "write_file",
+                    "target": "/tmp/shared.txt",
+                    "parameters": {"content": content},
+                },
+                "outcome": {"status": "success"},
+                "context": {"turn_number": i},
+            }))
+
+        assert ids == ["target-event-0", "target-event-1"]
+        assert len(db.query(event_type="tool_call", limit=20)) == 2
+        assert db.get_chain_checkpoint()["event_count"] == 2
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_hash_chain_detects_canonical_payload_tampering():
+    """Changing a persisted event breaks verification at that event."""
+    print("--- test_hash_chain_detects_canonical_payload_tampering ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "tamper.db")
+        db = AuditDB(db_path)
+        for i in range(3):
+            db.insert_event({
+                "event_id": f"chain-{i}",
+                "timestamp": f"2026-07-10T10:00:0{i}.000Z",
+                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                "event_type": "model_request",
+                "action": {"sequence": i},
+                "outcome": {"status": "success"},
+                "context": {"turn_number": i},
+            })
+
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["initialized"]
+        assert checkpoint["event_count"] == 3
+        assert checkpoint["first_event_id"] == "chain-0"
+        assert checkpoint["last_event_id"] == "chain-2"
+        assert db.verify_chain()["valid"]
+
+        raw = sqlite3.connect(db_path)
+        raw.execute(
+            "UPDATE events SET outcome = ? WHERE event_id = 'chain-1'",
+            (json.dumps({"status": "blocked", "summary": "forged"}),),
+        )
+        raw.commit()
+        raw.close()
+
+        verification = db.verify_chain()
+        assert not verification["valid"]
+        assert verification["broken_event_id"] == "chain-1"
+        assert "hash mismatch" in verification["error"].lower()
+        db.close()
+
+    print("  PASSED")
+
+
+def test_chain_append_validation_is_indexed_not_history_scanning():
+    """The ingest hot path validates only the metadata-addressed chain head."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "append-cost.db")
+        db = AuditDB(db_path)
+        db.insert_event({
+            "event_id": "append-cost-1",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {
+                "type": "hermes",
+                "session_id": "append-cost-session",
+                "run_id": "append-cost-run",
+            },
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        })
+
+        raw = sqlite3.connect(db_path)
+        raw.row_factory = sqlite3.Row
+        statements = []
+
+        class _RecordingConnection:
+            def execute(self, sql, parameters=()):
+                statements.append(" ".join(sql.split()).upper())
+                return raw.execute(sql, parameters)
+
+        checkpoint = _load_chain_for_append(_RecordingConnection())
+        assert checkpoint["event_count"] == 1
+        assert not any("COUNT(" in statement for statement in statements)
+        assert any("WHERE EVENT_ID = ?" in statement for statement in statements)
+        raw.close()
+
+        # Minimal hot-path validation still refuses a changed recorded head.
+        tamper = sqlite3.connect(db_path)
+        tamper.execute(
+            "UPDATE events SET event_hash = ? WHERE event_id = ?",
+            ("0" * 64, "append-cost-1"),
+        )
+        tamper.commit()
+        tamper.close()
+        with pytest.raises(ChainIntegrityError, match="recorded head"):
+            db.insert_event({
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "append-cost-session",
+                    "run_id": "append-cost-run-2",
+                },
+                "event_type": "model_request",
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {},
+            })
+        db.close()
+
+
+def test_verify_checkpoint_exact_prefix_and_tampering():
+    """External checkpoints must identify an exact verified chain prefix."""
+    print("--- test_verify_checkpoint_exact_prefix_and_tampering ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "external-checkpoint.db")
+        db = AuditDB(db_path)
+
+        def insert(index):
+            db.insert_event({
+                "event_id": f"checkpoint-{index}",
+                "timestamp": f"2026-07-10T10:00:{index:02d}.000Z",
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "checkpoint-session",
+                    "run_id": f"run-{index}",
+                },
+                "event_type": "model_request",
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {"turn_number": index},
+            })
+
+        insert(1)
+        insert(2)
+        external = db.get_chain_checkpoint()
+
+        exact = db.verify_checkpoint(external)
+        assert exact["valid"]
+        assert exact["exact"]
+        assert exact["appended_events"] == 0
+        assert exact["checkpoint_event_count"] == 2
+        assert exact["current_event_count"] == 2
+
+        insert(3)
+        insert(4)
+        prefix = db.verify_checkpoint(external)
+        assert prefix["valid"]
+        assert not prefix["exact"]
+        assert prefix["appended_events"] == 2
+        assert prefix["current_event_count"] == 4
+
+        forged_head = {**external, "head": "0" * 64}
+        mismatch = db.verify_checkpoint(forged_head)
+        assert not mismatch["valid"]
+        assert mismatch["appended_events"] is None
+        assert "not the chain prefix" in mismatch["error"]
+
+        forged_boundary = {
+            **external,
+            "legacy_event_count": external["legacy_event_count"] + 1,
+        }
+        boundary = db.verify_checkpoint(forged_boundary)
+        assert not boundary["valid"]
+        assert "legacy_event_count" in boundary["error"]
+
+        ahead = {
+            **external,
+            "event_count": 99,
+            "last_event_id": "does-not-exist",
+        }
+        future = db.verify_checkpoint(ahead)
+        assert not future["valid"]
+        assert "ahead" in future["error"]
+
+        raw = sqlite3.connect(db_path)
+        raw.execute(
+            "UPDATE events SET outcome = ? WHERE event_id = 'checkpoint-3'",
+            (json.dumps({"status": "blocked"}),),
+        )
+        raw.commit()
+        raw.close()
+        corrupt = db.verify_checkpoint(external)
+        assert not corrupt["valid"]
+        assert corrupt["error"].startswith("Current hash chain is invalid:")
+        db.close()
+
+    print("  PASSED")
+
+
+def test_batch_conflict_rolls_back_events_and_chain_head():
+    """A late conflict rolls back earlier batch rows and chain metadata."""
+    print("--- test_batch_conflict_rolls_back_events_and_chain_head ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "rollback-chain.db"))
+        original = {
+            "event_id": "existing",
+            "timestamp": "2026-07-10T10:00:00.000Z",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        }
+        db.insert_event(original)
+        before = db.get_chain_checkpoint()
+
+        new_event = {
+            "event_id": "would-have-been-inserted",
+            "timestamp": "2026-07-10T10:00:01.000Z",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r2"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        }
+        conflicting = {
+            **original,
+            "outcome": {"status": "error"},
+        }
+        try:
+            db.insert_events([new_event, conflicting])
+            assert False, "The conflicting tail event must abort the batch"
+        except EventConflictError:
+            pass
+
+        assert [event["event_id"] for event in db.query(limit=20)] == ["existing"]
+        assert db.get_chain_checkpoint() == before
+        assert db.verify_chain()["valid"]
+        db.close()
+
+    print("  PASSED")
+
+
+def test_database_permissions_and_symlink_rejection():
+    """POSIX storage defaults to owner-only files and rejects DB symlinks."""
+    if os.name != "posix":
+        return
+    print("--- test_database_permissions_and_symlink_rejection ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        private_dir = os.path.join(tmpdir, "private")
+        db_path = os.path.join(private_dir, "audit.db")
+        db = AuditDB(db_path)
+        assert stat.S_IMODE(os.stat(private_dir).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(db_path).st_mode) & 0o177 == 0
+
+        conn = db._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE chain_meta SET value = value WHERE key = 'not-present'"
+            )
+            for path in (f"{db_path}-wal", f"{db_path}-shm"):
+                if os.path.exists(path):
+                    assert stat.S_IMODE(os.stat(path).st_mode) & 0o177 == 0
+            conn.rollback()
+        finally:
+            db._put_conn(conn)
+        db.close()
+
+        target = os.path.join(tmpdir, "target.db")
+        with open(target, "wb"):
+            pass
+        link = os.path.join(tmpdir, "linked.db")
+        os.symlink(target, link)
+        try:
+            AuditDB(link)
+            assert False, "A symlink database path must be rejected"
+        except ValueError as exc:
+            assert "symlink" in str(exc).lower()
+
+    print("  PASSED")
+
+
+def test_insert_events_preserves_replays_within_batch():
+    """Two generated events sharing call_id are both stored in one batch."""
+    print("--- test_insert_events_preserves_replays_within_batch ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch_dedup.db")
@@ -917,27 +1789,23 @@ def test_insert_events_dedup_within_batch():
                 "context": {},
             }
 
-        # Two identical events in the same batch — first wins
+        # Two observations in one batch get distinct event IDs and chain links.
         ids = db.insert_events([_tool_result(), _tool_result()])
         assert len(ids) == 2
-        # Both should return the same event_id (the one that actually inserted)
-        assert ids[0] == ids[1], (
-            f"Dedup within batch should return same id, got {ids[0]!r} vs {ids[1]!r}"
-        )
+        assert ids[0] != ids[1]
 
-        # Only one row should be in the DB
         stats = db.get_stats()
-        assert stats["total_events"] == 1, (
-            f"Expected 1 event after intra-batch dedup, got {stats['total_events']}"
-        )
+        assert stats["total_events"] == 2
+        assert db.get_chain_checkpoint()["event_count"] == 2
+        assert db.verify_chain()["valid"]
 
         db.close()
         print("  PASSED")
 
 
-def test_insert_events_dedup_against_existing():
-    """Batch dedup against a pre-existing row returns the pre-existing event_id."""
-    print("--- test_insert_events_dedup_against_existing ---")
+def test_insert_events_preserves_replay_against_existing():
+    """A later event with the same call_id remains a separate observation."""
+    print("--- test_insert_events_preserves_replay_against_existing ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch_preexist.db")
@@ -963,7 +1831,7 @@ def test_insert_events_dedup_against_existing():
         existing_id = db.insert_event(dict(base))
         assert existing_id
 
-        # Batch: one duplicate (same call_id) + one genuinely new event
+        # Batch: one repeated call_id plus another event.
         new_event = {
             "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
             "event_type": "tool_call",
@@ -977,20 +1845,14 @@ def test_insert_events_dedup_against_existing():
         }
         ids = db.insert_events([dict(base), new_event])
 
-        # Duplicate should return the pre-existing row's id
-        assert ids[0] == existing_id, (
-            f"Duplicate in batch should return pre-existing id {existing_id!r}, got {ids[0]!r}"
-        )
-        # New event should get a fresh id
-        assert ids[1] and ids[1] != existing_id, (
-            f"New event in batch should get distinct id, got {ids[1]!r}"
-        )
+        assert ids[0] != existing_id
+        assert ids[1] and ids[1] != existing_id
+        assert ids[0] != ids[1]
 
-        # Total: 2 rows (the pre-existing and the new one)
         stats = db.get_stats()
-        assert stats["total_events"] == 2, (
-            f"Expected 2 events total, got {stats['total_events']}"
-        )
+        assert stats["total_events"] == 3
+        assert db.get_chain_checkpoint()["event_count"] == 3
+        assert db.verify_chain()["valid"]
 
         db.close()
         print("  PASSED")
@@ -1059,12 +1921,18 @@ def test_covering_index_exists():
 
 
 def test_v3_fresh_schema():
-    """A fresh DB has hash-chain columns and the v3 auxiliary tables."""
+    """A fresh DB has hash-chain columns and metadata."""
     print("--- test_v3_fresh_schema ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_v3.db")
         db = AuditDB(db_path)
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["initialized"]
+        assert checkpoint["event_count"] == 0
+        assert checkpoint["legacy_event_count"] == 0
+        assert checkpoint["coverage"] == "complete"
+        assert db.verify_chain()["valid"]
         db.close()
 
         conn = sqlite3.connect(db_path)
@@ -1078,19 +1946,139 @@ def test_v3_fresh_schema():
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        for table in ("chain_meta", "baselines", "trust_events", "alerts"):
-            assert table in table_names, f"v3 table '{table}' missing: {table_names}"
-
-        index_names = {
-            r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            )
-        }
-        for idx in ("idx_trust_events_session", "idx_alerts_timestamp", "idx_alerts_severity"):
-            assert idx in index_names, f"v3 index '{idx}' missing"
+        assert "chain_meta" in table_names
+        assert not {"baselines", "trust_events", "alerts"} & table_names
 
         conn.close()
         print("  PASSED")
+
+
+def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
+    """Migration preserves rows whose corrected explicit call_ids converge."""
+    print("--- test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction ---")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "v3-call-id.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+            CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("INSERT INTO schema_version (version) VALUES (3)")
+        conn.execute("""
+            CREATE TABLE events (
+                event_id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                agent_type TEXT NOT NULL DEFAULT 'unknown',
+                session_id TEXT NOT NULL,
+                run_id TEXT,
+                event_type TEXT NOT NULL,
+                tool_name TEXT,
+                data_accessed TEXT DEFAULT '',
+                call_id TEXT DEFAULT '',
+                agent TEXT NOT NULL,
+                user_info TEXT NOT NULL,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                context TEXT NOT NULL,
+                cost TEXT NOT NULL,
+                raw_request TEXT,
+                raw_response TEXT,
+                prev_hash TEXT,
+                event_hash TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX idx_events_dedup
+            ON events(session_id, event_type, call_id)
+            WHERE call_id != ''
+              AND event_type IN ('tool_call', 'tool_result')
+        """)
+        for index, legacy_key in enumerate(
+            ("legacy-target-a", "legacy-target-b"),
+            start=1,
+        ):
+            action = json.dumps({
+                "tool_name": "bash",
+                "parameters": {"attempt": index},
+                "target": legacy_key,
+                "call_id": "shared-provider-call",
+            })
+            agent = json.dumps({
+                "type": "hermes",
+                "session_id": "migration-session",
+                "run_id": f"run-{index}",
+            })
+            conn.execute(
+                """
+                INSERT INTO events (
+                    event_id, timestamp, agent_type, session_id, run_id,
+                    event_type, tool_name, data_accessed, call_id, agent,
+                    user_info, action, outcome, context, cost
+                ) VALUES (?, ?, 'hermes', 'migration-session', ?, 'tool_call',
+                          'bash', '', ?, ?, '{}', ?, '{"status":"success"}',
+                          '{}', '{}')
+                """,
+                (
+                    f"legacy-event-{index}",
+                    f"2026-07-10T10:0{index}:00.000Z",
+                    f"run-{index}",
+                    legacy_key,
+                    agent,
+                    action,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+        db = AuditDB(db_path)
+        assert db.get_stats()["total_events"] == 2
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["legacy_event_count"] == 2
+        assert checkpoint["event_count"] == 0
+
+        third_id = db.insert_event({
+            "event_id": "new-delivery",
+            "timestamp": "2026-07-10T10:03:00.000Z",
+            "agent": {
+                "type": "hermes",
+                "session_id": "migration-session",
+                "run_id": "run-3",
+            },
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "bash",
+                "parameters": {"attempt": 3},
+                "call_id": "shared-provider-call",
+            },
+            "outcome": {"status": "success"},
+            "context": {},
+        })
+        assert third_id == "new-delivery"
+        assert db.get_stats()["total_events"] == 3
+        assert db.verify_chain()["valid"]
+        db.close()
+
+        raw = sqlite3.connect(db_path)
+        call_ids = [
+            row[0] for row in raw.execute(
+                "SELECT call_id FROM events ORDER BY timestamp"
+            )
+        ]
+        indexes = {row[1] for row in raw.execute("PRAGMA index_list(events)")}
+        version = raw.execute(
+            "SELECT MAX(version) FROM schema_version"
+        ).fetchone()[0]
+        raw.close()
+
+        assert call_ids == ["shared-provider-call"] * 3
+        assert "idx_events_dedup" not in indexes
+        assert "idx_events_call_id" in indexes
+        assert version == SCHEMA_VERSION
+
+    print("  PASSED")
 
 
 def test_migration_v2_to_v3():
@@ -1143,8 +2131,9 @@ def test_migration_v2_to_v3():
         # ── Open with AuditDB — v2 → v3 migration should run ──────────────
         db = AuditDB(db_path)
         stats = db.get_stats()
-        assert stats["schema_version"] == 3, (
-            f"Expected schema_version=3 after migration, got {stats['schema_version']}"
+        assert stats["schema_version"] == SCHEMA_VERSION, (
+            f"Expected schema_version={SCHEMA_VERSION} after migration, "
+            f"got {stats['schema_version']}"
         )
 
         # Existing data survives and stays queryable
@@ -1152,13 +2141,19 @@ def test_migration_v2_to_v3():
         assert len(events) == 1 and events[0]["event_id"] == "v2-evt-1"
 
         # New inserts work against the migrated table
-        db.insert_event({
+        new_event_id = db.insert_event({
             "agent": {"type": "hermes", "session_id": "sess-v2", "run_id": "r2"},
             "event_type": "tool_call",
             "action": {"tool_name": "read_file", "parameters": {}},
             "outcome": {"status": "success"},
             "context": {},
         })
+        checkpoint = db.get_chain_checkpoint()
+        assert checkpoint["event_count"] == 1
+        assert checkpoint["legacy_event_count"] == 1
+        assert checkpoint["coverage"] == "partial"
+        assert checkpoint["first_event_id"] == new_event_id
+        assert db.verify_chain()["valid"]
         db.close()
 
         # ── Verify via raw sqlite3 ────────────────────────────────────────
@@ -1167,11 +2162,19 @@ def test_migration_v2_to_v3():
         assert "prev_hash" in col_names and "event_hash" in col_names, (
             "hash-chain columns missing after v2 → v3 migration"
         )
+        legacy_hashes = raw.execute(
+            "SELECT prev_hash, event_hash FROM events WHERE event_id = 'v2-evt-1'"
+        ).fetchone()
+        new_hashes = raw.execute(
+            "SELECT prev_hash, event_hash FROM events WHERE event_id = ?",
+            (new_event_id,),
+        ).fetchone()
+        assert legacy_hashes == (None, None)
+        assert all(new_hashes)
         table_names = {
             r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
-        for table in ("chain_meta", "baselines", "trust_events", "alerts"):
-            assert table in table_names, f"v3 table '{table}' missing after migration"
+        assert "chain_meta" in table_names
         raw.close()
         print("  PASSED")
 
@@ -1296,6 +2299,11 @@ def test_aggregate_validation():
             lambda: db.aggregate(group_by=["evil; DROP TABLE events"]),
             lambda: db.aggregate(group_by=["agent_type"], metrics=["1); DELETE"]),
             lambda: db.aggregate(group_by=["agent_type"], order_by="timestamp"),
+            lambda: db.aggregate(group_by=[], limit=-1),
+            lambda: db.query(limit=-1),
+            lambda: db.query(limit=10_001),
+            lambda: db.query(offset=-1),
+            lambda: db.list_sessions(limit=0),
         ):
             try:
                 bad_call()
@@ -1312,23 +2320,39 @@ if __name__ == "__main__":
     test_normalize_event()
     test_validate_event()
     test_db_lifecycle()
+    test_in_memory_database_persists_across_operation_connections()
     test_query_filters()
     test_evidence_chain()
     test_evidence_chain_via_call_id()
-    test_tool_result_dedup()
-    test_tool_call_dedup()
-    test_dedup_different_sessions()
+    test_evidence_chain_temporal_fallback_parses_iso8601()
+    test_tool_result_replays_are_preserved()
+    test_tool_call_replays_are_preserved()
+    test_call_id_is_correlation_not_idempotency()
+    test_call_id_correlation_across_sessions()
     test_migration_v1_to_v2()
+    test_migration_preserves_all_duplicate_call_ids()
     test_session_access()
     test_validation_error_on_insert()
     test_concurrent_access()
+    test_concurrent_batches_across_db_instances_do_not_fork_chain()
     test_schema_version_table()
+    test_future_schema_version_is_rejected()
     test_insert_events_batch()
-    test_insert_events_dedup_within_batch()
-    test_insert_events_dedup_against_existing()
+    test_event_id_conflicts_and_invalid_events_are_never_silent()
+    test_redaction_cannot_collapse_distinct_secret_bearing_event_replays()
+    test_explicit_event_id_requires_stable_timestamp()
+    test_query_round_trip_is_idempotent_with_derived_metadata()
+    test_shared_target_without_call_id_is_not_deduplicated()
+    test_hash_chain_detects_canonical_payload_tampering()
+    test_verify_checkpoint_exact_prefix_and_tampering()
+    test_batch_conflict_rolls_back_events_and_chain_head()
+    test_database_permissions_and_symlink_rejection()
+    test_insert_events_preserves_replays_within_batch()
+    test_insert_events_preserves_replay_against_existing()
     test_insert_events_rollback_on_bad_event()
     test_covering_index_exists()
     test_v3_fresh_schema()
+    test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction()
     test_migration_v2_to_v3()
     test_aggregate_basic()
     test_aggregate_buckets_and_filters()

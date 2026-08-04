@@ -1,18 +1,60 @@
-"""Panoptes CLI — universal agent observability and audit trail."""
+"""Panoptes CLI for adapter observations, local audit trails, and policy gates."""
 
 import argparse
 import json
 import os
+from pathlib import Path
 import shutil
+import sqlite3
 import sys
 
 from panoptes.db import AuditDB
 from panoptes.policy import DEFAULT_POLICIES_DIR, PolicyEngine
 
 
+def _open_existing_db(db_path: str) -> AuditDB:
+    """Open an initialized audit database without creating one by typo.
+
+    ``AuditDB`` intentionally creates and migrates databases for write paths.
+    Read-only CLI commands first probe the path with SQLite's ``mode=ro`` and
+    require Panoptes' events table, so a missing or empty path is never silently
+    turned into a new audit trail.
+    """
+    expanded = os.path.expanduser(db_path)
+    if expanded == ":memory:" or not os.path.isfile(expanded):
+        print(
+            f"Audit database not found or not initialized: {expanded}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    connection = None
+    try:
+        uri = f"{Path(expanded).resolve().as_uri()}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True)
+        initialized = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'events'"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        print(f"Cannot read audit database {expanded}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if initialized is None:
+        print(
+            f"Audit database not found or not initialized: {expanded}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return AuditDB(expanded)
+
+
 def cmd_query(args):
     """Query audit events from the database."""
-    db = AuditDB(args.db_path)
+    db = _open_existing_db(args.db_path)
     results = db.query(
         agent_type=args.agent,
         event_type=args.event_type,
@@ -40,7 +82,7 @@ def cmd_query(args):
 
 def cmd_status(args):
     """Show audit database statistics."""
-    db = AuditDB(args.db_path)
+    db = _open_existing_db(args.db_path)
     stats = db.get_stats()
     print(f"Total events: {stats['total_events']}")
 
@@ -57,15 +99,24 @@ def cmd_status(args):
 
 
 def cmd_session(args):
-    """Show full session timeline."""
-    db = AuditDB(args.db_path)
+    """Show a bounded session timeline selection."""
+    db = _open_existing_db(args.db_path)
     events = db.get_session(args.session_id)
+    total_rows = db.aggregate(
+        group_by=[],
+        metrics=["count"],
+        session_id=args.session_id,
+    )
+    matching_total = int(total_rows[0]["count"]) if total_rows else 0
 
     if not events:
         print(f"No events found for session: {args.session_id}")
         return
 
-    print(f"Session: {args.session_id} ({len(events)} events)\n")
+    selection = f"{len(events)} of {matching_total} events"
+    if len(events) < matching_total:
+        selection += "; showing the newest 10,000"
+    print(f"Session: {args.session_id} ({selection})\n")
     for i, e in enumerate(events, 1):
         print(f"--- Event {i} ---")
         print(json.dumps(e, indent=2, default=str))
@@ -74,7 +125,7 @@ def cmd_session(args):
 
 def cmd_evidence(args):
     """Show evidence chain for an event."""
-    db = AuditDB(args.db_path)
+    db = _open_existing_db(args.db_path)
     chain = db.get_evidence_chain(args.event_id)
     if not chain:
         print(f"No evidence chain found for event: {args.event_id}")
@@ -87,13 +138,53 @@ def cmd_evidence(args):
         print(f"[{e['event_type']}] {outcome.get('summary', 'no summary')}")
 
 
+def cmd_verify(args):
+    """Verify the chain, optionally against a separately stored checkpoint."""
+    db = _open_existing_db(args.db_path)
+    if args.checkpoint:
+        checkpoint_path = os.path.expanduser(args.checkpoint)
+        try:
+            with open(checkpoint_path, "r", encoding="utf-8") as handle:
+                checkpoint = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"Cannot read checkpoint {checkpoint_path}: {exc}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        result = db.verify_checkpoint(checkpoint)
+    else:
+        result = db.verify_chain()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if not result.get("valid"):
+        raise SystemExit(1)
+
+
+def cmd_checkpoint(args):
+    """Print a checkpoint that can be stored in a separate trust domain."""
+    db = _open_existing_db(args.db_path)
+    verification = db.verify_chain()
+    if not verification.get("valid"):
+        print(
+            "Refusing to export a checkpoint for an invalid chain: "
+            f"{verification.get('error') or 'verification failed'}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    print(json.dumps(db.get_chain_checkpoint(), indent=2, sort_keys=True))
+
+
 # ── Policy subcommands ────────────────────────────────────────────────────────
 
 
 def cmd_policy_check(args):
     """Check configured policies against stored events."""
-    db = AuditDB(args.db_path)
+    db = _open_existing_db(args.db_path)
     engine = PolicyEngine(args.policies_dir, db)
+    if engine.policy_snapshot_id is None:
+        for error in engine.load_errors:
+            print(f"Policy load error: {error}", file=sys.stderr)
+        raise SystemExit(2)
 
     results = db.query(
         event_type=args.event_type,
@@ -101,14 +192,25 @@ def cmd_policy_check(args):
         until=args.until,
         limit=args.limit,
     )
+    total_rows = db.aggregate(
+        group_by=[],
+        metrics=["count"],
+        event_type=args.event_type,
+        since=args.since,
+        until=args.until,
+    )
+    matching_total = int(total_rows[0]["count"]) if total_rows else 0
 
     if not results:
         print("No events to check.")
         return
 
     violations = []
+    evaluation_errors: list[tuple[dict, str]] = []
     for event in results:
         result = engine.evaluate(event)
+        for error in getattr(result, "evaluation_errors", []):
+            evaluation_errors.append((event, str(error)))
         if result.action in ("warn", "block"):
             violations.append((event, result))
 
@@ -126,21 +228,48 @@ def cmd_policy_check(args):
                 f"tool={action.get('tool_name', '?')} "
                 f"policies=[{policy_names}]"
             )
+    elif not evaluation_errors:
+        if len(results) < matching_total:
+            print(
+                "No policy violations detected in the selected events "
+                f"(newest {len(results)} of {matching_total} matching events; "
+                "partial scan)."
+            )
+        else:
+            print(
+                "No policy violations detected in the selected events "
+                f"({len(results)} matching events scanned)."
+            )
     else:
-        print("No policy violations detected.")
-    print(f"\nChecked {len(results)} events against {len(engine.policies)} policies.")
+        print("Policy evaluation incomplete; no reliable clean result.")
+
+    if evaluation_errors:
+        for event, error in evaluation_errors:
+            print(
+                "Policy evaluation error "
+                f"for event {event.get('event_id', '?')}: {error}",
+                file=sys.stderr,
+            )
+    print(
+        f"\nChecked {len(results)} of {matching_total} matching events "
+        f"against {len(engine.policies)} policies."
+    )
+    if evaluation_errors:
+        raise SystemExit(2)
 
 
 def cmd_policy_list(args):
     """List all loaded policies."""
     engine = PolicyEngine(args.policies_dir)
     if not engine.policies:
-        print("No policies loaded.")
+        print("No valid policy snapshot loaded.")
         print(f"Policies directory: {engine._policies_dir}")
-        print("Add .yaml policy files to this directory to define policies.")
-        return
+        for error in engine.load_errors:
+            print(f"Policy load error: {error}", file=sys.stderr)
+        raise SystemExit(2)
 
     print(f"Loaded {len(engine.policies)} policies from {engine._policies_dir}:\n")
+    print(f"Snapshot: {engine.policy_snapshot_id}\n")
     for p in engine.policies:
         status = "✓" if p.enabled else "✗ (disabled)"
         scope_str = _format_scope(p.scope)
@@ -227,29 +356,44 @@ def main(argv=None):
 
     parser = argparse.ArgumentParser(
         prog="panoptes",
-        description="Panoptes — universal agent observability, audit trail, and policy enforcement.",
+        description="Panoptes — adapter-based agent observability, local audit trails, and policy gates.",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     # --- proxy ---
     proxy_parser = subparsers.add_parser(
-        "proxy", help="Start the MITM audit proxy", parents=[db_opts, policy_opts]
+        "proxy", help="Start the model-API reverse proxy", parents=[db_opts, policy_opts]
     )
     proxy_parser.add_argument("--port", default=8081, type=int, help="Proxy listen port")
     proxy_parser.add_argument(
         "--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)"
     )
     proxy_parser.add_argument(
-        "--default-upstream",
-        default=None,
-        help="Default upstream base URL for unmatched paths (e.g. https://api.openai.com). "
-             "If not set, unmatched paths return 502.",
-    )
-    proxy_parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)",
+    )
+    proxy_parser.add_argument(
+        "--policy-failure-mode",
+        choices=["fail_open", "fail_closed"],
+        default="fail_open",
+        help=(
+            "Allow or deny traffic when policy loading/evaluation fails "
+            "(default: fail_open)"
+        ),
+    )
+    proxy_parser.add_argument(
+        "--client-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds allowed for client socket reads/writes (default: 30)",
+    )
+    proxy_parser.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=64,
+        help="Maximum simultaneous proxy requests (default: 64)",
     )
 
     # --- query ---
@@ -271,7 +415,7 @@ def main(argv=None):
 
     # --- session ---
     session_parser = subparsers.add_parser(
-        "session", help="Show session timeline", parents=[db_opts]
+        "session", help="Show up to 10,000 newest session events", parents=[db_opts]
     )
     session_parser.add_argument("session_id", help="Session ID to inspect")
 
@@ -280,6 +424,22 @@ def main(argv=None):
         "evidence", help="Show evidence chain", parents=[db_opts]
     )
     evidence_parser.add_argument("event_id", help="Event ID to inspect")
+
+    # --- local hash-chain integrity ---
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Verify the local tamper-evidence hash chain",
+        parents=[db_opts],
+    )
+    verify_parser.add_argument(
+        "--checkpoint",
+        help="Prove a separately stored JSON checkpoint is a prefix of this chain",
+    )
+    subparsers.add_parser(
+        "checkpoint",
+        help="Print the current hash-chain checkpoint",
+        parents=[db_opts],
+    )
 
     # --- policy ---
     policy_parser = subparsers.add_parser("policy", help="Policy management commands")
@@ -329,8 +489,10 @@ def main(argv=None):
             host=args.host,
             db_path=args.db_path,
             policies_dir=args.policies_dir,
-            default_upstream=args.default_upstream,
             log_level=args.log_level,
+            policy_failure_mode=args.policy_failure_mode,
+            client_socket_timeout_seconds=args.client_timeout,
+            max_concurrent_requests=args.max_concurrent_requests,
         )
     elif args.command == "policy":
         policy_commands = {
@@ -350,6 +512,8 @@ def main(argv=None):
             "status": cmd_status,
             "session": cmd_session,
             "evidence": cmd_evidence,
+            "verify": cmd_verify,
+            "checkpoint": cmd_checkpoint,
         }
         handler = commands.get(args.command)
         if handler:
