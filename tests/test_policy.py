@@ -5,7 +5,6 @@ Covers:
   - Policy loading from YAML
   - Basic condition matching (==, !=, contains, in, matches)
   - Boolean logic (AND, OR)
-  - Rate limiting
   - PolicyResult construction
   - Policy violation recording to DB
   - Scope filtering (only applies to specified agents)
@@ -20,11 +19,20 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 # Ensure local package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from panoptes.db import AuditDB
-from panoptes.policy import Policy, PolicyEngine, PolicyResult
+import panoptes.policy as policy_module
+from panoptes.policy import (
+    MAX_POLICY_REASON_LENGTH,
+    POLICY_ENGINE_SEMANTICS_VERSION,
+    Policy,
+    PolicyEngine,
+    PolicyResult,
+)
 
 
 def _make_event(**overrides):
@@ -120,17 +128,32 @@ rule:
 
 
 def test_missing_policies_dir():
-    """Missing policies directory is handled gracefully (no policies)."""
+    """Missing policy storage is explicit and respects failure mode."""
     print("--- test_missing_policies_dir ---")
 
-    engine = PolicyEngine(policies_dir="/nonexistent/path/to/policies")
-    assert len(engine.policies) == 0
+    opened = PolicyEngine(
+        policies_dir="/nonexistent/path/to/policies",
+        failure_mode="fail_open",
+    )
+    closed = PolicyEngine(
+        policies_dir="/nonexistent/path/to/policies",
+        failure_mode="fail_closed",
+    )
+
+    opened_result = opened.evaluate(_make_event())
+    closed_result = closed.evaluate(_make_event())
+
+    assert opened.policies == []
+    assert opened_result.action == "allow"
+    assert opened_result.evaluation_errors
+    assert closed_result.action == "block"
+    assert closed_result.evaluation_errors
 
     print("  PASSED")
 
 
 def test_malformed_yaml_skipped():
-    """Malformed YAML files are skipped with a warning."""
+    """A partial candidate never replaces or becomes an active snapshot."""
     print("--- test_malformed_yaml_skipped ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -144,10 +167,13 @@ def test_malformed_yaml_skipped():
         with open(good_path, "w") as f:
             f.write("name: good-policy\nenabled: true\naction: warn\nrule:\n  conditions: []\n")
 
-        engine = PolicyEngine(policies_dir=tmpdir)
-        # Only the valid policy should be loaded
-        assert len(engine.policies) == 1
-        assert engine.policies[0].name == "good-policy"
+        engine = PolicyEngine(policies_dir=tmpdir, failure_mode="fail_open")
+        result = engine.evaluate(_make_event())
+
+        assert engine.policies == []
+        assert engine.load_errors
+        assert result.action == "allow"
+        assert result.evaluation_errors
 
     print("  PASSED")
 
@@ -182,6 +208,115 @@ def test_non_dict_yaml_skipped():
         assert len(engine.policies) == 0
 
     print("  PASSED")
+
+
+def test_empty_policy_dir_has_no_valid_snapshot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        opened = PolicyEngine(tmpdir, failure_mode="fail_open")
+        closed = PolicyEngine(tmpdir, failure_mode="fail_closed")
+
+        opened_result = opened.evaluate(_make_event())
+        closed_result = closed.evaluate(_make_event())
+
+        assert opened_result.action == "allow"
+        assert opened_result.evaluation_errors
+        assert closed_result.action == "block"
+        assert closed_result.evaluation_errors
+        assert opened.policy_snapshot_id is None
+        assert closed.policy_snapshot_id is None
+
+
+def test_invalid_event_respects_failure_mode_before_policy_evaluation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(
+            os.path.join(tmpdir, "always.yaml"), "w", encoding="utf-8"
+        ) as f:
+            f.write(
+                "name: always\n"
+                "action: warn\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+        invalid = _make_event(action={
+            "tool_name": None,
+            "parameters": {},
+            "data_accessed": [],
+        })
+
+        opened = PolicyEngine(tmpdir, failure_mode="fail_open").evaluate(invalid)
+        closed = PolicyEngine(tmpdir, failure_mode="fail_closed").evaluate(invalid)
+
+        assert opened.action == "allow"
+        assert opened.evaluation_errors
+        assert closed.action == "block"
+        assert closed.evaluation_errors
+
+
+def test_unreadable_policy_dir_respects_failure_mode(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        original_listdir = os.listdir
+
+        def deny_policy_directory(path):
+            if os.fspath(path) == tmpdir:
+                raise PermissionError("test denied")
+            return original_listdir(path)
+
+        monkeypatch.setattr("panoptes.policy.os.listdir", deny_policy_directory)
+
+        opened = PolicyEngine(tmpdir, failure_mode="fail_open")
+        closed = PolicyEngine(tmpdir, failure_mode="fail_closed")
+
+        assert opened.evaluate(_make_event()).action == "allow"
+        assert opened.load_errors
+        assert closed.evaluate(_make_event()).action == "block"
+        assert closed.load_errors
+
+
+def test_failed_explicit_load_retains_active_snapshot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policy_path = os.path.join(tmpdir, "block.yaml")
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: block-terminal\n"
+                "action: block\n"
+                "rule:\n"
+                "  event_type: tool_call\n"
+                "  conditions:\n"
+                "    - field: action.tool_name\n"
+                "      operator: ==\n"
+                "      value: terminal\n"
+            )
+
+        engine = PolicyEngine(tmpdir, failure_mode="fail_closed")
+        original_snapshot = engine._snapshot
+        original_policy = engine.policies[0]
+        original_snapshot_id = engine.policy_snapshot_id
+        assert engine.evaluate(_make_event()).action == "block"
+
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write("name: [unterminated\n")
+        engine.load_policies()
+
+        assert engine._snapshot is original_snapshot
+        assert engine.policies[0] is original_policy
+        assert engine.policy_snapshot_id == original_snapshot_id
+        assert engine.load_errors
+
+        blocked = engine.evaluate(_make_event())
+        safe = engine.evaluate(
+            _make_event(
+                action={
+                    "tool_name": "read_file",
+                    "parameters": {},
+                    "data_accessed": [],
+                }
+            )
+        )
+        assert blocked.action == "block"
+        assert blocked.policy_snapshot_id == original_snapshot_id
+        assert blocked.evaluation_errors
+        assert safe.action == "allow"
+        assert safe.evaluation_errors
 
 
 # ── Condition matching tests ──────────────────────────────────────────────────
@@ -365,6 +500,107 @@ def test_operator_matches():
     assert not matched2, "read_file should not match ^write_"
 
     print("  PASSED")
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"(a+)+$",
+        r"a|b",
+        r"a{1,3}",
+        r"a+b+",
+        r"a+b",
+        "a" * 257,
+    ],
+)
+def test_matches_rejects_unsafe_or_unbounded_regexes(pattern):
+    with pytest.raises(ValueError, match="regex|unsupported|quantifier"):
+        Policy({
+            "name": "unsafe-regex",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": "action.tool_name",
+                    "operator": "matches",
+                    "value": pattern,
+                }],
+            },
+        })
+
+
+def test_matches_allows_escaped_quantifier_literal():
+    policy = Policy({
+        "name": "escaped-literal",
+        "action": "warn",
+        "rule": {
+            "conditions": [{
+                "field": "action.tool_name",
+                "operator": "matches",
+                "value": r"^write\+file$",
+            }],
+        },
+    })
+
+    matched, _ = policy.evaluate_conditions(
+        _make_event(action={
+            "tool_name": "write+file",
+            "parameters": {},
+            "data_accessed": [],
+        })
+    )
+    assert matched
+
+
+def test_policy_reason_is_redacted_and_bounded():
+    secret = "sk-" + ("A" * 40)
+    policy = Policy({
+        "name": "bounded-reason",
+        "action": "warn",
+        "rule": {
+            "conditions": [{
+                "field": "action.parameters.command",
+                "operator": "contains",
+                "value": "deploy",
+            }],
+        },
+    })
+    event = _make_event(action={
+        "tool_name": "terminal",
+        "parameters": {
+            "command": f"deploy api_key={secret} " + ("x" * 10_000),
+        },
+        "data_accessed": [],
+    })
+
+    matched, reason = policy.evaluate_conditions(event)
+
+    assert matched
+    assert secret not in reason
+    assert "[REDACTED]" in reason
+    assert len(reason) <= MAX_POLICY_REASON_LENGTH
+
+
+def test_policy_reason_uses_key_aware_redaction_for_short_secrets():
+    policy = Policy({
+        "name": "structured-secret",
+        "action": "warn",
+        "rule": {
+            "conditions": [{
+                "field": "action.parameters",
+                "operator": "==",
+                "value": {"password": "tiny-secret"},
+            }],
+        },
+    })
+    matched, reason = policy.evaluate_conditions(_make_event(action={
+        "tool_name": "terminal",
+        "parameters": {"password": "tiny-secret"},
+        "data_accessed": [],
+    }))
+
+    assert matched
+    assert "tiny-secret" not in reason
+    assert "[REDACTED]" in reason
 
 
 def test_operator_numeric():
@@ -558,6 +794,16 @@ def test_scope_wildcard():
     print("  PASSED")
 
 
+def test_scope_rejects_wildcard_mixed_with_named_agents():
+    with pytest.raises(ValueError, match="wildcard.*only entry"):
+        Policy({
+            "name": "ambiguous-scope",
+            "action": "block",
+            "scope": {"agents": ["*", "hermes"]},
+            "rule": {"conditions": []},
+        })
+
+
 def test_scope_session_filter():
     """Scope with session list only applies to those sessions."""
     print("--- test_scope_session_filter ---")
@@ -613,98 +859,105 @@ rule:
     print("  PASSED")
 
 
-# ── Rate limiting tests ───────────────────────────────────────────────────────
+# ── Snapshot immutability tests ───────────────────────────────────────────────────────
 
 
-def test_rate_limit_basic():
-    """Rate limiting tracks counts and triggers after threshold."""
-    print("--- test_rate_limit_basic ---")
+def test_compatibility_policy_list_cannot_mutate_active_snapshot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(
+            os.path.join(tmpdir, "block.yaml"), "w", encoding="utf-8"
+        ) as f:
+            f.write(
+                "name: immutable\n"
+                "action: block\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
 
-    raw = {
-        "name": "rate-limit-test",
-        "enabled": True,
+        engine = PolicyEngine(tmpdir)
+        assert engine.evaluate(_make_event()).action == "block"
+
+        engine.policies[0].action = "allow"
+        engine.policies[0].rule["conditions"] = [
+            {"field": "action.tool_name", "operator": "==", "value": "never"}
+        ]
+
+        assert engine.evaluate(_make_event()).action == "block"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_numeric_policy_threshold_must_be_finite(value):
+    with pytest.raises(ValueError, match="finite"):
+        Policy({
+            "name": "finite-threshold",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": "cost.tokens_in",
+                    "operator": "gt",
+                    "value": value,
+                }],
+            },
+        })
+
+
+def test_numeric_policy_threshold_rejects_bool():
+    with pytest.raises(ValueError, match="must be numeric"):
+        Policy({
+            "name": "bool-threshold",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": "cost.tokens_in",
+                    "operator": "gt",
+                    "value": True,
+                }],
+            },
+        })
+
+
+def test_numeric_comparison_handles_huge_integer_without_float_overflow():
+    policy = Policy({
+        "name": "huge-number",
+        "action": "block",
+        "rule": {
+            "conditions": [{
+                "field": "cost.tokens_in",
+                "operator": "gt",
+                "value": 10,
+            }],
+        },
+    })
+    matched, reason = policy.evaluate_conditions(_make_event(cost={
+        "tokens_in": 1 << 4095,
+        "tokens_out": 0,
+    }))
+
+    assert matched
+    assert "cost.tokens_in gt" in reason
+
+
+@pytest.mark.parametrize("actual", [True, False, float("inf"), float("nan")])
+def test_numeric_comparison_does_not_coerce_bool_or_nonfinite_actual(actual):
+    policy = Policy({
+        "name": "strict-number",
         "action": "warn",
         "rule": {
-            "event_type": "tool_call",
-            "conditions": [
-                {"field": "action.tool_name", "operator": "==", "value": "terminal"},
-            ],
-            "logic": "AND",
-            "rate_limit": {
-                "count": 3,
-                "window": "session",
-            },
+            "conditions": [{
+                "field": "action.parameters.value",
+                "operator": "gte",
+                "value": 1,
+            }],
         },
-    }
-    policy = Policy(raw)
+    })
+    matched, reason = policy.evaluate_conditions(_make_event(action={
+        "tool_name": "terminal",
+        "parameters": {"value": actual},
+        "data_accessed": [],
+    }))
 
-    event = _make_event(action={"tool_name": "terminal", "parameters": {}, "data_accessed": []})
-
-    engine = PolicyEngine.__new__(PolicyEngine)
-    engine._policies_dir = "/nonexistent"
-    engine._db = None
-    engine._rate_limits = {}
-    engine._rate_lock = threading = __import__("threading")
-    engine.policies = [policy]
-
-    import threading as thr
-    engine._rate_lock = thr.Lock()
-
-    # First 3 should NOT trigger (count 1, 2, 3 — threshold is 3, exceeded at 4+)
-    for i in range(3):
-        result = engine.evaluate(event)
-        assert result.action == "allow", f"Call {i+1} should be allow (under limit)"
-
-    # 4th call should trigger
-    result = engine.evaluate(event)
-    assert result.action == "warn", f"4th call should trigger rate limit, got {result.action}"
-    assert len(result.violated_policies) == 1
-
-    print("  PASSED")
-
-
-def test_rate_limit_per_session():
-    """Rate limits are tracked per session ID."""
-    print("--- test_rate_limit_per_session ---")
-
-    raw = {
-        "name": "rate-limit-session",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "event_type": "tool_call",
-            "conditions": [],
-            "logic": "AND",
-            "rate_limit": {
-                "count": 2,
-                "window": "session",
-            },
-        },
-    }
-
-    import threading as thr
-
-    policy = Policy(raw)
-    engine = PolicyEngine.__new__(PolicyEngine)
-    engine._policies_dir = "/nonexistent"
-    engine._db = None
-    engine._rate_limits = {}
-    engine._rate_lock = thr.Lock()
-    engine.policies = [policy]
-
-    # Session A: 3 calls — first 2 ok, 3rd triggers
-    for i in range(2):
-        result = engine.evaluate(_make_event(agent={"type": "hermes", "session_id": "sess-a", "run_id": "r1"}))
-        assert result.action == "allow", f"Session A call {i+1} should be allow"
-
-    result_a = engine.evaluate(_make_event(agent={"type": "hermes", "session_id": "sess-a", "run_id": "r1"}))
-    assert result_a.action == "warn", "Session A 3rd call should trigger"
-
-    # Session B: first call should still be allowed (separate counter)
-    result_b = engine.evaluate(_make_event(agent={"type": "hermes", "session_id": "sess-b", "run_id": "r2"}))
-    assert result_b.action == "allow", "Session B first call should be allow"
-
-    print("  PASSED")
+    assert not matched
+    assert "not a finite numeric value" in reason
 
 
 # ── PolicyResult tests ────────────────────────────────────────────────────────
@@ -718,6 +971,10 @@ def test_policy_result_construction():
     assert r1.action == "allow"
     assert r1.violated_policies == []
     assert r1.warnings == []
+    assert (
+        r1.policy_engine_semantics_version
+        == POLICY_ENGINE_SEMANTICS_VERSION
+    )
 
     r2 = PolicyResult(
         action="block",
@@ -729,6 +986,29 @@ def test_policy_result_construction():
     assert r2.violated_policies[0]["policy_name"] == "test"
 
     print("  PASSED")
+
+
+def test_policy_semantics_version_participates_in_snapshot_digest(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(
+            os.path.join(tmpdir, "policy.yaml"), "w", encoding="utf-8"
+        ) as f:
+            f.write(
+                "name: semantics\n"
+                "action: allow\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+
+        first = PolicyEngine(tmpdir)
+        monkeypatch.setattr(
+            policy_module,
+            "POLICY_ENGINE_SEMANTICS_VERSION",
+            POLICY_ENGINE_SEMANTICS_VERSION + 1,
+        )
+        second = PolicyEngine(tmpdir)
+
+        assert first.policy_snapshot_id != second.policy_snapshot_id
 
 
 def test_action_escalation():
@@ -793,9 +1073,6 @@ def test_record_violation_to_db():
         engine = PolicyEngine.__new__(PolicyEngine)
         engine._policies_dir = "/nonexistent"
         engine._db = db
-        import threading as thr
-        engine._rate_limits = {}
-        engine._rate_lock = thr.Lock()
         engine.policies = []
 
         event = _make_event(
@@ -859,15 +1136,154 @@ message: "Terminal blocked"
         result = engine.check_event(event)
         assert result.action == "block"
         assert len(result.violated_policies) == 1
+        assert result.violated_policies[0]["action"] == "block"
 
         # Verify violation was recorded
         violations = db.query(event_type="policy_violation")
         assert len(violations) == 1
         assert violations[0]["context"]["policy_name"] == "block-terminal"
+        assert violations[0]["context"]["policy_action"] == "block"
+        assert (
+            violations[0]["context"]["policy_snapshot_id"]
+            == result.policy_snapshot_id
+        )
+        assert (
+            violations[0]["context"]["policy_engine_semantics_version"]
+            == POLICY_ENGINE_SEMANTICS_VERSION
+        )
 
         db.close()
 
     print("  PASSED")
+
+
+def test_check_event_normalizes_source_and_records_recomputable_lineage():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policies_dir = os.path.join(tmpdir, "policies")
+        os.makedirs(policies_dir)
+        with open(
+            os.path.join(policies_dir, "prod.yaml"), "w", encoding="utf-8"
+        ) as f:
+            f.write(
+                "name: block-derived-prod\n"
+                "action: block\n"
+                "rule:\n"
+                "  event_type: tool_call\n"
+                "  conditions:\n"
+                "    - field: action.data_accessed\n"
+                "      operator: contains\n"
+                "      value: prod\n"
+            )
+
+        db = AuditDB(os.path.join(tmpdir, "audit.db"))
+        engine = PolicyEngine(policies_dir, db=db)
+        secret = "sk-" + ("Z" * 40)
+        raw_event = _make_event(
+            event_id="source-event-123",
+            action={
+                "tool_name": "bash",
+                "call_id": "provider-call-456",
+                "parameters": {
+                    "command": (
+                        "kubectl apply -f /prod/deployment.yaml "
+                        f"--token={secret}"
+                    ),
+                },
+                "target": "/prod/deployment.yaml",
+                "data_accessed": ["dev"],
+            },
+            context={
+                "turn_number": 1,
+                "capture": {
+                    "adapter": "test",
+                    "fidelity": "host_reported",
+                    "observation_boundary": "unit_test",
+                    "identity_assurance": "client_asserted",
+                    "provenance": "adapter_asserted",
+                    "execution_observed": False,
+                    "enforcement_mandatory": False,
+                    "authenticated": False,
+                },
+            },
+        )
+
+        result = engine.check_event(raw_event)
+        violations = db.query(event_type="policy_violation")
+
+        assert result.action == "block"
+        assert len(violations) == 1
+        violation = violations[0]
+        assert violation["context"]["source_event_id"] == "source-event-123"
+        assert violation["context"]["source_event_type"] == "tool_call"
+        assert violation["action"]["call_id"] == "provider-call-456"
+        assert violation["action"]["declared_data_accessed"] == ["dev"]
+        assert {"prod", "infra"}.issubset(
+            violation["action"]["derived_data_accessed"]
+        )
+        assert secret not in json.dumps(violation)
+        assert "[REDACTED" in json.dumps(violation["action"]["parameters"])
+        assert violation["context"]["capture"]["adapter"] == "policy_engine"
+        assert violation["context"]["capture"]["observed_events"] == [
+            "policy_violation"
+        ]
+        assert violation["context"]["source_capture"]["adapter"] == "test"
+        db.close()
+
+
+def test_allow_match_is_visible_but_not_recorded_as_violation():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policy_path = os.path.join(tmpdir, "allow.yaml")
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: explicitly-allowed\n"
+                "action: allow\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+
+        db = AuditDB(os.path.join(tmpdir, "allow-audit.db"))
+        engine = PolicyEngine(tmpdir, db=db)
+        result = engine.check_event(_make_event())
+
+        assert result.action == "allow"
+        assert result.violated_policies == []
+        assert len(result.matched_policies) == 1
+        assert result.matched_policies[0]["policy_name"] == "explicitly-allowed"
+        assert result.matched_policies[0]["action"] == "allow"
+        assert result.matched_policies[0]["reason"]
+        assert db.query(event_type="policy_violation") == []
+        db.close()
+
+
+def test_warn_match_records_warned_outcome_and_snapshot():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policy_path = os.path.join(tmpdir, "warn.yaml")
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: warn-terminal\n"
+                "action: warn\n"
+                "message: Terminal use observed\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+
+        db = AuditDB(os.path.join(tmpdir, "warn-audit.db"))
+        engine = PolicyEngine(tmpdir, db=db)
+        result = engine.check_event(_make_event())
+
+        assert result.action == "warn"
+        assert result.violated_policies[0]["action"] == "warn"
+        audit_events = db.query(event_type="policy_violation")
+        assert len(audit_events) == 1
+        audit_event = audit_events[0]
+        assert audit_event["outcome"]["status"] == "warned"
+        assert audit_event["context"]["policy_action"] == "warn"
+        assert audit_event["context"]["policy_snapshot_id"]
+        assert (
+            audit_event["context"]["policy_snapshot_id"]
+            == result.policy_snapshot_id
+        )
+        db.close()
 
 
 # ── Error handling / fail-open tests ──────────────────────────────────────────
@@ -906,8 +1322,93 @@ rule:
     print("  PASSED")
 
 
-def test_nonexistent_field():
-    """Accessing a nonexistent field returns None and condition fails gracefully."""
+def test_structurally_invalid_policy_respects_failure_mode():
+    """Invalid condition shapes are load errors, never always-match rules."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "invalid-conditions.yaml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: invalid-conditions\n"
+                "action: block\n"
+                "rule:\n"
+                "  conditions: not-a-list\n"
+            )
+
+        opened = PolicyEngine(tmpdir, failure_mode="fail_open")
+        closed = PolicyEngine(tmpdir, failure_mode="fail_closed")
+
+        assert opened.load_errors
+        assert opened.evaluate(_make_event()).action == "allow"
+        assert closed.evaluate(_make_event()).action == "block"
+
+
+@pytest.mark.parametrize(
+    "policy_yaml",
+    [
+        (
+            "name: typo\n"
+            "actions: block\n"
+            "rule:\n"
+            "  conditions: []\n"
+        ),
+        (
+            "name: typo\n"
+            "action: block\n"
+            "rule:\n"
+            "  condition: []\n"
+        ),
+        (
+            "name: typo\n"
+            "action: block\n"
+            "scope:\n"
+            "  agent: [hermes]\n"
+            "rule:\n"
+            "  conditions: []\n"
+        ),
+        (
+            "name: typo\n"
+            "action: block\n"
+            "rule:\n"
+            "  event_type: tool_cal\n"
+            "  conditions: []\n"
+        ),
+        (
+            "name: typo\n"
+            "action: block\n"
+            "rule:\n"
+            "  conditions:\n"
+            "    - field: action.tool_name\n"
+            "      operators: '=='\n"
+            "      value: terminal\n"
+        ),
+        (
+            "name: duplicate\n"
+            "action: block\n"
+            "action: allow\n"
+            "rule:\n"
+            "  conditions: []\n"
+        ),
+    ],
+)
+def test_policy_typos_and_duplicate_keys_cannot_silently_weaken_enforcement(
+    policy_yaml,
+):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(
+            os.path.join(tmpdir, "invalid.yaml"), "w", encoding="utf-8"
+        ) as f:
+            f.write(policy_yaml)
+
+        opened = PolicyEngine(tmpdir, failure_mode="fail_open")
+        closed = PolicyEngine(tmpdir, failure_mode="fail_closed")
+
+        assert opened.load_errors
+        assert opened.evaluate(_make_event()).action == "allow"
+        assert closed.evaluate(_make_event()).action == "block"
+
+
+def test_nonexistent_nested_field():
+    """A missing nested field below a canonical root simply does not match."""
     print("--- test_nonexistent_field ---")
 
     raw = {
@@ -916,7 +1417,7 @@ def test_nonexistent_field():
         "action": "warn",
         "rule": {
             "conditions": [
-                {"field": "nonexistent.field.path", "operator": "==", "value": "something"},
+                {"field": "action.parameters.nonexistent.path", "operator": "==", "value": "something"},
             ],
             "logic": "AND",
         },
@@ -928,6 +1429,84 @@ def test_nonexistent_field():
     assert not matched, "Nonexistent field should not match"
 
     print("  PASSED")
+
+
+def test_nonexistent_top_level_policy_field_is_rejected():
+    with pytest.raises(ValueError, match="not a canonical enforceable field"):
+        Policy({
+            "name": "typo",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": "acton.tool_name",
+                    "operator": "==",
+                    "value": "terminal",
+                }],
+            },
+        })
+
+
+def test_nonexistent_fixed_leaf_policy_field_is_rejected():
+    with pytest.raises(ValueError, match="not a canonical enforceable field"):
+        Policy({
+            "name": "leaf-typo",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": "action.tool_nmae",
+                    "operator": "==",
+                    "value": "terminal",
+                }],
+            },
+        })
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    [
+        "action.client_side_tools",
+        "action.server_side_tools",
+        "action.unknown_tool_types",
+        "action.requested_tool_targets",
+        "action.execution_scope",
+        "action.provider_item_type",
+        "action.server_result_type",
+        "action.server_result_complete",
+        "action.result.error.code",
+    ],
+)
+def test_complete_structured_tool_fields_are_enforceable(field_path):
+    policy = Policy({
+        "name": "structured-tool-policy",
+        "action": "block",
+        "rule": {
+            "conditions": [{
+                "field": field_path,
+                "operator": "contains",
+                "value": "forbidden",
+            }],
+        },
+    })
+    assert policy.name == "structured-tool-policy"
+
+
+@pytest.mark.parametrize(
+    "field_path",
+    ["raw_request", "raw_response", "action.server_result_summary"],
+)
+def test_lossy_raw_payload_fields_cannot_be_enforcement_conditions(field_path):
+    with pytest.raises(ValueError, match="lossy presentation field"):
+        Policy({
+            "name": "lossy-input",
+            "action": "block",
+            "rule": {
+                "conditions": [{
+                    "field": field_path,
+                    "operator": "contains",
+                    "value": "forbidden",
+                }],
+            },
+        })
 
 
 # ── Event type filter tests ───────────────────────────────────────────────────
@@ -986,10 +1565,7 @@ rule:
 
         engine = PolicyEngine.__new__(PolicyEngine)
         engine._policies_dir = "/nonexistent"
-        import threading as thr
         engine._db = None
-        engine._rate_limits = {}
-        engine._rate_lock = thr.Lock()
         engine.policies = []
 
         # Matching event
@@ -1021,6 +1597,88 @@ rule:
             pass
 
     print("  PASSED")
+
+
+def test_test_policy_uses_live_single_event_semantics():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policy_path = os.path.join(tmpdir, "test.yaml")
+        event_json = json.dumps(_make_event())
+
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: disabled\n"
+                "enabled: false\n"
+                "action: block\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+        disabled = PolicyEngine.test_policy(policy_path, event_json)
+        assert disabled.action == "allow"
+        assert disabled.matched_policies == []
+
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: other-agent\n"
+                "scope:\n"
+                "  agents: [codex]\n"
+                "action: block\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+        out_of_scope = PolicyEngine.test_policy(policy_path, event_json)
+        assert out_of_scope.action == "allow"
+        assert out_of_scope.matched_policies == []
+
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: derived-prod\n"
+                "action: block\n"
+                "rule:\n"
+                "  conditions:\n"
+                "    - field: action.data_accessed\n"
+                "      operator: contains\n"
+                "      value: prod\n"
+            )
+        derived = PolicyEngine.test_policy(
+            policy_path,
+            json.dumps(_make_event(action={
+                "tool_name": "bash",
+                "parameters": {"command": "kubectl get pods -n prod"},
+                "data_accessed": [],
+            })),
+        )
+        assert derived.action == "block"
+
+        invalid = _make_event(action={
+            "tool_name": None,
+            "parameters": {},
+            "data_accessed": [],
+        })
+        with pytest.raises(ValueError, match="Invalid event"):
+            PolicyEngine.test_policy(policy_path, json.dumps(invalid))
+
+
+@pytest.mark.parametrize(
+    "event_json",
+    [
+        '{"event_type":"tool_call","event_type":"model_request"}',
+        '{"cost":{"tokens_in":NaN}}',
+        '{"cost":{"estimated_usd":Infinity}}',
+    ],
+)
+def test_test_policy_rejects_ambiguous_or_nonstandard_json(event_json):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        policy_path = os.path.join(tmpdir, "test.yaml")
+        with open(policy_path, "w", encoding="utf-8") as f:
+            f.write(
+                "name: strict-json\n"
+                "action: allow\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+
+        with pytest.raises(ValueError, match="Invalid event JSON"):
+            PolicyEngine.test_policy(policy_path, event_json)
 
 
 # ── Default policies test ─────────────────────────────────────────────────────
@@ -1169,6 +1827,69 @@ def test_no_prod_access_with_derived_data_accessed():
     print("  PASSED")
 
 
+def test_engine_evaluate_derives_authoritative_tags_before_policy_matching():
+    default_dir = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "panoptes",
+        "default_policies",
+    )
+    engine = PolicyEngine(default_dir)
+    raw_event = _make_event(action={
+        "tool_name": "bash",
+        "parameters": {
+            "command": "kubectl apply -f /prod/deployment.yaml",
+        },
+        # An adapter-declared safe tag must not suppress classifier output.
+        "data_accessed": ["dev"],
+    })
+
+    result = engine.evaluate(raw_event)
+
+    assert result.action == "block"
+    assert result.violated_policies[0]["policy_name"] == "no-prod-access"
+
+
+def test_check_event_surfaces_violation_evidence_write_failure():
+    class _FailingDB:
+        def insert_event(self, event):
+            raise OSError("disk full")
+
+    with tempfile.TemporaryDirectory() as directory:
+        with open(
+            os.path.join(directory, "warn.yaml"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(
+                "name: warn-all\n"
+                "action: warn\n"
+                "rule:\n"
+                "  conditions: []\n"
+            )
+
+        open_engine = PolicyEngine(
+            directory,
+            db=_FailingDB(),
+            failure_mode="fail_open",
+        )
+        open_result = open_engine.check_event(_make_event())
+        assert open_result.action == "warn"
+        assert "could not be persisted" in open_result.evaluation_errors[0]
+
+        closed_engine = PolicyEngine(
+            directory,
+            db=_FailingDB(),
+            failure_mode="fail_closed",
+        )
+        closed_result = closed_engine.check_event(_make_event())
+        assert closed_result.action == "block"
+        assert any(
+            violation["policy_name"] == "policy_evidence_write_error"
+            for violation in closed_result.violated_policies
+        )
+
+
 # ── Run all tests ─────────────────────────────────────────────────────────────
 
 
@@ -1193,14 +1914,12 @@ if __name__ == "__main__":
     test_scope_wildcard()
     test_scope_session_filter()
     test_disabled_policy_skipped()
-    test_rate_limit_basic()
-    test_rate_limit_per_session()
     test_policy_result_construction()
     test_action_escalation()
     test_record_violation_to_db()
     test_check_event_with_db()
     test_evaluate_error_fail_open()
-    test_nonexistent_field()
+    test_nonexistent_nested_field()
     test_rule_event_type_filter()
     test_test_policy_method()
     test_no_prod_access_policy()

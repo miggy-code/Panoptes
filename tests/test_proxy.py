@@ -1,31 +1,45 @@
 """Tests for panoptes.proxy.
 
 Covers:
-  - Basic forward-proxy capture (existing test)
   - Shared run_id across events in one exchange
   - Reverse-proxy path routing
   - SSE reassembly for Anthropic and OpenAI formats
   - Pre-flight policy blocking
 """
 
+import io
 import json
 import os
 import tempfile
 import time
 import uuid
+from email.message import Message
 
-import httpx
 import pytest
 
 from panoptes.proxy import (
+    AuditWriteError,
     AuditEventWriter,
     ProxyHandler,
     ProxyServer,
+    RequestBodyTooLarge,
+    RequestFramingError,
+    UpstreamBodyTooLarge,
+    _filter_headers,
     _parse_sse_response,
+    detect_agent_type,
 )
-from panoptes.providers.base import _parse_sse_events
-from panoptes.providers.anthropic import _reassemble_anthropic_sse
-from panoptes.providers.openai import _reassemble_openai_sse
+from panoptes.providers import detect as detect_provider
+from panoptes.providers.base import SSEParseError, _parse_sse_events
+from panoptes.providers.anthropic import (
+    AnthropicProvider,
+    _reassemble_anthropic_sse,
+)
+from panoptes.providers.openai import (
+    OpenAIProvider,
+    _reassemble_openai_sse,
+)
+from panoptes.schema import ValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -45,78 +59,265 @@ class _AuditDBStub:
         return list(self.events)
 
 
-# ---------------------------------------------------------------------------
-# Existing integration test (forward-proxy mode)
-# ---------------------------------------------------------------------------
+def test_provider_detection_prefers_routed_path_and_handles_malformed_messages():
+    anthropic = detect_provider(
+        "/v1/messages",
+        {"model": "claude-test", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert anthropic.name == "anthropic"
+
+    malformed = detect_provider("/custom", {"messages": ["not-a-mapping"]})
+    assert malformed.name == "openai"
 
 
-def test_proxy_capture_openai():
-    """Start proxy, send mock request via forward-proxy, verify events captured."""
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-        db_path = tmp.name
+def test_openai_responses_api_extracts_calls_results_and_usage():
+    provider = OpenAIProvider()
+    request = {
+        "model": "gpt-test",
+        "input": [{
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "sunny",
+        }],
+        "tools": [{"type": "function", "name": "weather"}],
+    }
+    response = {
+        "object": "response",
+        "output": [{
+            "id": "fc_123",
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "weather",
+            "arguments": '{"city":"Lima"}',
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7},
+    }
 
-    server = ProxyServer(host="127.0.0.1", port=0, db_path=db_path)
-    port = server.start()
-    print(f"Proxy started on port {port}")
+    assert provider.extract_request_info(request)["messages_count"] == 1
+    assert provider.extract_tool_results(request)[0]["call_id"] == "call_123"
+    assert provider.extract_tool_calls(response)[0] == {
+        "tool_name": "weather",
+        "parameters": {"city": "Lima"},
+        "call_id": "call_123",
+    }
+    assert provider.extract_usage(response) == {"tokens_in": 20, "tokens_out": 7}
 
-    try:
-        req_body = {
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "What is 2+2?"},
-                {"role": "assistant", "content": None, "tool_calls": [
-                    {"id": "call_123", "type": "function",
-                     "function": {"name": "calculator", "arguments": '{"expr": "2+2"}'}}
-                ]},
-                {"role": "tool", "tool_call_id": "call_123", "name": "calculator", "content": "4"},
-            ],
-            "tools": [
-                {"type": "function", "function": {"name": "calculator",
-                 "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}}},
-            ],
-            "stream": False,
-        }
 
-        proxy_url = f"http://127.0.0.1:{port}"
-        test_url = "http://httpbin.org/post"
-        print(f"Sending test request through proxy at {proxy_url} to {test_url}")
+def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
+    writer = AuditEventWriter(_AuditDBStub())
+    req_body = {"model": "gpt-test", "messages": []}
+    _, exchange_ctx = writer.build_request_events(
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
 
-        try:
-            resp = httpx.post(test_url, json=req_body, proxy=proxy_url, timeout=15)
-            print(f"Response status: {resp.status_code}")
-        except Exception as e:
-            print(f"Request error (expected if no internet): {e}")
+    with pytest.raises(SSEParseError, match="cross-dialect"):
+        writer.build_response_events(
+            path="/v1/chat/completions",
+            req_body=req_body,
+            resp_status=200,
+            resp_headers={},
+            resp_body={
+                "object": "response",
+                "output": [{
+                    "type": "function_call",
+                    "name": "hidden",
+                    "arguments": "{}",
+                }],
+            },
+            duration_ms=20,
+            exchange_ctx=exchange_ctx,
+        )
 
-        time.sleep(0.5)
 
-        events = server.events
-        print(f"\nCaptured {len(events)} events:")
-        for i, event in enumerate(events):
-            print(f"  Event {i+1}: {event.get('event_type')} agent={event.get('agent', {}).get('type')}")
+def test_openai_responses_stream_uses_completed_response():
+    completed = {
+        "id": "resp_123",
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "weather",
+            "arguments": '{"city":"Lima"}',
+        }],
+        "usage": {"input_tokens": 20, "output_tokens": 7},
+    }
+    raw = (
+        "event: response.completed\n"
+        f"data: {json.dumps({'type': 'response.completed', 'response': completed})}\n\n"
+    ).encode()
 
-        event_types = [e["event_type"] for e in events]
-        assert "model_request" in event_types, f"Expected model_request, got {event_types}"
-        assert "tool_result" in event_types, f"Expected tool_result, got {event_types}"
+    assert OpenAIProvider().reassemble_sse(raw) == completed
 
-        for event in events:
-            assert "event_id" in event
-            assert "timestamp" in event
-            assert "agent" in event
-            assert "type" in event["agent"]
-            assert "session_id" in event["agent"]
-            assert "run_id" in event["agent"]
-            assert "event_type" in event
-            assert "context" in event
 
-        print("All assertions passed!")
+def test_agent_identity_requires_evidence_not_provider_guessing():
+    body = {"model": "gpt-test", "messages": []}
+    assert detect_agent_type("/v1/chat/completions", {}, body) == "unknown"
+    assert detect_agent_type(
+        "/v1beta/models/gemini-pro:generateContent",
+        {},
+        {"contents": []},
+    ) == "unknown"
+    assert detect_agent_type(
+        "/v1/chat/completions",
+        {"user-agent": "openai-codex/1.0"},
+        body,
+    ) == "codex"
 
-    finally:
-        server.stop()
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
+
+def test_sse_parser_honors_eventsource_framing_and_multiline_data():
+    raw = (
+        b": keepalive\r\n"
+        b"event: message\r\n"
+        b"data:{\"kind\":\r\n"
+        b"data: \"tool\"}\r\n"
+        b"\r\n"
+        b"data: {\"sequence\": 2}\n\n"
+    )
+
+    assert _parse_sse_events(raw) == [
+        {"kind": "tool"},
+        {"sequence": 2},
+    ]
+
+
+def test_sse_parser_surfaces_malformed_or_ambiguous_events():
+    with pytest.raises(SSEParseError, match="invalid JSON"):
+        _parse_sse_events(
+            b'data: {"safe": true\n'
+            b'data: {"hidden_tool": true}\n\n'
+        )
+
+    with pytest.raises(SSEParseError, match="invalid UTF-8"):
+        _parse_sse_events(b"data: \xff\n\n")
+
+
+def test_request_body_framing_and_size_are_strict():
+    class _Handler:
+        max_request_body_bytes = 4
+
+        def __init__(self, headers, body=b""):
+            self.headers = headers
+            self.rfile = io.BytesIO(body)
+
+    duplicate = Message()
+    duplicate.add_header("Content-Length", "1")
+    duplicate.add_header("Content-Length", "1")
+    with pytest.raises(RequestFramingError, match="Multiple"):
+        ProxyHandler._read_body(_Handler(duplicate, b"x"))
+
+    chunked = Message()
+    chunked.add_header("Transfer-Encoding", "chunked")
+    with pytest.raises(RequestFramingError, match="not supported"):
+        ProxyHandler._read_body(_Handler(chunked, b"1\r\nx\r\n0\r\n\r\n"))
+
+    oversized = Message()
+    oversized.add_header("Content-Length", "5")
+    with pytest.raises(RequestBodyTooLarge):
+        ProxyHandler._read_body(_Handler(oversized, b"12345"))
+
+    incomplete = Message()
+    incomplete.add_header("Content-Length", "4")
+    with pytest.raises(RequestFramingError, match="ended before"):
+        ProxyHandler._read_body(_Handler(incomplete, b"12"))
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.10", "proxy.local"])
+def test_proxy_rejects_non_loopback_bind_without_explicit_opt_in(host):
+    with pytest.raises(ValueError, match="Refusing non-loopback"):
+        ProxyServer(host=host, port=0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"client_socket_timeout_seconds": 0},
+        {"max_concurrent_requests": 0},
+        {"max_tool_events_per_exchange": 0},
+    ],
+)
+def test_proxy_rejects_nonpositive_resource_limits(kwargs):
+    with pytest.raises(ValueError, match="must be positive"):
+        ProxyServer(port=0, **kwargs)
+
+
+def test_proxy_start_failure_releases_partial_resources(monkeypatch):
+    def _fail_server(*args, **kwargs):
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(
+        "panoptes.proxy._BoundedThreadingHTTPServer",
+        _fail_server,
+    )
+    server = ProxyServer(port=0)
+
+    with pytest.raises(OSError, match="bind failed"):
+        server.start()
+
+    assert server._server is None
+    assert server._thread is None
+    assert server._http_client is None
+    assert server._db is None
+    assert server._tmp_db_path is None
+    assert server.writer is None
+
+
+def test_handler_owned_http_client_ignores_proxy_environment(monkeypatch):
+    captured = {}
+    sentinel = object()
+
+    def _client(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr("panoptes.proxy.httpx.Client", _client)
+
+    class _Handler:
+        http_client = None
+        upstream_timeout = 12.0
+
+    client, owned = ProxyHandler._get_client(_Handler())
+    assert client is sentinel
+    assert owned is True
+    assert captured["trust_env"] is False
+
+
+def test_proxy_does_not_merge_headerless_requests_into_one_session():
+    writer = AuditEventWriter(_AuditDBStub())
+    _, first = writer.build_request_events(
+        path="/v1/chat/completions", method="POST", req_headers={},
+        req_body={"model": "gpt-test", "messages": []}, run_id="run-1",
+    )
+    _, second = writer.build_request_events(
+        path="/v1/chat/completions", method="POST", req_headers={},
+        req_body={"model": "gpt-test", "messages": []}, run_id="run-2",
+    )
+    _, explicit = writer.build_request_events(
+        path="/v1/chat/completions", method="POST",
+        req_headers={"x-panoptes-session": "session-explicit"},
+        req_body={"model": "gpt-test", "messages": []}, run_id="run-3",
+    )
+
+    assert first["session_id"] != second["session_id"]
+    assert explicit["session_id"] == "session-explicit"
+
+
+def test_proxy_does_not_forward_internal_identity_headers():
+    class _Handler:
+        def _build_fwd_headers(self, headers):
+            return ProxyHandler._build_fwd_headers(self, headers)
+
+    forwarded = _Handler()._build_fwd_headers({
+        "Host": "localhost",
+        "Authorization": "Bearer upstream-token",
+        "X-Panoptes-Agent": "codex",
+        "x-panoptes-session": "session-1",
+    })
+
+    assert forwarded["Authorization"] == "Bearer upstream-token"
+    assert not any(key.lower().startswith("x-panoptes-") for key in forwarded)
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +443,215 @@ def test_call_id_on_tool_events():
     tool_calls = [e for e in resp_events if e["event_type"] == "tool_call"]
     assert tool_calls, "Expected tool_call event"
     assert tool_calls[0]["action"]["call_id"] == "call_new"
+    assert tool_calls[0]["outcome"]["status"] == "pending"
+    assert "execution was not observed" in tool_calls[0]["outcome"]["summary"]
     print("call_id test passed")
+
+
+def test_proxy_redacts_tool_result_before_summary_truncation():
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----"
+        + ("A" * 800)
+        + "-----END PRIVATE KEY-----"
+    )
+    writer = AuditEventWriter(_AuditDBStub())
+    events, _ = writer.build_request_events(
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body={
+            "model": "gpt-test",
+            "messages": [{
+                "role": "tool",
+                "tool_call_id": "call-secret",
+                "name": "read_secret",
+                "content": private_key,
+            }],
+        },
+    )
+    tool_result = next(
+        event for event in events if event["event_type"] == "tool_result"
+    )
+    summary = tool_result["outcome"]["summary"]
+    assert "BEGIN PRIVATE KEY" not in summary
+    assert "A" * 50 not in summary
+    assert "[REDACTED PRIVATE KEY]" in summary
+    assert tool_result["action"]["result"] == "[REDACTED PRIVATE KEY]"
+    assert tool_result["action"]["result_complete"] is True
+
+
+def test_request_event_exposes_complete_tool_capability_summary():
+    writer = AuditEventWriter(_AuditDBStub())
+    events, _ = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body={
+            "model": "gpt-test",
+            "input": "search",
+            "tools": [
+                {"type": "function", "name": "local_tool"},
+                {"type": "web_search_preview"},
+                {
+                    "type": "mcp",
+                    "server_label": "docs",
+                    "server_url": "https://mcp.example.test",
+                },
+            ],
+        },
+    )
+
+    action = events[0]["action"]
+    assert action["requested_tools"] == [
+        "function:local_tool",
+        "web_search_preview",
+        "mcp",
+    ]
+    assert action["client_side_tools"] == ["function:local_tool"]
+    assert action["server_side_tools"] == ["web_search_preview", "mcp"]
+    assert (
+        "server_url:https://mcp.example.test"
+        in action["requested_tool_targets"]
+    )
+
+
+def test_request_tool_capability_count_is_bounded():
+    writer = AuditEventWriter(
+        _AuditDBStub(),
+        max_tool_events_per_exchange=1,
+    )
+    with pytest.raises(ValidationError, match="per-exchange limit"):
+        writer.build_request_events(
+            path="/v1/responses",
+            method="POST",
+            req_headers={},
+            req_body={
+                "model": "gpt-test",
+                "input": "search",
+                "tools": [
+                    {"type": "function", "name": "one"},
+                    {"type": "function", "name": "two"},
+                ],
+            },
+        )
+
+
+def test_provider_hosted_action_records_upstream_execution_truth():
+    writer = AuditEventWriter(_AuditDBStub())
+    req_body = {"model": "gpt-test", "input": "search"}
+    _, exchange_ctx = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
+    events = writer.build_response_events(
+        path="/v1/responses",
+        req_body=req_body,
+        resp_status=200,
+        resp_headers={},
+        resp_body={
+            "object": "response",
+            "output": [{
+                "id": "ws_1",
+                "type": "web_search_call",
+                "status": "completed",
+                "action": {"query": "Panoptes"},
+            }],
+        },
+        duration_ms=20,
+        exchange_ctx=exchange_ctx,
+    )
+
+    tool_call = next(
+        event for event in events if event["event_type"] == "tool_call"
+    )
+    assert tool_call["action"]["execution_scope"] == "provider"
+    assert tool_call["action"]["provider_item_type"] == "web_search_call"
+    assert tool_call["outcome"]["status"] == "success"
+    assert "completed upstream" in tool_call["outcome"]["summary"]
+
+
+def test_provider_hosted_result_is_redacted_and_bounded():
+    writer = AuditEventWriter(_AuditDBStub())
+    req_body = {"model": "claude-test", "messages": []}
+    _, exchange_ctx = writer.build_request_events(
+        path="/v1/messages",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
+    events = writer.build_response_events(
+        path="/v1/messages",
+        req_body=req_body,
+        resp_status=200,
+        resp_headers={},
+        resp_body={
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srv_1",
+                    "name": "web_search",
+                    "input": {"query": "Panoptes"},
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": "result-" + ("x" * 1000),
+                },
+            ],
+        },
+        duration_ms=20,
+        exchange_ctx=exchange_ctx,
+    )
+
+    tool_call = next(
+        event for event in events if event["event_type"] == "tool_call"
+    )
+    assert tool_call["outcome"]["status"] == "success"
+    assert len(tool_call["action"]["server_result_summary"]) == 500
+    assert tool_call["action"]["server_result_complete"] is False
+    assert "server_result" not in tool_call["action"]
+
+
+def test_protocols_without_call_ids_remain_valid():
+    writer = AuditEventWriter(_AuditDBStub())
+    req_body = {
+        "model": "gemini-test",
+        "contents": [{"role": "user", "parts": [{"text": "weather"}]}],
+    }
+    _, exchange_ctx = writer.build_request_events(
+        path="/v1beta/models/gemini-test:generateContent",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
+    events = writer.build_response_events(
+        path="/v1beta/models/gemini-test:generateContent",
+        req_body=req_body,
+        resp_status=200,
+        resp_headers={},
+        resp_body={
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "weather",
+                            "args": {"city": "Lima"},
+                        },
+                    }],
+                },
+            }],
+        },
+        duration_ms=20,
+        exchange_ctx=exchange_ctx,
+    )
+
+    tool_call = next(
+        event for event in events if event["event_type"] == "tool_call"
+    )
+    assert tool_call["action"]["call_id"] is None
+    assert tool_call["action"]["target"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +663,6 @@ def test_reverse_proxy_routing():
     """_parse_target routes relative paths to correct upstreams."""
     class MockHandler:
         """Minimal mock that satisfies _parse_target's attribute accesses."""
-        default_upstream = None
-
         def _parse_target(self):
             return ProxyHandler._parse_target(self)
 
@@ -295,29 +702,19 @@ def test_reverse_proxy_routing():
     scheme, host, port, path = h._parse_target()
     assert "googleapis" in host
 
-    # Forward-proxy mode (absolute HTTP URL)
+    # Absolute-form targets are never accepted by the reverse proxy.
     h.path = "http://api.openai.com/v1/chat/completions"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.openai.com"
-    assert scheme == "http"
-    assert path == "/v1/chat/completions"
-
-    # Forward-proxy mode (absolute HTTPS URL)
-    h.path = "https://api.anthropic.com/v1/messages"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.anthropic.com"
-    assert scheme == "https"
+    with pytest.raises(ValueError, match="Absolute-form"):
+        h._parse_target()
 
     print("Reverse-proxy routing test passed")
 
 
 def test_reverse_proxy_no_upstream_raises():
-    """Unmatched path with no default_upstream should raise NoUpstreamError."""
+    """Unmatched provider paths are rejected."""
     from panoptes.proxy import NoUpstreamError
 
     class MockHandler:
-        default_upstream = None
-
         def _parse_target(self):
             return ProxyHandler._parse_target(self)
 
@@ -327,20 +724,27 @@ def test_reverse_proxy_no_upstream_raises():
         h._parse_target()
 
 
-def test_reverse_proxy_default_upstream():
-    """Unmatched path with default_upstream falls back to it."""
+def test_proxy_errors_and_request_logs_do_not_expose_query_secrets(caplog):
+    from panoptes.proxy import NoUpstreamError
+
     class MockHandler:
-        default_upstream = "https://my.custom.upstream.example.com"
+        path = "/unknown/endpoint?key=gemini-secret"
+        requestline = "POST /unknown/endpoint?key=gemini-secret HTTP/1.1"
+        command = "POST"
+        request_version = "HTTP/1.1"
 
         def _parse_target(self):
             return ProxyHandler._parse_target(self)
 
     h = MockHandler()
-    h.path = "/unknown/endpoint"
-    scheme, host, port, path = h._parse_target()
-    assert host == "my.custom.upstream.example.com"
-    assert scheme == "https"
-    print("default_upstream fallback test passed")
+    with pytest.raises(NoUpstreamError) as exc_info:
+        h._parse_target()
+    assert "gemini-secret" not in str(exc_info.value)
+
+    caplog.set_level("INFO", logger="panoptes")
+    ProxyHandler.log_message(h, '"%s" %s %s', h.requestline, "502", "-")
+    assert "gemini-secret" not in caplog.text
+    assert "/unknown/endpoint" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +876,75 @@ def test_sse_parsing_anthropic_via_parse_sse_response():
     print("_parse_sse_response (anthropic) test passed")
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "danger",
+                    "name": "terminal",
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "harmless"},
+            },
+        ],
+        [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "danger",
+                    "name": "terminal",
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"command":"kubectl delete',
+                },
+            },
+        ],
+        [
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "danger",
+                    "name": "terminal",
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"command":"kubectl delete',
+                },
+            },
+            {"type": "content_block_stop", "index": 0},
+        ],
+    ],
+)
+def test_anthropic_reassembly_rejects_overwrite_and_incomplete_tool_blocks(events):
+    raw = b"".join(
+        b"data:" + json.dumps(event).encode() + b"\n\n"
+        for event in events
+    )
+    with pytest.raises(SSEParseError):
+        AnthropicProvider().reassemble_sse(raw)
+
+
 # ---------------------------------------------------------------------------
 # SSE parsing — OpenAI
 # ---------------------------------------------------------------------------
@@ -536,6 +1009,791 @@ def test_sse_parsing_openai_via_parse_sse_response():
     assert result is not None
     assert result["choices"][0]["message"]["content"] == "Hi"
     print("_parse_sse_response (openai) test passed")
+
+
+def _responses_sse(*events: dict) -> bytes:
+    return b"".join(
+        b"data:" + json.dumps(event).encode() + b"\n\n"
+        for event in events
+    )
+
+
+def test_openai_responses_final_event_cannot_erase_streamed_tool_call():
+    call = {
+        "id": "fc_danger",
+        "type": "function_call",
+        "call_id": "call_danger",
+        "name": "terminal",
+        "arguments": "",
+    }
+    completed_call = {
+        **call,
+        "arguments": '{"command":"kubectl delete namespace production"}',
+    }
+    raw = _responses_sse(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": call,
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": '{"command":"kubectl delete namespace production"}',
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": completed_call,
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "object": "response",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        },
+    )
+
+    provider = OpenAIProvider()
+    response = provider.reassemble_sse(raw)
+    calls = provider.extract_tool_calls(response)
+    assert len(calls) == 1
+    assert calls[0]["tool_name"] == "terminal"
+    assert calls[0]["parameters"]["command"].endswith("production")
+
+
+def test_openai_responses_rejects_final_tool_call_contradiction():
+    raw = _responses_sse(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "terminal",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "terminal",
+                "arguments": '{"command":"rm -rf /"}',
+            },
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "object": "response",
+                "output": [{
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "calculator",
+                    "arguments": '{"expr":"2+2"}',
+                }],
+            },
+        },
+    )
+    with pytest.raises(SSEParseError, match="contradicted"):
+        OpenAIProvider().reassemble_sse(raw)
+
+
+def test_openai_responses_rejects_incomplete_function_call_stream():
+    raw = _responses_sse(
+        {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "terminal",
+                "arguments": "",
+            },
+        },
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "delta": '{"command":"rm -rf',
+        },
+    )
+    with pytest.raises(SSEParseError, match="incomplete"):
+        OpenAIProvider().reassemble_sse(raw)
+
+
+@pytest.mark.parametrize(
+    ("path", "request_body", "response_headers", "response_body"),
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "gpt-test", "messages": [], "stream": True},
+            {"content-type": "text/event-stream"},
+            b'data: {"choices": []}\n\ndata: {not-json}\n\n',
+        ),
+        (
+            "/custom/generate",
+            {"payload": "opaque"},
+            {"content-type": "application/json"},
+            b'{"possibly_hidden_tool_call": true}',
+        ),
+    ],
+)
+def test_buffering_enforcement_denies_uninspectable_responses(
+    path, request_body, response_headers, response_body
+):
+    from panoptes.policy import PolicyResult
+
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db)
+
+    class _BlockingCapableEngine:
+        has_blocking_policies = True
+
+        def check_event(self, event):
+            return PolicyResult(action="allow")
+
+    writer.policy_engine = _BlockingCapableEngine()
+    req_events, exchange_ctx = writer.build_request_events(
+        path=path,
+        method="POST",
+        req_headers={},
+        req_body=request_body,
+        run_id="inspection-run",
+    )
+
+    class _Handler:
+        def __init__(self):
+            self.writer = writer
+            self.wfile = io.BytesIO()
+            self.status = None
+            self.headers = []
+
+        def _forward_request(self, *args, **kwargs):
+            return 200, response_headers, response_body
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    handler = _Handler()
+    ProxyHandler._handle_buffered(
+        handler,
+        method="POST",
+        scheme="https",
+        host="api.openai.com",
+        port=443,
+        path=path,
+        req_headers={},
+        body=json.dumps(request_body).encode(),
+        req_body=request_body,
+        req_events=req_events,
+        exchange_ctx=exchange_ctx,
+        t0=time.monotonic(),
+    )
+
+    assert handler.status == 502
+    denial = json.loads(handler.wfile.getvalue())
+    assert denial["inspection_error"] is True
+    assert handler.wfile.getvalue() != response_body
+    response_event = next(
+        event for event in db.events if event["event_type"] == "model_response"
+    )
+    assert response_event["outcome"]["status"] == "blocked"
+    assert response_event["context"]["capture"]["inspection_status"] == "blocked"
+
+
+def test_buffered_and_stream_audit_bodies_are_bounded():
+    class _Response:
+        status_code = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_bytes(self):
+            yield b"abc"
+            yield b"def"
+
+    class _Client:
+        def stream(self, *args, **kwargs):
+            return _Response()
+
+    class _BufferedHandler:
+        http_client = _Client()
+        max_buffered_response_bytes = 5
+
+        def _get_client(self):
+            return self.http_client, False
+
+        def _build_fwd_headers(self, headers):
+            return ProxyHandler._build_fwd_headers(self, headers)
+
+    with pytest.raises(UpstreamBodyTooLarge):
+        ProxyHandler._forward_request(
+            _BufferedHandler(),
+            "POST",
+            "https",
+            "api.openai.com",
+            443,
+            "/v1/responses",
+            {},
+            b"{}",
+        )
+
+    class _StreamingHandler(_BufferedHandler):
+        max_audit_stream_bytes = 4
+
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    streaming = _StreamingHandler()
+    status, _, audit_bytes, truncated = ProxyHandler._forward_streaming(
+        streaming,
+        "POST",
+        "https",
+        "api.openai.com",
+        443,
+        "/v1/responses",
+        {},
+        b"{}",
+    )
+    assert status == 200
+    assert audit_bytes == b"abcd"
+    assert truncated is True
+    assert streaming.wfile.getvalue() == b"abcdef"
+
+
+def test_decoded_response_headers_and_connection_nominated_headers_are_removed():
+    filtered = _filter_headers({
+        "Connection": "X-Internal, Keep-Alive",
+        "X-Internal": "must-not-cross",
+        "Keep-Alive": "timeout=5",
+        "Content-Type": "application/json",
+    })
+    assert "Connection" not in filtered
+    assert "X-Internal" not in filtered
+    assert "Keep-Alive" not in filtered
+    assert filtered["Content-Type"] == "application/json"
+
+    class _Response:
+        status_code = 200
+        headers = {
+            "content-type": "application/json",
+            "content-encoding": "gzip",
+            "content-length": "2",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def iter_bytes(self):
+            # httpx exposes decoded bytes here even when upstream headers still
+            # describe the encoded representation.
+            yield b"{}"
+
+    class _Client:
+        def stream(self, *args, **kwargs):
+            return _Response()
+
+    class _Handler:
+        http_client = _Client()
+        max_buffered_response_bytes = 100
+
+        def _get_client(self):
+            return self.http_client, False
+
+        def _build_fwd_headers(self, headers):
+            return ProxyHandler._build_fwd_headers(self, headers)
+
+    _, headers, body = ProxyHandler._forward_request(
+        _Handler(),
+        "POST",
+        "https",
+        "api.openai.com",
+        443,
+        "/v1/responses",
+        {},
+        b"{}",
+    )
+    assert body == b"{}"
+    assert all(key.lower() != "content-encoding" for key in headers)
+
+    class _StreamingHandler(_Handler):
+        max_audit_stream_bytes = 100
+
+        def __init__(self):
+            self.wfile = io.BytesIO()
+            self.sent_headers = []
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.sent_headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    streaming = _StreamingHandler()
+    _, returned_headers, _, _ = ProxyHandler._forward_streaming(
+        streaming,
+        "POST",
+        "https",
+        "api.openai.com",
+        443,
+        "/v1/responses",
+        {},
+        b"{}",
+    )
+    assert all(
+        key.lower() not in {"content-encoding", "content-length"}
+        for key, _ in streaming.sent_headers
+    )
+    assert all(
+        key.lower() not in {"content-encoding", "content-length"}
+        for key in returned_headers
+    )
+
+
+def test_fail_closed_without_policy_engine_denies_and_records_provenance():
+    writer = AuditEventWriter(
+        _AuditDBStub(), policy_failure_mode="fail_closed"
+    )
+    events, _ = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body={"model": "gpt-test", "input": "hello"},
+    )
+    result = writer.check_policies(events)
+    assert result.action == "block"
+    assert result.violated_policies[0]["policy_name"] == "policy_engine_error"
+    assert events[0]["context"]["policy"]["action"] == "block"
+
+
+def test_proxy_policy_aggregation_preserves_matches_and_snapshot():
+    from panoptes.policy import PolicyResult
+
+    writer = AuditEventWriter(_AuditDBStub())
+
+    class _Engine:
+        has_blocking_policies = False
+
+        def check_event(self, event):
+            return PolicyResult(
+                action="allow",
+                matched_policies=[{
+                    "policy_name": "explicit-allow",
+                    "action": "allow",
+                    "reason": "test",
+                    "message": "allowed",
+                }],
+                policy_snapshot_id="snapshot-123",
+            )
+
+    writer.policy_engine = _Engine()
+    events, _ = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body={"model": "gpt-test", "input": "hello"},
+    )
+    result = writer.check_policies(events)
+    assert result.policy_snapshot_id == "snapshot-123"
+    assert result.matched_policies[0]["policy_name"] == "explicit-allow"
+    assert events[0]["context"]["policy"]["snapshot_id"] == "snapshot-123"
+    assert (
+        events[0]["context"]["policy"]["matched_policies"][0]["policy_name"]
+        == "explicit-allow"
+    )
+
+
+def test_proxy_batches_source_and_policy_violation_atomically(tmp_path):
+    class _BatchDB:
+        def __init__(self):
+            self.batches = []
+
+        def insert_events(self, events):
+            self.batches.append(list(events))
+
+        def insert_event(self, event):
+            raise AssertionError("atomic batch path should be used")
+
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    (policies / "deny.yaml").write_text(
+        "\n".join([
+            'name: "deny-test-model"',
+            "enabled: true",
+            "rule:",
+            "  event_type: model_request",
+            "  conditions:",
+            '    - field: "action.model"',
+            '      operator: "=="',
+            '      value: "gpt-test"',
+            "action: block",
+            'message: "test model denied"',
+        ]),
+        encoding="utf-8",
+    )
+    db = _BatchDB()
+    writer = AuditEventWriter(db, policies_dir=str(policies))
+    events, _ = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body={"model": "gpt-test", "input": "hello"},
+    )
+
+    result = writer.check_policies(events)
+
+    assert result.action == "block"
+    assert db.batches == []
+    assert [event["event_type"] for event in events] == [
+        "model_request",
+        "policy_violation",
+    ]
+    assert (
+        events[1]["context"]["policy_snapshot_id"]
+        == result.policy_snapshot_id
+    )
+
+    writer.write(events)
+    assert len(db.batches) == 1
+    assert [event["event_type"] for event in db.batches[0]] == [
+        "model_request",
+        "policy_violation",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_action"),
+    [("fail_open", "warn"), ("fail_closed", "block")],
+)
+def test_unknown_requested_tool_type_never_silently_allows(
+    failure_mode, expected_action
+):
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db, policy_failure_mode=failure_mode)
+    events, _ = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body={
+            "model": "gpt-test",
+            "input": "future tool",
+            "tools": [{"type": "future_remote_execution"}],
+        },
+    )
+
+    result = writer.check_policies(events)
+    writer.write(events)
+
+    assert result.action == expected_action
+    assert any(
+        violation["policy_name"] == "unknown_requested_tool_type"
+        for violation in result.violated_policies
+    )
+    stored_source = next(
+        event for event in db.events if event["event_type"] == "model_request"
+    )
+    assert stored_source["context"]["policy"]["action"] == expected_action
+    assert any(
+        violation["policy_name"] == "unknown_requested_tool_type"
+        for violation in stored_source["context"]["policy"][
+            "violated_policies"
+        ]
+    )
+
+
+def test_proxy_validates_normalized_identity_before_policy_or_forwarding():
+    writer = AuditEventWriter(_AuditDBStub())
+    with pytest.raises(ValidationError, match="control characters"):
+        writer.build_request_events(
+            path="/v1/responses",
+            method="POST",
+            req_headers={"x-panoptes-session": "attacker\nforged"},
+            req_body={"model": "gpt-test", "input": "hello"},
+        )
+
+
+def test_proxy_rejects_duplicate_request_object_keys_before_forwarding():
+    class _Handler:
+        headers = {}
+        writer = AuditEventWriter(_AuditDBStub())
+
+        def __init__(self):
+            self.forwarded = False
+            self.error = None
+
+        def _parse_target(self):
+            return "https", "api.openai.com", 443, "/v1/responses"
+
+        def _read_body(self):
+            return (
+                b'{"model":"gpt-safe","model":"gpt-confused",'
+                b'"input":"hello"}'
+            )
+
+        def _send_json_error(self, status, message, extra=None):
+            self.error = (status, message, extra)
+
+        def _handle_buffered(self, **kwargs):
+            self.forwarded = True
+
+    handler = _Handler()
+    ProxyHandler._handle_request(handler, "POST")
+
+    assert handler.forwarded is False
+    assert handler.error[0] == 400
+    assert "unambiguous" in handler.error[1]
+
+
+def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery():
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db)
+    req_body = {"model": "gpt-test", "input": "hello"}
+    req_events, exchange_ctx = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
+    exchange_ctx["_request_events_persisted"] = True
+    ambiguous = (
+        b'{"object":"response","output":[],'
+        b'"output":[{"type":"function_call","name":"hidden",'
+        b'"arguments":"{}"}]}'
+    )
+
+    class _Handler:
+        def __init__(self):
+            self.writer = writer
+            self.wfile = io.BytesIO()
+            self.status = None
+            self.headers = []
+
+        def _forward_request(self, *args, **kwargs):
+            return 200, {"content-type": "application/json"}, ambiguous
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    handler = _Handler()
+    ProxyHandler._handle_buffered(
+        handler,
+        method="POST",
+        scheme="https",
+        host="api.openai.com",
+        port=443,
+        path="/v1/responses",
+        req_headers={},
+        body=json.dumps(req_body).encode(),
+        req_body=req_body,
+        req_events=req_events,
+        exchange_ctx=exchange_ctx,
+        t0=time.monotonic(),
+    )
+
+    assert handler.status == 502
+    assert handler.wfile.getvalue() != ambiguous
+    response_event = next(
+        event for event in db.events if event["event_type"] == "model_response"
+    )
+    assert response_event["outcome"]["status"] == "blocked"
+    assert response_event["context"]["capture"]["response_delivered"] is False
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_status", "expected_outcome"),
+    [
+        ("fail_open", 200, "error"),
+        ("fail_closed", 503, "blocked"),
+    ],
+)
+def test_response_event_construction_failure_gets_explicit_fallback(
+    failure_mode, expected_status, expected_outcome, monkeypatch
+):
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db, policy_failure_mode=failure_mode)
+    req_body = {"model": "gpt-test", "input": "hello"}
+    req_events, exchange_ctx = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+    )
+    exchange_ctx["_request_events_persisted"] = True
+
+    def _fail_extraction(self, resp_body, *, path=None):
+        raise RuntimeError("provider extraction exploded")
+
+    monkeypatch.setattr(
+        OpenAIProvider,
+        "extract_tool_calls",
+        _fail_extraction,
+    )
+    upstream = b'{"object":"response","output":[]}'
+
+    class _Handler:
+        def __init__(self):
+            self.writer = writer
+            self.wfile = io.BytesIO()
+            self.status = None
+
+        def _forward_request(self, *args, **kwargs):
+            return 200, {"content-type": "application/json"}, upstream
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            pass
+
+        def end_headers(self):
+            pass
+
+    handler = _Handler()
+    ProxyHandler._handle_buffered(
+        handler,
+        method="POST",
+        scheme="https",
+        host="api.openai.com",
+        port=443,
+        path="/v1/responses",
+        req_headers={},
+        body=json.dumps(req_body).encode(),
+        req_body=req_body,
+        req_events=req_events,
+        exchange_ctx=exchange_ctx,
+        t0=time.monotonic(),
+    )
+
+    assert handler.status == expected_status
+    response_event = next(
+        event for event in db.events if event["event_type"] == "model_response"
+    )
+    assert response_event["outcome"]["status"] == expected_outcome
+    assert (
+        response_event["context"]["capture"]["inspection_status"]
+        == ("blocked" if failure_mode == "fail_closed" else "incomplete")
+    )
+    if failure_mode == "fail_open":
+        assert handler.wfile.getvalue() == upstream
+    else:
+        assert handler.wfile.getvalue() != upstream
+
+
+def test_audit_writer_raises_when_batch_and_fallback_cannot_persist_all_events():
+    class _FailingDB:
+        def insert_events(self, events):
+            raise OSError("batch unavailable")
+
+        def insert_event(self, event):
+            raise OSError("single insert unavailable")
+
+    writer = AuditEventWriter(_FailingDB())
+    with pytest.raises(AuditWriteError, match="Failed to persist"):
+        writer.write([{"event_id": "one"}, {"event_id": "two"}])
+
+
+@pytest.mark.parametrize(
+    ("policy_action", "expected_status"),
+    [("allow", 503), ("block", 403)],
+)
+def test_fail_closed_never_forwards_without_durable_request_audit(
+    policy_action, expected_status
+):
+    from panoptes.policy import PolicyResult
+
+    class _FailingDB:
+        def insert_event(self, event):
+            raise OSError("audit storage unavailable")
+
+    writer = AuditEventWriter(
+        _FailingDB(), policy_failure_mode="fail_closed"
+    )
+
+    class _Engine:
+        has_blocking_policies = True
+
+        def check_event(self, event):
+            if policy_action == "block":
+                return PolicyResult(
+                    action="block",
+                    violated_policies=[{
+                        "policy_name": "deny-test",
+                        "message": "blocked",
+                    }],
+                )
+            return PolicyResult(action="allow")
+
+    writer.policy_engine = _Engine()
+
+    class _Handler:
+        headers = {}
+
+        def __init__(self):
+            self.writer = writer
+            self.forwarded = False
+            self.error = None
+
+        def _parse_target(self):
+            return "https", "api.openai.com", 443, "/v1/responses"
+
+        def _read_body(self):
+            return json.dumps({
+                "model": "gpt-test",
+                "input": "hello",
+            }).encode()
+
+        def _send_json_error(self, status, message, extra=None):
+            self.error = (status, message, extra)
+
+        def _handle_buffered(self, **kwargs):
+            self.forwarded = True
+
+    handler = _Handler()
+    ProxyHandler._handle_request(handler, "POST")
+    assert handler.forwarded is False
+    assert handler.error[0] == expected_status
+    if policy_action == "block":
+        assert handler.error[2]["audit_persisted"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +1863,150 @@ def test_preflight_block_prevents_forward():
     print("Pre-flight blocking test passed")
 
 
+def test_preflight_block_records_request_as_not_forwarded():
+    from panoptes.policy import PolicyResult
+
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db)
+
+    class _BlockingEngine:
+        def check_event(self, event):
+            return PolicyResult(
+                action="block",
+                violated_policies=[{
+                    "policy_name": "deny-request",
+                    "message": "request denied",
+                }],
+            )
+
+    writer.policy_engine = _BlockingEngine()
+
+    class _Handler:
+        headers = {}
+
+        def __init__(self):
+            self.writer = writer
+            self.forwarded = False
+            self.error = None
+
+        def _parse_target(self):
+            return "https", "api.openai.com", 443, "/v1/responses"
+
+        def _read_body(self):
+            return json.dumps({
+                "model": "gpt-test",
+                "input": "hello",
+            }).encode()
+
+        def _send_json_error(self, status, message, extra=None):
+            self.error = (status, message, extra)
+
+        def _handle_buffered(self, **kwargs):
+            self.forwarded = True
+
+    handler = _Handler()
+    ProxyHandler._handle_request(handler, "POST")
+
+    assert handler.forwarded is False
+    assert handler.error[0] == 403
+    request_event = next(
+        event for event in db.events if event["event_type"] == "model_request"
+    )
+    assert request_event["outcome"]["status"] == "blocked"
+    assert (
+        request_event["context"]["capture"]["upstream_forwarded"] is False
+    )
+    assert (
+        request_event["context"]["capture"]["delivery_status"]
+        == "blocked_before_upstream"
+    )
+
+
+def test_buffered_postflight_block_records_response_and_tool_call_withheld():
+    from panoptes.policy import PolicyResult
+
+    db = _AuditDBStub()
+    writer = AuditEventWriter(db)
+
+    class _BlockingEngine:
+        has_blocking_policies = True
+
+        def check_event(self, event):
+            return PolicyResult(
+                action="block",
+                violated_policies=[{
+                    "policy_name": "deny-response",
+                    "message": "response denied",
+                }],
+            )
+
+    writer.policy_engine = _BlockingEngine()
+    req_body = {"model": "gpt-test", "input": "call a tool"}
+    req_events, exchange_ctx = writer.build_request_events(
+        path="/v1/responses",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+        run_id="withheld-response-run",
+    )
+    exchange_ctx["_request_events_persisted"] = True
+    upstream_body = json.dumps({
+        "object": "response",
+        "output": [{
+            "id": "fc_123",
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "terminal",
+            "arguments": '{"command":"dangerous"}',
+        }],
+    }).encode()
+
+    class _Handler:
+        def __init__(self):
+            self.writer = writer
+            self.wfile = io.BytesIO()
+            self.status = None
+            self.headers = []
+
+        def _forward_request(self, *args, **kwargs):
+            return 200, {"content-type": "application/json"}, upstream_body
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    handler = _Handler()
+    ProxyHandler._handle_buffered(
+        handler,
+        method="POST",
+        scheme="https",
+        host="api.openai.com",
+        port=443,
+        path="/v1/responses",
+        req_headers={},
+        body=json.dumps(req_body).encode(),
+        req_body=req_body,
+        req_events=req_events,
+        exchange_ctx=exchange_ctx,
+        t0=time.monotonic(),
+    )
+
+    assert handler.status == 403
+    assert handler.wfile.getvalue() != upstream_body
+    by_type = {event["event_type"]: event for event in db.events}
+    assert by_type["model_response"]["outcome"]["status"] == "blocked"
+    assert by_type["tool_call"]["outcome"]["status"] == "blocked"
+    for event_type in ("model_response", "tool_call"):
+        capture = by_type[event_type]["context"]["capture"]
+        assert capture["response_delivered"] is False
+        assert capture["delivery_status"] == "withheld"
+
+
 def test_preflight_allow_writes_all_events():
     """When policies allow, both request and response events are written."""
     db = _AuditDBStub()
@@ -651,59 +2053,15 @@ def test_preflight_allow_writes_all_events():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end integration: reverse-proxy mode with live server
-# ---------------------------------------------------------------------------
-
-
-def test_reverse_proxy_mode_captures_events():
-    """Reverse-proxy mode: direct POST to proxy captures audit events."""
-    server = ProxyServer(host="127.0.0.1", port=0)
-    port = server.start()
-
-    try:
-        # Use a direct HTTP request in reverse-proxy style (relative path resolved by proxy)
-        # We can't actually hit api.openai.com in tests, so we hit httpbin.org via
-        # forward-proxy mode with an absolute URL to verify event capture works.
-        # This test exercises the path where req_body parse + events are built.
-        req_body = {
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Test"}],
-            "stream": False,
-        }
-        proxy_url = f"http://127.0.0.1:{port}"
-        try:
-            resp = httpx.post(
-                "http://httpbin.org/post",
-                json=req_body,
-                proxy=proxy_url,
-                timeout=10,
-            )
-        except Exception:
-            pass
-
-        time.sleep(0.2)
-        events = server.events
-        if events:
-            # All events from this exchange share a run_id
-            run_ids = {e["agent"]["run_id"] for e in events}
-            assert len(run_ids) == 1, f"Multiple run_ids: {run_ids}"
-        print(f"Reverse-proxy integration test passed ({len(events)} events captured)")
-    finally:
-        server.stop()
-
-
-# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    test_proxy_capture_openai()
     test_shared_run_id()
     test_turn_number_in_context()
     test_call_id_on_tool_events()
     test_reverse_proxy_routing()
     test_reverse_proxy_no_upstream_raises()
-    test_reverse_proxy_default_upstream()
     test_sse_parsing_anthropic_text()
     test_sse_parsing_anthropic_tool_use()
     test_sse_parsing_anthropic_via_parse_sse_response()
@@ -712,5 +2070,4 @@ if __name__ == "__main__":
     test_sse_parsing_openai_via_parse_sse_response()
     test_preflight_block_prevents_forward()
     test_preflight_allow_writes_all_events()
-    test_reverse_proxy_mode_captures_events()
     print("\nAll tests passed!")

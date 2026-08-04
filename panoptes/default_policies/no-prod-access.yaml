@@ -1,7 +1,7 @@
 # Block any tool call whose resolved data_accessed includes production resources.
-# data_accessed is automatically derived by normalize_event from command strings,
-# file paths, and URLs in action.parameters and action.target — so this policy
-# fires on real agent events without manual tagging.
+# data_accessed is heuristically derived by normalize_event from command strings,
+# file paths, and URLs in action.parameters and action.target. Treat this bundled
+# rule as an example to extend and test against the exact tools in your deployment.
 name: "no-prod-access"
 description: >
   Block tool calls that touch production resources (detected via data_accessed
@@ -9,7 +9,7 @@ description: >
   the command or file path with 'prod', regardless of which tool was used.
 enabled: true
 scope:
-  agents: ["hermes", "claude_code", "codex"]
+  agents: ["*"]
   sessions: []
 rule:
   event_type: "tool_call"
