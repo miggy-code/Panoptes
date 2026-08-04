@@ -5,10 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "panoptes"
 version = "0.1.0"
-description = "Panoptes — universal agent observability, audit trail, and policy enforcement for AI coding agents."
+description = "Adapter-based agent observability, local audit trails, and policy gates."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+dependencies = [
+    "httpx>=0.27,<1",
+    "PyYAML>=6,<7",
+]
+license = "Apache-2.0"
 authors = [
     {name = "Miggy", email = "miguel@throttlai.com"}
 ]
@@ -16,17 +20,30 @@ keywords = ["agent", "ai", "audit", "security", "observability", "claude-code", 
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Quality Assurance",
     "Topic :: Security",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+]
+
+[project.urls]
+Homepage = "https://github.com/miggy-code/Panoptes"
+Repository = "https://github.com/miggy-code/Panoptes"
+Issues = "https://github.com/miggy-code/Panoptes/issues"
 
 [project.scripts]
 panoptes = "panoptes.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["panoptes*"]
+
+[tool.setuptools.package-data]
+panoptes = ["default_policies/*.yaml"]
