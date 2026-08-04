@@ -3,22 +3,139 @@
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any
 
 
+class SSEParseError(ValueError):
+    """Raised when an SSE data event cannot be decoded safely.
+
+    LLM provider streams carry JSON in ``data`` fields. Silently dropping a
+    malformed event can hide a tool instruction from response-side policy
+    enforcement, so callers must be able to distinguish "no event" from
+    "uninspectable event".
+    """
+
+
+def _strict_json_loads(value: str | bytes | bytearray) -> Any:
+    """Decode standards-compliant JSON while rejecting ambiguous objects.
+
+    Duplicate object names are a parser-differential risk at an enforcement
+    boundary: Panoptes and the eventual consumer might otherwise make policy
+    decisions from different values in the same byte sequence. Non-finite
+    constants are outside JSON and are rejected as well.
+    """
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = item
+        return result
+
+    def reject_constant(constant: str) -> Any:
+        raise ValueError(f"non-finite JSON number {constant!r}")
+
+    try:
+        return json.loads(
+            value,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    except RecursionError as exc:
+        raise ValueError("JSON nesting exceeds the parser limit") from exc
+
+
 def _parse_sse_events(data: bytes) -> list[dict]:
-    """Parse SSE byte stream into a list of parsed JSON data objects."""
+    """Parse an SSE byte stream into JSON data objects.
+
+    This follows the EventSource framing rules relevant to provider responses:
+    events are delimited by a blank line, repeated ``data`` fields are joined
+    with a newline, ``data:`` may have zero or one leading space in its value,
+    comments and non-data fields are ignored, and a final unterminated event is
+    dispatched at EOF for compatibility with finite HTTP response bodies.
+
+    Malformed UTF-8, malformed JSON, and non-object JSON data are rejected
+    instead of being skipped. A skipped chunk is an enforcement bypass when it
+    contains the only tool call in a response.
+    """
+    try:
+        # Event streams are UTF-8; utf-8-sig also implements the EventSource
+        # rule that a single leading BOM is ignored.
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SSEParseError(f"invalid UTF-8 in SSE stream at byte {exc.start}") from exc
+
     events: list[dict] = []
-    for line in data.decode("utf-8", errors="replace").splitlines():
-        if line.startswith("data: "):
-            payload = line[6:].strip()
-            if payload == "[DONE]":
-                continue
-            try:
-                events.append(json.loads(payload))
-            except (json.JSONDecodeError, ValueError):
-                pass
+    data_lines: list[str] = []
+    event_number = 0
+
+    def accumulated_payload_is_complete() -> bool:
+        """Whether buffered data already forms one provider JSON event.
+
+        Some provider SDK fixtures (and older Panoptes captures) omit the blank
+        EventSource separator and emit one complete JSON ``data`` field per
+        line. Dispatching only when the existing payload is independently
+        complete preserves that compatibility without silently splitting a
+        malformed or genuinely multiline JSON event.
+        """
+        if not data_lines:
+            return False
+        payload = "\n".join(data_lines)
+        if payload.strip() == "[DONE]":
+            return True
+        try:
+            return isinstance(_strict_json_loads(payload), dict)
+        except (json.JSONDecodeError, ValueError):
+            return False
+
+    def dispatch() -> None:
+        nonlocal data_lines, event_number
+        if not data_lines:
+            return
+
+        event_number += 1
+        payload = "\n".join(data_lines)
+        data_lines = []
+        if payload.strip() == "[DONE]":
+            return
+
+        try:
+            parsed = _strict_json_loads(payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SSEParseError(
+                f"invalid JSON in SSE data event {event_number}: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise SSEParseError(
+                f"SSE data event {event_number} must contain a JSON object"
+            )
+        events.append(parsed)
+
+    # splitlines() also treats several Unicode control characters as line
+    # boundaries; EventSource only recognizes CR, LF, and CRLF.
+    for line in re.split(r"\r\n|\r|\n", text):
+        if line == "":
+            dispatch()
+            continue
+        if line.startswith(":"):
+            continue
+
+        if ":" in line:
+            field, value = line.split(":", 1)
+            if value.startswith(" "):
+                value = value[1:]
+        else:
+            field, value = line, ""
+
+        if field == "data":
+            if accumulated_payload_is_complete():
+                dispatch()
+            data_lines.append(value)
+
+    dispatch()
     return events
 
 
@@ -55,8 +172,17 @@ class Provider(ABC):
         """Default upstream base URL (e.g. 'https://api.anthropic.com')."""
 
     @abstractmethod
-    def reassemble_sse(self, raw_bytes: bytes) -> dict:
-        """Reassemble a streaming response into a final response dict."""
+    def reassemble_sse(
+        self,
+        raw_bytes: bytes,
+        *,
+        path: str | None = None,
+    ) -> dict:
+        """Reassemble a streaming response into a final response dict.
+
+        ``path`` binds parsing to the requested endpoint when one provider has
+        multiple wire protocols. Enforcement callers should always supply it.
+        """
 
     def extract_request_info(self, body: dict | None) -> dict[str, Any]:
         """Extract normalized request info from a request body.
@@ -93,9 +219,15 @@ class Provider(ABC):
         messages = body.get("messages", [])
         return sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")
 
-    def extract_tool_calls(self, resp_body: dict) -> list[dict]:
+    def extract_tool_calls(
+        self,
+        resp_body: dict,
+        *,
+        path: str | None = None,
+    ) -> list[dict]:
         """Extract tool call events from a response body.
 
+        ``path`` binds extraction to the requested endpoint's response dialect.
         Returns list of dicts with keys: tool_name, parameters, call_id.
         """
         return []
@@ -106,6 +238,21 @@ class Provider(ABC):
         Returns list of dicts with keys: tool_name, result, call_id.
         """
         return []
+
+    def extract_requested_tools(self, req_body: dict) -> dict[str, list[str]]:
+        """Return complete, policy-safe tool capability summaries.
+
+        Providers should expose security-relevant type/name/target strings from
+        the full request instead of asking policy rules to inspect a truncated
+        raw-payload presentation.
+        """
+        return {
+            "requested_tools": [],
+            "client_side_tools": [],
+            "server_side_tools": [],
+            "unknown_tool_types": [],
+            "requested_tool_targets": [],
+        }
 
     def extract_usage(self, resp_body: dict) -> dict:
         """Extract token usage from a response body.
@@ -130,11 +277,16 @@ class UnknownProvider(Provider):
     def default_upstream(self) -> str:
         return ""
 
-    def reassemble_sse(self, raw_bytes: bytes) -> dict:
+    def reassemble_sse(
+        self,
+        raw_bytes: bytes,
+        *,
+        path: str | None = None,
+    ) -> dict:
         events = _parse_sse_events(raw_bytes)
         if events:
             return events[-1]
         try:
-            return json.loads(raw_bytes)
+            return _strict_json_loads(raw_bytes)
         except (json.JSONDecodeError, ValueError):
             return {}

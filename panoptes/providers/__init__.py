@@ -27,19 +27,20 @@ _UNKNOWN = UnknownProvider()
 def detect(path: str, body: dict | None) -> Provider:
     """Detect the provider for a request from its path and body.
 
-    Body-based matching takes priority (most specific); falls back to
-    path-based matching; returns UnknownProvider if nothing matches.
+    The routed API path takes priority because provider request bodies can be
+    structurally ambiguous (for example, both OpenAI and Anthropic use a
+    ``messages`` list). Body matching is only a fallback for custom paths.
     """
-    # 1. Body-based detection (highest specificity)
+    # 1. Route-based detection (highest specificity)
+    for provider in REGISTRY:
+        if provider.matches_path(path):
+            return provider
+
+    # 2. Body-based fallback for custom upstream paths
     if isinstance(body, dict):
         for provider in REGISTRY:
             if provider.matches_body(body):
                 return provider
-
-    # 2. Path-based detection
-    for provider in REGISTRY:
-        if provider.matches_path(path):
-            return provider
 
     return _UNKNOWN
 
