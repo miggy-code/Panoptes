@@ -18,8 +18,7 @@ trail. Hermes integrations can also report lifecycle events and ask Panoptes
 for a synchronous pre-tool decision.
 
 It runs locally, needs no external service, and keeps its claims deliberately
-narrow: Panoptes records what an adapter observed. It does not pretend that a
-model-issued tool instruction proves a local command actually ran.
+narrow: Panoptes records what an adapter observed. Calls emitted by a model remain requests unless the host reports an execution outcome
 
 ## Why
 
