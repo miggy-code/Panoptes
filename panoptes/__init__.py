@@ -7,6 +7,8 @@ synchronously authorized; schema conformance does not prove identity or local
 execution.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .capture import (
     AuthorizationDecision,
     CaptureCapabilities,
@@ -35,6 +37,11 @@ from .schema import (
     validate_identifier,
 )
 
+try:
+    __version__ = version("panoptes-observe")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+
 __all__ = [
     "AuditDB",
     "AuthorizationDecision",
@@ -55,4 +62,5 @@ __all__ = [
     "redact_secrets",
     "validate_event",
     "validate_identifier",
+    "__version__",
 ]

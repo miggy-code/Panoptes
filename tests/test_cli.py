@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from panoptes import __version__
 from panoptes.cli import main
 from panoptes.db import AuditDB
 from panoptes.policy import PolicyResult
@@ -19,6 +20,14 @@ def _event(event_id: str) -> dict:
         "outcome": {"status": "success"},
         "context": {},
     }
+
+
+def test_version_command_reports_installed_distribution(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--version"])
+
+    assert exc.value.code == 0
+    assert capsys.readouterr().out == f"panoptes {__version__}\n"
 
 
 def test_verify_and_checkpoint_commands(tmp_path, capsys):

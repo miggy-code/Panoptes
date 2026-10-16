@@ -1,9 +1,9 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "panoptes"
+name = "panoptes-observe"
 version = "0.1.0"
 description = "Adapter-based agent observability, local audit trails, and policy gates."
 readme = "README.md"
@@ -13,6 +13,7 @@ dependencies = [
     "PyYAML>=6,<7",
 ]
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Miggy", email = "miguel@throttlai.com"}
 ]
@@ -33,11 +34,17 @@ classifiers = [
 dev = [
     "pytest>=8,<9",
 ]
+release = [
+    "build>=1.2,<2",
+    "twine>=6,<7",
+]
 
 [project.urls]
 Homepage = "https://github.com/miggy-code/Panoptes"
 Repository = "https://github.com/miggy-code/Panoptes"
 Issues = "https://github.com/miggy-code/Panoptes/issues"
+Changelog = "https://github.com/miggy-code/Panoptes/blob/main/CHANGELOG.md"
+Security = "https://github.com/miggy-code/Panoptes/security/policy"
 
 [project.scripts]
 panoptes = "panoptes.cli:main"

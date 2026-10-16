@@ -17,8 +17,9 @@ instructions, policy decisions, and cost data into a queryable SQLite audit
 trail. Hermes integrations can also report lifecycle events and ask Panoptes
 for a synchronous pre-tool decision.
 
-It runs locally, needs no external service, and keeps its claims deliberately
-narrow: Panoptes records what an adapter observed. Calls emitted by a model remain requests unless the host reports an execution outcome
+Panoptes runs locally with no external service. It records model API traffic
+and host-reported lifecycle events; tool calls emitted by a model remain
+requests unless the host reports an execution outcome.
 
 ## Why
 
@@ -38,12 +39,25 @@ operational weight of a distributed observability stack.
 
 ## Quick Start
 
-Install from source:
+Install Panoptes as an isolated command-line application:
+
+```bash
+pipx install panoptes-observe
+```
+
+Or use `uv`:
+
+```bash
+uv tool install panoptes-observe
+```
+
+The distribution is named `panoptes-observe`; the installed command remains
+`panoptes`. To work on the source instead:
 
 ```bash
 git clone https://github.com/miggy-code/Panoptes.git
 cd Panoptes
-python -m pip install -e .
+python -m pip install -e ".[dev]"
 ```
 
 ### Capture model API traffic
@@ -252,6 +266,7 @@ they are supported.
 
 ```text
 panoptes proxy          Start the loopback-only model-API reverse proxy
+panoptes --version      Show the installed Panoptes version
 panoptes status         Show event statistics
 panoptes query          Query events by agent, type, tool, or time
 panoptes session <id>   Show up to 10,000 newest session events
@@ -275,9 +290,9 @@ panoptes policy test    Test one policy against one event
 | YAML policy engine | Alpha |
 | Mandatory local execution broker | Out of scope today |
 
-The project targets Python 3.10 through 3.13 and runs its test and wheel smoke
-suite in GitHub Actions. Passing tests do not expand the adapter guarantees
-described in [SECURITY.md](SECURITY.md).
+The project targets Python 3.10 through 3.13 and runs its tests, distribution
+validation, and wheel smoke test in GitHub Actions. Passing tests do not expand
+the adapter guarantees described in [SECURITY.md](SECURITY.md).
 
 Runtime dependencies are intentionally small: `httpx` and `PyYAML`.
 
@@ -288,12 +303,15 @@ Create an environment, install the development extra, and run the suite:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,release]"
 python -m pytest -q
+python -m build
+python -m twine check --strict dist/*
 ```
 
 The tests are local and network-independent. A change is ready to review when
-the full suite passes and `git diff --check` is clean.
+the full suite passes and `git diff --check` is clean. Release ownership and
+the tagged publishing flow are documented in [RELEASING.md](RELEASING.md).
 
 ## Contributing
 

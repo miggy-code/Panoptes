@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import sys
 
+from panoptes import __version__
 from panoptes.db import AuditDB
 from panoptes.policy import DEFAULT_POLICIES_DIR, PolicyEngine
 
@@ -357,6 +358,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="panoptes",
         description="Panoptes — adapter-based agent observability, local audit trails, and policy gates.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
