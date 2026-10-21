@@ -5,6 +5,12 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- `agentgate` as an accepted `agent.type` for schema version 4 events, so
+  agentgate gate decisions are recorded under their own agent type instead of
+  `unknown`.
+
 ## [0.1.0] - 2026-08-05
 
 ### Added

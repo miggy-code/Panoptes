@@ -810,6 +810,23 @@ def test_normalization_preserves_prior_supported_schema_version():
     assert normalized["context"]["schema_version"] == 3
 
 
+def test_agentgate_agent_type_is_current_schema_only():
+    event = {
+        "agent": {"type": "agentgate", "session_id": "s1", "run_id": "r1"},
+        "event_type": "decision_point",
+        "action": {"tool_name": "email.send"},
+        "outcome": {"status": "blocked"},
+        "context": {},
+    }
+
+    normalized = normalize_event(event)
+    validate_event(normalized)
+    assert normalized["agent"]["type"] == "agentgate"
+
+    legacy = dict(event, context={"schema_version": 3})
+    _assert_validation_error(lambda: validate_event(normalize_event(legacy)))
+
+
 def test_agent_step_derives_visibility_tags_and_requires_tool_identity():
     event = {
         "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},

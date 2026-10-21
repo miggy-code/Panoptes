@@ -18,7 +18,7 @@ SCHEMA_VERSION = 4
 # ── Allowed values ────────────────────────────────────────────────────────────
 ALLOWED_AGENT_TYPES = frozenset({
     "claude_code", "codex", "hermes", "antigravity", "cursor",
-    "gemini_cli", "unknown",
+    "gemini_cli", "agentgate", "unknown",
 })
 
 ALLOWED_EVENT_TYPES = frozenset({
