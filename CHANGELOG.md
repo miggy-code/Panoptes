@@ -5,6 +5,8 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-21
+
 ### Added
 
 - `agentgate` as an accepted `agent.type` for schema version 4 events, so
@@ -25,5 +27,6 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Hermes lifecycle hooks and an optional synchronous tool authorizer.
 - Python 3.10–3.13 CI, distribution validation, and installed-wheel smoke tests.
 
-[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/miggy-code/Panoptes/releases/tag/v0.1.0
