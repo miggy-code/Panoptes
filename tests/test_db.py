@@ -44,7 +44,7 @@ def test_redact_secrets():
     print("--- test_redact_secrets ---")
 
     # API key in parameters
-    params = {"headers": {"Authorization": "Bearer sk-ant-api03-abcdefghijklmnopqrstuvwxyz"}}
+    params = {"headers": {"Authorization": "Bearer sk-ant-api03-fakefakefakefakefakefake"}}
     cleaned = redact_secrets(params)
     assert "[REDACTED]" in str(cleaned), f"Bearer token not redacted: {cleaned}"
 
@@ -65,7 +65,7 @@ def test_redact_secrets():
     assert "AKIA" not in str(cleaned4), f"AWS key not redacted: {cleaned4}"
 
     # GitHub token
-    params5 = {"token": "ghp_1234567890abcdefghijklmnopqrstuvwxyz1234"}
+    params5 = {"token": "ghp_fakefakefakefakefakefakefakefakefake"}
     cleaned5 = redact_secrets(params5)
     assert "ghp_" not in str(cleaned5), f"GitHub token not redacted: {cleaned5}"
 

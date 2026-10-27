@@ -605,22 +605,22 @@ def test_normalize_redacts_every_persisted_content_field():
 
 def test_redacts_bare_keys_credential_urls_and_signed_queries():
     raw = {
-        "bare": "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
+        "bare": "sk-proj-fakefakefakefakefakefake012345",
         "database": "postgresql://admin:hunter2@db.internal/prod",
         "signed": "https://example.test/file?X-Amz-Signature=abcdef123456",
     }
 
     redacted = redact_secrets(raw)
     serialized = str(redacted)
-    assert "abcdefghijklmnopqrstuvwxyz012345" not in serialized
+    assert "fakefakefakefakefakefake012345" not in serialized
     assert "admin:hunter2" not in serialized
     assert "abcdef123456" not in serialized
     assert serialized.count("[REDACTED") >= 3
 
 
 def test_redacts_secret_bearing_mapping_keys_without_collisions():
-    first = "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
-    second = "sk-proj-zyxwvutsrqponmlkjihgfedcba543210"
+    first = "sk-proj-fakefakefakefakefakefake012345"
+    second = "sk-proj-fakefakefakefakefakefake543210"
     normalized = normalize_event({
         "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
         "event_type": "tool_call",
@@ -971,7 +971,7 @@ def test_capture_metadata_is_key_aware_but_preserves_safe_authorization_label():
     capture = HERMES_AUTHORIZER_CAPABILITIES.as_context(
         authorization_check="pre_execution",
         token=secret,
-        diagnostics={"api_key": "sk-proj-abcdefghijklmnopqrstuvwxyz012345"},
+        diagnostics={"api_key": "sk-proj-fakefakefakefakefakefake012345"},
     )
     normalized = normalize_event({
         "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
@@ -1016,7 +1016,7 @@ def test_capture_core_field_types_and_event_names_are_validated():
 
 
 def test_secret_shaped_structural_identifiers_are_rejected_before_redaction():
-    secret_id = "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
+    secret_id = "sk-proj-fakefakefakefakefakefake012345"
     base = {
         "event_id": "event-1",
         "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
