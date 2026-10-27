@@ -32,8 +32,9 @@ inference.
 - The local proxy only binds to an explicit loopback address. It is not an
   authenticated or internet-facing gateway.
 - Agent and session headers are assertions, not authenticated identities.
-  Security-sensitive deployments must place an authenticated adapter or
-  workload-identity gateway in front of Panoptes.
+  Security-sensitive deployments must use credential injection (below) or
+  place an authenticated adapter or workload-identity gateway in front of
+  Panoptes.
 - The proxy is bypassable unless provider credentials are isolated from the
   agent and direct provider egress is blocked.
 - An agent running as the same operating-system user can modify local policies,
@@ -51,6 +52,47 @@ inference.
 - Proxy-created HTTP clients ignore ambient `HTTP_PROXY`, `HTTPS_PROXY`, and
   `NO_PROXY` settings. Configure only the documented Panoptes upstreams; do not
   rely on shell proxy variables to establish a security boundary.
+
+## Credential injection
+
+`panoptes proxy --inject-credentials` makes Panoptes the only holder of
+provider API keys. It loads them at startup from `PANOPTES_ANTHROPIC_API_KEY`,
+`PANOPTES_OPENAI_API_KEY`, and `PANOPTES_GEMINI_API_KEY`, or from a
+`--credentials-file` that must be a regular file owned by the Panoptes user
+with mode 0600. Agents receive a random Panoptes session token from
+`panoptes token issue`. Only its SHA-256 hash is stored, in a `session_tokens`
+table in the audit database, with its agent type, session id, and expiry.
+
+On every request the proxy requires exactly one valid, unexpired, unrevoked
+token in the routed provider's credential slot. Otherwise it returns 401,
+records a blocked `model_request` event with `context.capture.identity_check`
+set to the reason, and forwards nothing. On success it strips every client
+credential (`Authorization`, `x-api-key`, `x-goog-api-key`, and `?key=`) and
+adds the key for that upstream only. Tokens and keys are not written to the
+audit log, logs, or responses; secret redaction is a backstop, not the
+mechanism.
+
+What this closes:
+
+- An agent that holds only a Panoptes token cannot call the provider directly,
+  so the proxy is no longer bypassable by reusing the agent's own key.
+- Agent type and session id come from the token Panoptes issued, not from
+  `X-Panoptes-*` headers. Those events carry
+  `identity_assurance: "panoptes_session_token"` and
+  `identity_source: "panoptes_token"`. `context.capture.authenticated` stays
+  `false`: the capture block is still an adapter record, not a signature.
+- Rejected requests ignore identity headers, so an unauthenticated caller
+  cannot write into another session's timeline.
+
+What it does not close, and you must still do:
+
+- Run Panoptes as a separate OS user or in a separate container. An agent
+  running as the same user can read the Panoptes environment, the credentials
+  file, and the token table, or stop the proxy.
+- Block direct egress from the agent to provider endpoints, so a key obtained
+  some other way cannot be used around the proxy.
+- Treat a token as a bearer credential: issue it per session with a short TTL
+  and revoke it with `panoptes token revoke` when the session ends.
 
 Hermes lifecycle hooks are observation-only and intentionally do not turn an
 audit write outage into an execution boundary. The separate pre-tool
@@ -94,7 +136,9 @@ accidental local resource exhaustion.
 ## Enforcement deployment checklist
 
 1. Run in fail-closed mode with a valid, non-empty, tested policy snapshot.
-2. Keep provider credentials out of the agent and block direct provider egress.
+2. Keep provider credentials out of the agent with `--inject-credentials`, run
+   Panoptes as a separate OS user or container, and block direct provider
+   egress.
 3. Use a native synchronous pre-tool hook or execution broker for local tools.
 4. Protect policy files from the agent identity and audit every policy change.
 5. Monitor proxy readiness, audit-write failures, disk capacity, and dropped

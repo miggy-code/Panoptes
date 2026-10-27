@@ -5,6 +5,20 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- Credential injection for the reverse proxy. With `--inject-credentials`,
+  provider API keys load from `PANOPTES_<PROVIDER>_API_KEY` or an owner-only
+  `--credentials-file` and never reach the agent. Agents present a Panoptes
+  session token, which the proxy swaps for the routed provider's key. Missing,
+  unknown, expired, revoked, or ambiguous tokens get HTTP 401 and a blocked
+  audit event, and are never forwarded.
+- `panoptes token issue`, `revoke`, and `list`. Only a SHA-256 hash of each
+  token is stored, in a `session_tokens` table in the audit database.
+- Token-authenticated identity: in credential mode the token's agent type and
+  session id replace the `X-Panoptes-*` headers, and events record
+  `identity_assurance: "panoptes_session_token"`.
+
 ## [0.1.1] - 2026-10-21
 
 ### Added

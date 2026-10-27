@@ -95,6 +95,38 @@ The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
 and the server accepts at most 64 concurrent requests by default; tune these
 with `--client-timeout` and `--max-concurrent-requests`.
 
+### Keep provider keys out of the agent
+
+With `--inject-credentials`, the provider API keys live only in Panoptes. The
+agent gets a Panoptes session token instead, and Panoptes swaps it for the real
+key on every request. An agent without the real key cannot skip the proxy and
+call the provider directly.
+
+```bash
+# Panoptes holds the keys (or pass --credentials-file, a 0600 YAML file
+# mapping anthropic/openai/gemini to keys).
+PANOPTES_ANTHROPIC_API_KEY=sk-ant-... panoptes proxy --port 8081 --inject-credentials
+
+# Issue a token for one agent session. Only the token is printed to stdout.
+TOKEN=$(panoptes token issue --agent claude_code --session my-run --ttl 28800)
+
+ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=$TOKEN claude
+```
+
+The agent sends the token where its SDK already sends a key: `x-api-key` or
+`Authorization: Bearer` for Anthropic, `Authorization: Bearer` for OpenAI, and
+`x-goog-api-key` or `?key=` for Gemini. A missing, unknown, expired, revoked,
+or ambiguous token gets HTTP 401 and a blocked audit event, and nothing reaches
+the provider. Panoptes stores only a SHA-256 hash of each token, and never
+writes a token or a provider key to the audit log or its own logs.
+
+The token also fixes the event identity: its agent type and session id replace
+the `X-Panoptes-Agent` and `X-Panoptes-Session` headers, and those events carry
+`context.capture.identity_assurance: "panoptes_session_token"`. Revoke a token
+with `panoptes token revoke <id>`; `panoptes token list` shows ids and status.
+Run Panoptes as a separate OS user or container and block direct provider
+egress, or the agent can still read the keys. See [SECURITY.md](SECURITY.md).
+
 ### Install Hermes lifecycle hooks
 
 ```bash
@@ -159,6 +191,8 @@ For reliable cross-request timelines, adapters should send
 `X-Panoptes-Session: <stable-session-id>`. Without it, each exchange is
 isolated. `X-Panoptes-Agent` and session headers are client assertions, not
 authenticated workload identities, and are removed before upstream forwarding.
+In credential-injection mode the session token supplies both values instead,
+and the headers are ignored.
 
 ### Audit schema
 
@@ -277,6 +311,9 @@ panoptes policy list    List the active policy snapshot
 panoptes policy add     Add a policy file
 panoptes policy check   Scan a bounded newest-event selection; errors exit nonzero
 panoptes policy test    Test one policy against one event
+panoptes token issue    Issue a session token for credential injection
+panoptes token revoke   Revoke a session token by id
+panoptes token list     List session tokens and their status (never values)
 ```
 
 ## Project Status

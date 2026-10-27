@@ -27,9 +27,10 @@ Audit plane         ←  adapter → normalized event → SQLite → CLI
 | `panoptes/schema.py` | Event validation, normalization, classification, and secret redaction |
 | `panoptes/db.py` | SQLite storage, query API, evidence paths, and local hash-chain integrity |
 | `panoptes/proxy.py` | Reverse proxy capture and policy gates at the model API boundary |
+| `panoptes/credentials.py` | Provider key loading and Panoptes session tokens for credential injection |
 | `panoptes/providers/` | Strict provider request, response, and streaming parsers |
 | `panoptes/policy.py` | Validated YAML policy sets and nine condition operators |
-| `panoptes/cli.py` | Proxy, query, integrity, and policy commands |
+| `panoptes/cli.py` | Proxy, query, integrity, token, and policy commands |
 | `panoptes/hermes_plugin.py` | Hermes lifecycle hooks and optional host-callable authorizer |
 | `panoptes/install_hermes_plugin.py` | One-command Hermes plugin installer |
 | `panoptes/default_policies/` | Bundled example policies |
