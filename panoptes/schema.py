@@ -67,6 +67,7 @@ MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
 MAX_EVENT_TEXT_CHARS = 8 * 1024 * 1024
 MAX_JSON_INTEGER_BITS = 4096
+MAX_COST_INTEGER = 2**53
 _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # ── Secret redaction ───────────────────────────────────────────────────────────
@@ -101,6 +102,8 @@ _CONTENT_PATTERNS: List[Tuple[re.Pattern, str]] = [
     # OpenAI-style keys are commonly logged as bare values rather than key=value.
     (re.compile(r'\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}\b'),
      '[REDACTED API KEY]'),
+    # Panoptes session tokens are live bearer credentials for injected keys.
+    (re.compile(r'\bpnpt_[A-Za-z0-9_\-]{20,}'), '[REDACTED PANOPTES TOKEN]'),
     # Credentials embedded in database and other authority-bearing URLs.
     (re.compile(
         r'(?P<scheme>[a-z][a-z0-9+\-.]*://)'
@@ -473,6 +476,18 @@ def _validate_capture_metadata(
             )
 
 
+def _reject_unencodable(text: str, path: str) -> None:
+    """Reject strings UTF-8 cannot encode, such as lone UTF-16 surrogates.
+
+    JSON's ``\\ud800`` escapes decode to such strings; storage and hashing
+    encode UTF-8, so accepting one would lose the event after validation.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValidationError(f"{path} contains text that is not valid Unicode") from exc
+
+
 def _validate_json_value(
     value: Any,
     path: str,
@@ -493,6 +508,7 @@ def _validate_json_value(
             f"{path} exceeds the maximum JSON depth of {MAX_JSON_DEPTH}"
         )
     if isinstance(value, str):
+        _reject_unencodable(value, path)
         budget["text_chars"] += len(value)
         if budget["text_chars"] > MAX_EVENT_TEXT_CHARS:
             raise ValidationError(
@@ -524,6 +540,7 @@ def _validate_json_value(
             for key, item in value.items():
                 if not isinstance(key, str):
                     raise ValidationError(f"{path} contains a non-string key")
+                _reject_unencodable(key, f"{path} key")
                 budget["text_chars"] += len(key)
                 if budget["text_chars"] > MAX_EVENT_TEXT_CHARS:
                     raise ValidationError(
@@ -614,6 +631,7 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
         if isinstance(timestamp, datetime):
             if timestamp.tzinfo is None:
                 raise ValidationError("timestamp datetime must include a timezone")
+            parsed = timestamp
         elif not isinstance(timestamp, str) or not timestamp.strip():
             raise ValidationError("timestamp must be a non-empty ISO8601 string")
         else:
@@ -623,6 +641,12 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
                 raise ValidationError("timestamp must be valid ISO8601") from exc
             if parsed.tzinfo is None:
                 raise ValidationError("timestamp must include a timezone")
+        # Normalization stores UTC; an offset that pushes the instant outside
+        # datetime's range must be a validation error, not a later crash.
+        try:
+            parsed.astimezone(timezone.utc)
+        except OverflowError as exc:
+            raise ValidationError("timestamp is outside the representable range") from exc
 
     # event_type
     allowed_event_types = _EVENT_TYPES_BY_SCHEMA_VERSION[schema_version]
@@ -722,9 +746,13 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
             # policy input into a fail-open parser error.
             if isinstance(value, float) and not math.isfinite(value):
                 invalid = True
+            # SQLite sums INTEGER columns in 64 bits and raises on overflow.
+            if isinstance(value, int) and value > MAX_COST_INTEGER:
+                invalid = True
             if invalid:
                 raise ValidationError(
-                    f"cost.{field} must be a finite non-negative number"
+                    f"cost.{field} must be a finite non-negative number "
+                    f"no larger than {MAX_COST_INTEGER}"
                 )
 
     # Tool events require an explicit, usable tool identity.

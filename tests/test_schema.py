@@ -9,16 +9,20 @@ Covers:
   - extract_index_fields: explicit call_id extraction
 """
 
+import json
 import os
 import sys
+import tempfile
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from panoptes.capture import HERMES_AUTHORIZER_CAPABILITIES
+from panoptes.db import AuditDB
 from panoptes.schema import (
     DATA_ACCESS_CLASSIFIERS,
+    MAX_COST_INTEGER,
     ValidationError,
     _derive_data_accessed,
     _is_sensitive_key,
@@ -780,7 +784,7 @@ def test_validation_rejects_pathological_integer_size():
         raise AssertionError("pathologically large JSON integers must be rejected")
 
 
-def test_cost_validation_does_not_float_convert_large_valid_json_integer():
+def test_cost_validation_rejects_large_integer_without_float_conversion():
     event = {
         "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
         "event_type": "model_request",
@@ -790,9 +794,61 @@ def test_cost_validation_does_not_float_convert_large_valid_json_integer():
         "cost": {"tokens_in": 1 << 4095, "tokens_out": 0},
     }
 
+    # A clean ValidationError, never an OverflowError from float conversion.
     normalized = normalize_event(event)
-    validate_event(normalized)
-    assert normalized["cost"]["tokens_in"] == 1 << 4095
+    with pytest.raises(ValidationError, match="cost.tokens_in"):
+        validate_event(normalized)
+
+
+def test_cost_integers_must_fit_sqlite_sums():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = AuditDB(os.path.join(tmpdir, "audit.db"))
+        try:
+            for tokens in (MAX_COST_INTEGER, MAX_COST_INTEGER + 1):
+                event = {
+                    "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                    "event_type": "model_request",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                    "cost": {"tokens_in": tokens, "tokens_out": 0},
+                }
+                if tokens > MAX_COST_INTEGER:
+                    with pytest.raises(ValidationError):
+                        db.insert_event(event)
+                else:
+                    db.insert_event(event)
+            assert db.aggregate(group_by=[], metrics=["tokens_in"]) == [
+                {"tokens_in": MAX_COST_INTEGER}
+            ]
+        finally:
+            db.close()
+
+
+def test_lone_surrogates_are_rejected_before_storage():
+    for event_text in ('{"cmd": "\\ud800"}', '{"\\udfff": "x"}'):
+        event = {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "tool_call",
+            "action": {"tool_name": "bash", "parameters": json.loads(event_text)},
+            "outcome": {"status": "pending"},
+            "context": {},
+        }
+        with pytest.raises(ValidationError, match="not valid Unicode"):
+            validate_event(normalize_event(event))
+
+
+def test_timestamp_offset_outside_utc_range_is_a_validation_error():
+    event = {
+        "timestamp": "0001-01-01T00:00:00+05:00",
+        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+        "event_type": "model_request",
+        "action": {},
+        "outcome": {"status": "success"},
+        "context": {},
+    }
+    with pytest.raises(ValidationError, match="representable range"):
+        validate_event(event)
 
 
 def test_normalization_preserves_prior_supported_schema_version():
