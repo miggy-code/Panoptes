@@ -16,6 +16,13 @@ Reverse-proxy mode (recommended — works with HTTPS):
         PANOPTES_UPSTREAM_OPENAI=https://api.openai.com
         PANOPTES_UPSTREAM_GEMINI=https://generativelanguage.googleapis.com
 
+Credential injection (``--inject-credentials``):
+    Provider API keys live only in the proxy process. Agents present a Panoptes
+    session token where their SDK sends an API key; the proxy resolves it to an
+    authenticated agent type and session, strips every client credential, and
+    adds the real key for the routed upstream. Missing, unknown, expired, or
+    revoked tokens get HTTP 401 and are never forwarded.
+
 Streaming policy behavior:
     When an enabled blocking policy is loaded, streaming responses are buffered
     until response-side policy checks complete. This protects the model-response
@@ -38,11 +45,16 @@ import threading
 import time
 import uuid
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote_plus, urlparse
 
 import httpx
 
-from panoptes.capture import PROXY_CAPABILITIES
+from panoptes.capture import PROXY_CAPABILITIES, PROXY_TOKEN_CAPABILITIES
+from panoptes.credentials import (
+    SessionIdentity,
+    SessionTokenStore,
+    TokenRejected,
+)
 from panoptes.db import AuditDB
 from panoptes.policy import PolicyEngine, PolicyResult
 from panoptes.schema import (
@@ -425,13 +437,18 @@ class AuditEventWriter:
             or self.policy_failure_mode == "fail_closed"
         )
 
-    def _capture_metadata(self, streaming: bool) -> dict:
+    def _capture_metadata(self, streaming: bool, token_identity: bool = False) -> dict:
         stream_delivery = None
         if streaming:
             stream_delivery = (
                 "buffered_for_enforcement"
                 if self.requires_stream_buffering
                 else "passthrough_audit_only"
+            )
+        if token_identity:
+            return PROXY_TOKEN_CAPABILITIES.as_context(
+                stream_delivery=stream_delivery,
+                identity_source="panoptes_token",
             )
         return PROXY_CAPABILITIES.as_context(stream_delivery=stream_delivery)
 
@@ -444,6 +461,7 @@ class AuditEventWriter:
         agent_type: str,
         turn_number: int,
         streaming: bool,
+        token_identity: bool = False,
     ) -> dict:
         return {
             "event_id": uuid.uuid4().hex,
@@ -454,7 +472,7 @@ class AuditEventWriter:
             "outcome": {},
             "context": {
                 "turn_number": turn_number,
-                "capture": self._capture_metadata(streaming),
+                "capture": self._capture_metadata(streaming, token_identity),
             },
             "cost": {},
         }
@@ -467,18 +485,24 @@ class AuditEventWriter:
         req_headers: dict[str, str],
         req_body: dict | None,
         run_id: str | None = None,
+        identity: SessionIdentity | None = None,
     ) -> tuple[list[dict], dict]:
         """Build request-side audit events (model_request + tool_result).
 
         Returns (events, exchange_ctx). Pass exchange_ctx to build_response_events
         to share run_id, session_id, agent_type, req_format, and turn_number.
+        A token-resolved ``identity`` replaces the client's identity headers.
         """
         if run_id is None:
             run_id = uuid.uuid4().hex
 
         provider = _providers.detect(path, req_body)
         req_format = provider.name
-        agent_type = detect_agent_type(path, req_headers, req_body)
+        agent_type = (
+            identity.agent_type
+            if identity is not None
+            else detect_agent_type(path, req_headers, req_body)
+        )
         req_info = provider.extract_request_info(req_body)
         requested_tools = (
             provider.extract_requested_tools(req_body)
@@ -511,10 +535,13 @@ class AuditEventWriter:
         # timelines and evidence chains; continuity requires the documented
         # x-panoptes-session header.
         session_id = (
-            _lower_keys(req_headers).get("x-panoptes-session")
+            identity.session_id
+            if identity is not None
+            else _lower_keys(req_headers).get("x-panoptes-session")
             or self._session_id
             or run_id
         )
+        token_identity = identity is not None
 
         exchange_ctx = {
             "run_id": run_id,
@@ -524,13 +551,14 @@ class AuditEventWriter:
             "req_format": req_format,
             "req_info": req_info,
             "turn_number": turn_number,
+            "token_identity": token_identity,
         }
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
                 event_type, run_id=run_id, session_id=session_id,
                 agent_type=agent_type, turn_number=turn_number,
-                streaming=req_info["stream"],
+                streaming=req_info["stream"], token_identity=token_identity,
             )
 
         events: list[dict] = []
@@ -632,6 +660,7 @@ class AuditEventWriter:
                 event_type, run_id=run_id, session_id=session_id,
                 agent_type=agent_type, turn_number=turn_number,
                 streaming=bool(req_info.get("stream", False)),
+                token_identity=bool(exchange_ctx.get("token_identity")),
             )
 
         events: list[dict] = []
@@ -1092,6 +1121,95 @@ PANOPTES_INTERNAL_HEADERS = frozenset({
     "x-panoptes-session",
 })
 
+# Credential injection: every client credential is stripped, and only the
+# routed provider's key is added. Clients present their Panoptes token in the
+# slot their provider SDK already uses for an API key.
+CLIENT_CREDENTIAL_HEADERS = frozenset({
+    "authorization",
+    "x-api-key",
+    "x-goog-api-key",
+})
+_CLIENT_TOKEN_SLOTS: dict[str, tuple[str, ...]] = {
+    "anthropic": ("x-api-key", "authorization"),
+    "openai": ("authorization",),
+    "gemini": ("x-goog-api-key", "query:key"),
+}
+_PROVIDER_KEY_HEADERS: dict[str, tuple[str, str]] = {
+    "anthropic": ("x-api-key", "{key}"),
+    "openai": ("Authorization", "Bearer {key}"),
+    "gemini": ("x-goog-api-key", "{key}"),
+}
+
+
+def _strip_query_credentials(path: str) -> tuple[str, list[str]]:
+    """Remove every ``key`` query parameter, returning the path and its values.
+
+    Other parameters keep their original encoding and order.
+    """
+    base, sep, query = path.partition("?")
+    if not sep:
+        return path, []
+    query, hash_sep, fragment = query.partition("#")
+    kept: list[str] = []
+    values: list[str] = []
+    for part in query.split("&"):
+        name, _, value = part.partition("=")
+        if unquote_plus(name) == "key":
+            values.append(unquote_plus(value))
+        else:
+            kept.append(part)
+    stripped = base + ("?" + "&".join(kept) if kept else "")
+    return stripped + (hash_sep + fragment if hash_sep else ""), values
+
+
+def _with_upstream_credential(
+    fwd_headers: dict[str, str],
+    upstream_credential: tuple[str, str] | None,
+) -> dict[str, str]:
+    """Replace every client credential with the provider key, if injecting.
+
+    Applied after hop-by-hop filtering so a client ``Connection`` header cannot
+    nominate the injected credential for removal.
+    """
+    if upstream_credential is None:
+        return fwd_headers
+    swapped = {
+        key: value
+        for key, value in fwd_headers.items()
+        if key.lower() not in CLIENT_CREDENTIAL_HEADERS
+    }
+    swapped[upstream_credential[0]] = upstream_credential[1]
+    return swapped
+
+
+def _presented_token(
+    provider: str,
+    headers: Any,
+    query_values: list[str],
+) -> str | None:
+    """Return the one credential the client presented for ``provider``.
+
+    Several differing credentials are ambiguous and rejected rather than
+    letting one slot win silently.
+    """
+    presented: list[str] = []
+    for slot in _CLIENT_TOKEN_SLOTS.get(provider, ()):
+        if slot == "query:key":
+            presented.extend(query_values)
+            continue
+        for value in _header_values(headers, slot):
+            value = value.strip()
+            if slot == "authorization":
+                scheme, _, credential = value.partition(" ")
+                value = (
+                    credential.strip() if scheme.lower() == "bearer" else value
+                )
+            presented.append(value)
+    distinct = {value for value in presented if value}
+    if len(distinct) > 1:
+        raise TokenRejected("ambiguous")
+    return next(iter(distinct), None)
+
 
 def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
     connection_nominated: set[str] = set()
@@ -1246,6 +1364,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
     max_buffered_response_bytes: int = DEFAULT_MAX_BUFFERED_RESPONSE_BYTES
     max_audit_stream_bytes: int = DEFAULT_MAX_AUDIT_STREAM_BYTES
+    # Credential-injection mode is on when provider_keys is not None.
+    provider_keys: dict[str, str] | None = None
+    token_store: SessionTokenStore | None = None
 
     def log_message(self, fmt: str, *args: Any) -> None:
         safe_args = list(args)
@@ -1393,11 +1514,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         path: str,
         headers: dict[str, str],
         body: bytes,
+        upstream_credential: tuple[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         """Buffered forward: return (status, headers, body_bytes)."""
         upstream_url = _upstream_url(scheme, host, port, path)
         safe_label = _safe_upstream_label(scheme, host, port, path)
-        fwd_headers = self._build_fwd_headers(headers)
+        fwd_headers = _with_upstream_credential(
+            self._build_fwd_headers(headers), upstream_credential
+        )
         client, owned = self._get_client()
         limit = getattr(
             self,
@@ -1491,6 +1615,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         path: str,
         headers: dict[str, str],
         body: bytes,
+        upstream_credential: tuple[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes, bool]:
         """Relay a stream while keeping a bounded audit capture.
 
@@ -1501,7 +1626,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """
         upstream_url = _upstream_url(scheme, host, port, path)
         safe_label = _safe_upstream_label(scheme, host, port, path)
-        fwd_headers = self._build_fwd_headers(headers)
+        fwd_headers = _with_upstream_credential(
+            self._build_fwd_headers(headers), upstream_credential
+        )
         accumulated = bytearray()
         audit_truncated = False
         audit_limit = getattr(
@@ -1587,6 +1714,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """Handle a proxied request: parse → pre-flight → forward → post-flight → respond."""
         t0 = time.monotonic()
 
+        # Credential mode: a query-string token must never reach routing,
+        # audit records, logs, or the upstream URL.
+        provider_keys = getattr(self, "provider_keys", None)
+        query_credentials: list[str] = []
+        if provider_keys is not None:
+            self.path, query_credentials = _strip_query_credentials(self.path)
+
         # 1. Parse target and read body
         try:
             scheme, host, port, path = self._parse_target()
@@ -1599,6 +1733,41 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log.exception("Failed to parse proxy request")
             self.send_error(400, "Bad Request")
             return
+
+        # 1b. Swap the client's Panoptes token for the provider key (fail closed)
+        identity: SessionIdentity | None = None
+        upstream_credential: tuple[str, str] | None = None
+        if provider_keys is not None:
+            provider = next(
+                p.name for p in _providers.REGISTRY if p.matches_path(path)
+            )
+            token_store = getattr(self, "token_store", None)
+            try:
+                if token_store is None:
+                    raise TokenRejected("unknown")
+                identity = token_store.resolve(
+                    _presented_token(provider, self.headers, query_credentials)
+                )
+            except TokenRejected as exc:
+                self._deny_before_upstream(
+                    method, path, req_headers, body,
+                    status=401,
+                    message="A valid Panoptes session token is required",
+                    reason=exc.reason,
+                )
+                return
+            provider_key = provider_keys.get(provider)
+            if provider_key is None:
+                self._deny_before_upstream(
+                    method, path, req_headers, body,
+                    status=503,
+                    message=f"No {provider} provider key is configured in Panoptes",
+                    reason="no_provider_key",
+                    identity=identity,
+                )
+                return
+            header_name, template = _PROVIDER_KEY_HEADERS[provider]
+            upstream_credential = (header_name, template.format(key=provider_key))
 
         # 2. Parse request body
         req_body: dict | None = None
@@ -1626,7 +1795,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 req_events, exchange_ctx = writer.build_request_events(
                     path=path, method=method, req_headers=req_headers,
-                    req_body=req_body,
+                    req_body=req_body, identity=identity,
                 )
             except (ValidationError, SSEParseError, ValueError) as exc:
                 log.warning("Rejected invalid proxy audit context: %s", exc)
@@ -1706,6 +1875,66 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             method=method, scheme=scheme, host=host, port=port, path=path,
             req_headers=req_headers, body=body, req_body=req_body,
             req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
+            upstream_credential=upstream_credential,
+        )
+
+    def _deny_before_upstream(
+        self,
+        method: str,
+        path: str,
+        req_headers: dict[str, str],
+        body: bytes,
+        *,
+        status: int,
+        message: str,
+        reason: str,
+        identity: SessionIdentity | None = None,
+    ) -> None:
+        """Record and refuse a request that failed credential checks.
+
+        Without a resolved token, identity headers are ignored so an
+        unauthenticated caller cannot write into another session's timeline.
+        """
+        writer = self.writer
+        audit_persisted = False
+        if writer:
+            headers = {
+                key: value
+                for key, value in req_headers.items()
+                if key.lower() not in PANOPTES_INTERNAL_HEADERS
+            }
+            try:
+                req_body = _strict_json_loads(body) if body else None
+            except (json.JSONDecodeError, ValueError):
+                req_body = None
+            if not isinstance(req_body, dict):
+                req_body = None
+            try:
+                try:
+                    events, _ = writer.build_request_events(
+                        path=path, method=method, req_headers=headers,
+                        req_body=req_body, identity=identity,
+                    )
+                except (ValidationError, SSEParseError, ValueError):
+                    events, _ = writer.build_request_events(
+                        path=path, method=method, req_headers=headers,
+                        req_body=None, identity=identity,
+                    )
+                events = [
+                    event for event in events
+                    if event.get("event_type") == "model_request"
+                ]
+                _mark_preflight_blocked(events)
+                for event in events:
+                    event["outcome"]["summary"] = f"{message} ({reason})"
+                    event["context"]["capture"]["identity_check"] = reason
+                writer.write(events)
+                audit_persisted = True
+            except Exception:
+                log.exception("Credential denial audit was not durable")
+        log.warning("Denied proxy request before upstream: %s (%s)", message, reason)
+        self._send_json_error(
+            status, message, {"reason": reason, "audit_persisted": audit_persisted}
         )
 
     def _handle_streaming(
@@ -1722,6 +1951,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         req_events: list[dict],
         exchange_ctx: dict,
         t0: float,
+        upstream_credential: tuple[str, str] | None = None,
     ) -> None:
         """Handle a streamed model response.
 
@@ -1739,12 +1969,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 method=method, scheme=scheme, host=host, port=port, path=path,
                 req_headers=req_headers, body=body, req_body=req_body,
                 req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
+                upstream_credential=upstream_credential,
             )
             return
 
         resp_status, resp_headers_raw, accumulated, audit_truncated = (
             self._forward_streaming(
-            method, scheme, host, port, path, req_headers, body
+            method, scheme, host, port, path, req_headers, body,
+            upstream_credential,
             )
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -1857,12 +2089,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         req_events: list[dict],
         exchange_ctx: dict,
         t0: float,
+        upstream_credential: tuple[str, str] | None = None,
     ) -> None:
         """Buffered path: forward, audit, optionally replace a blocked response."""
         writer = self.writer
         try:
             resp_status, resp_headers_raw, resp_body_bytes = self._forward_request(
-                method, scheme, host, port, path, req_headers, body
+                method, scheme, host, port, path, req_headers, body,
+                upstream_credential,
             )
         except UpstreamBodyTooLarge as exc:
             duration_ms = int((time.monotonic() - t0) * 1000)
@@ -2224,6 +2458,7 @@ class ProxyServer:
         max_tool_events_per_exchange: int = DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE,
         client_socket_timeout_seconds: float = DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS,
         max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+        provider_keys: dict[str, str] | None = None,
     ) -> None:
         if not _is_loopback_bind_host(host):
             raise ValueError(
@@ -2250,6 +2485,8 @@ class ProxyServer:
         self.max_tool_events_per_exchange = max_tool_events_per_exchange
         self.client_socket_timeout_seconds = client_socket_timeout_seconds
         self.max_concurrent_requests = max_concurrent_requests
+        self.provider_keys = dict(provider_keys) if provider_keys is not None else None
+        self.token_store: SessionTokenStore | None = None
         self._server: http.server.HTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._db: AuditDB | None = None
@@ -2283,12 +2520,16 @@ class ProxyServer:
                 policy_failure_mode=self.policy_failure_mode,
                 max_tool_events_per_exchange=self.max_tool_events_per_exchange,
             )
+            if self.provider_keys is not None:
+                self.token_store = SessionTokenStore(self._db)
 
             _writer = self.writer
             _http_client = self._http_client
             _max_request_body_bytes = self.max_request_body_bytes
             _max_buffered_response_bytes = self.max_buffered_response_bytes
             _max_audit_stream_bytes = self.max_audit_stream_bytes
+            _provider_keys = self.provider_keys
+            _token_store = self.token_store
 
             class _ConfiguredHandler(ProxyHandler):
                 writer = _writer
@@ -2296,6 +2537,8 @@ class ProxyServer:
                 max_request_body_bytes = _max_request_body_bytes
                 max_buffered_response_bytes = _max_buffered_response_bytes
                 max_audit_stream_bytes = _max_audit_stream_bytes
+                provider_keys = _provider_keys
+                token_store = _token_store
 
             self._server = _BoundedThreadingHTTPServer(
                 (self.host, self.port),
@@ -2316,6 +2559,11 @@ class ProxyServer:
             raise
 
         log.info("Panoptes proxy listening on %s:%d", self.host, self.port)
+        if self.provider_keys is not None:
+            log.info(
+                "Credential injection enabled for: %s",
+                ", ".join(sorted(self.provider_keys)),
+            )
         log.info("Reverse-proxy mode: ANTHROPIC_BASE_URL=http://%s:%d", self.host, self.port)
         log.info("Reverse-proxy mode: OPENAI_BASE_URL=http://%s:%d/v1", self.host, self.port)
         return self.port
@@ -2346,6 +2594,7 @@ class ProxyServer:
             self._db.close()
             self._db = None
         self.writer = None
+        self.token_store = None
         if self._tmp_db_path is not None:
             try:
                 os.unlink(self._tmp_db_path)
@@ -2378,6 +2627,7 @@ def start_proxy(
     max_tool_events_per_exchange: int = DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE,
     client_socket_timeout_seconds: float = DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS,
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+    provider_keys: dict[str, str] | None = None,
 ) -> None:
     """Start the audit proxy server (called from panoptes.cli)."""
     logging.basicConfig(
@@ -2400,6 +2650,7 @@ def start_proxy(
         max_tool_events_per_exchange=max_tool_events_per_exchange,
         client_socket_timeout_seconds=client_socket_timeout_seconds,
         max_concurrent_requests=max_concurrent_requests,
+        provider_keys=provider_keys,
     )
     actual_port = server.start()
 
@@ -2413,6 +2664,17 @@ def start_proxy(
     print(f"  export ANTHROPIC_BASE_URL=http://{host}:{actual_port}")
     print(f"  export OPENAI_BASE_URL=http://{host}:{actual_port}/v1")
     print()
+    if provider_keys is not None:
+        print(
+            "Credential injection: on for "
+            f"{', '.join(sorted(provider_keys))}. Give agents a Panoptes token, "
+            "not a provider key:"
+        )
+        print(
+            "  export ANTHROPIC_API_KEY=$(panoptes token issue "
+            "--agent claude_code --session <id>)"
+        )
+        print()
     print("Press Ctrl+C to stop")
 
     try:

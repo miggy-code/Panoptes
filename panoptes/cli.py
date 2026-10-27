@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import time
 
 from panoptes import __version__
 from panoptes.db import AuditDB
@@ -173,6 +174,67 @@ def cmd_checkpoint(args):
         )
         raise SystemExit(1)
     print(json.dumps(db.get_chain_checkpoint(), indent=2, sort_keys=True))
+
+
+# ── Token subcommands ─────────────────────────────────────────────────────────
+
+
+def _format_epoch(value) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value)) if value else "-"
+
+
+def cmd_token_issue(args):
+    """Issue a Panoptes session token. Only the token goes to stdout."""
+    from panoptes.credentials import SessionTokenStore
+    from panoptes.schema import ValidationError
+
+    store = SessionTokenStore(AuditDB(args.db_path))
+    try:
+        token, record = store.issue(args.agent, args.session, args.ttl)
+    except ValidationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    print(
+        f"Issued token {record['token_id']} for {record['agent_type']} "
+        f"session {record['session_id']}, expires "
+        f"{_format_epoch(record['expires_at'])}",
+        file=sys.stderr,
+    )
+    print(token)
+
+
+def cmd_token_revoke(args):
+    """Revoke a Panoptes session token by id."""
+    from panoptes.credentials import SessionTokenStore
+
+    store = SessionTokenStore(_open_existing_db(args.db_path))
+    if not store.revoke(args.token_id):
+        print(f"No live token with id: {args.token_id}", file=sys.stderr)
+        raise SystemExit(1)
+    print(f"Revoked token {args.token_id}")
+
+
+def cmd_token_list(args):
+    """List Panoptes session tokens without their values."""
+    from panoptes.credentials import SessionTokenStore
+
+    store = SessionTokenStore(_open_existing_db(args.db_path))
+    tokens = store.list_tokens()
+    if not tokens:
+        print("No tokens issued.")
+        return
+    now = time.time()
+    for t in tokens:
+        if t["revoked_at"] is not None:
+            state = "revoked"
+        elif now >= t["expires_at"]:
+            state = "expired"
+        else:
+            state = "live"
+        print(
+            f"{t['token_id']} | {t['agent_type']} | {t['session_id']} | "
+            f"expires {_format_epoch(t['expires_at'])} | {state}"
+        )
 
 
 # ── Policy subcommands ────────────────────────────────────────────────────────
@@ -401,6 +463,19 @@ def main(argv=None):
         default=64,
         help="Maximum simultaneous proxy requests (default: 64)",
     )
+    proxy_parser.add_argument(
+        "--inject-credentials",
+        action="store_true",
+        help=(
+            "Hold provider API keys in Panoptes and require a Panoptes session "
+            "token from agents (keys from PANOPTES_<PROVIDER>_API_KEY or "
+            "--credentials-file)"
+        ),
+    )
+    proxy_parser.add_argument(
+        "--credentials-file",
+        help="Owner-only (0600) YAML mapping of provider name to API key",
+    )
 
     # --- query ---
     query_parser = subparsers.add_parser(
@@ -447,6 +522,30 @@ def main(argv=None):
         parents=[db_opts],
     )
 
+    # --- token ---
+    token_parser = subparsers.add_parser(
+        "token", help="Panoptes session tokens for credential injection"
+    )
+    token_subs = token_parser.add_subparsers(dest="token_command")
+    token_issue = token_subs.add_parser(
+        "issue", help="Issue a session token (printed once)", parents=[db_opts]
+    )
+    token_issue.add_argument("--agent", required=True, help="Agent type, e.g. claude_code")
+    token_issue.add_argument("--session", required=True, help="Session ID")
+    token_issue.add_argument(
+        "--ttl",
+        type=int,
+        default=8 * 60 * 60,
+        help="Lifetime in seconds (default: 28800)",
+    )
+    token_revoke = token_subs.add_parser(
+        "revoke", help="Revoke a session token", parents=[db_opts]
+    )
+    token_revoke.add_argument("token_id", help="Token ID printed by 'token issue'")
+    token_subs.add_parser(
+        "list", help="List session tokens without their values", parents=[db_opts]
+    )
+
     # --- policy ---
     policy_parser = subparsers.add_parser("policy", help="Policy management commands")
     policy_subs = policy_parser.add_subparsers(dest="policy_command")
@@ -490,6 +589,18 @@ def main(argv=None):
     if args.command == "proxy":
         from panoptes.proxy import start_proxy
 
+        provider_keys = None
+        if args.credentials_file and not args.inject_credentials:
+            parser.error("--credentials-file requires --inject-credentials")
+        if args.inject_credentials:
+            from panoptes.credentials import CredentialConfigError, load_provider_keys
+
+            try:
+                provider_keys = load_provider_keys(args.credentials_file)
+            except CredentialConfigError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                raise SystemExit(2)
+
         start_proxy(
             port=args.port,
             host=args.host,
@@ -499,7 +610,19 @@ def main(argv=None):
             policy_failure_mode=args.policy_failure_mode,
             client_socket_timeout_seconds=args.client_timeout,
             max_concurrent_requests=args.max_concurrent_requests,
+            provider_keys=provider_keys,
         )
+    elif args.command == "token":
+        token_commands = {
+            "issue": cmd_token_issue,
+            "revoke": cmd_token_revoke,
+            "list": cmd_token_list,
+        }
+        handler = token_commands.get(args.token_command)
+        if handler:
+            handler(args)
+        else:
+            token_parser.print_help()
     elif args.command == "policy":
         policy_commands = {
             "check": cmd_policy_check,
