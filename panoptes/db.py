@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import stat
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schema import (
@@ -257,6 +258,22 @@ def _canonical_payload_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     """Build the canonical event payload from a stored SQLite row."""
     values = tuple(row[column] for column in _EVENT_PAYLOAD_COLUMNS)
     return _canonical_payload_from_values(values)
+
+
+def _rewritten_json_column(row: sqlite3.Row) -> Optional[str]:
+    """Name a stored JSON column that differs from what the writer wrote.
+
+    The hash covers parsed values, so a duplicate-key or other re-encoding can
+    keep it while SQLite's ``json_extract`` (which keeps the first duplicate,
+    where Python keeps the last) reads a different value in queries and
+    aggregates. Each JSON column must be byte-identical to its serialization.
+    """
+    for column in _EVENT_PAYLOAD_COLUMNS:
+        if column in _EVENT_JSON_COLUMNS:
+            raw = row[column]
+            if raw != _serialize(json.loads(raw)):
+                return column
+    return None
 
 
 def _event_hash(prev_hash: str, payload: Dict[str, Any]) -> str:
@@ -612,6 +629,13 @@ def _ensure_schema(db: "AuditDB") -> None:
         chain_meta = _read_chain_meta(conn)
         if chain_meta:
             _checkpoint_from_meta(chain_meta)
+        elif current >= 4:
+            # Every released Panoptes (schema v4) recorded its boundary in the
+            # transaction that created or migrated it. Re-anchoring now would
+            # demote the whole history to unverified legacy rows.
+            raise ChainIntegrityError(
+                "Hash-chain metadata is missing from a chained database"
+            )
         else:
             _initialize_chain(conn)
 
@@ -621,6 +645,26 @@ def _ensure_schema(db: "AuditDB") -> None:
                 (SCHEMA_VERSION,),
             )
         conn.commit()
+    finally:
+        db._put_conn(conn)
+
+
+def _check_read_only_schema(db: "AuditDB") -> None:
+    """Refuse a read-only open of a database that would need migrating."""
+    conn = db._get_conn()
+    try:
+        try:
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        except sqlite3.OperationalError as exc:
+            raise UnsupportedSchemaVersionError(
+                "Database has no Panoptes schema version; it is not initialized"
+            ) from exc
+        current = row[0] if row and row[0] is not None else 0
+        if current != SCHEMA_VERSION:
+            raise UnsupportedSchemaVersionError(
+                f"Database schema version {current} differs from supported "
+                f"version {SCHEMA_VERSION}; open it with a writer to migrate"
+            )
     finally:
         db._put_conn(conn)
 
@@ -638,13 +682,37 @@ class AuditDB:
         "raw_request", "raw_response",
     ]
 
-    def __init__(self, db_path: str = "~/.panoptes/audit.db"):
+    def __init__(
+        self, db_path: str = "~/.panoptes/audit.db", *, read_only: bool = False
+    ):
+        """Open (creating and migrating) an audit database.
+
+        ``read_only=True`` opens an existing, current-version database over
+        SQLite ``mode=ro`` connections: it never creates, migrates, re-anchors,
+        or changes file modes, so inspecting evidence cannot alter it.
+        """
         self._db_path = os.path.expanduser(db_path)
         self._is_memory = self._db_path == ":memory:"
-        self._connect_path = (
-            f"file:panoptes-{secrets.token_hex(16)}?mode=memory&cache=shared"
-            if self._is_memory else self._db_path
-        )
+        self._read_only = read_only
+        if read_only and self._is_memory:
+            raise ValueError("A read-only audit database needs a file path")
+        if read_only:
+            self._connect_path = f"{Path(self._db_path).resolve().as_uri()}?mode=ro"
+        else:
+            self._connect_path = (
+                f"file:panoptes-{secrets.token_hex(16)}?mode=memory&cache=shared"
+                if self._is_memory else self._db_path
+            )
+        if read_only:
+            self._all_conns: set = set()
+            self._conns_lock = threading.Lock()
+            self._keeper_conn: Optional[sqlite3.Connection] = None
+            try:
+                _check_read_only_schema(self)
+            except Exception:
+                self.close()
+                raise
+            return
         _prepare_database_path(self._db_path)
 
         # Connections are scoped to one database operation. ThreadingHTTPServer
@@ -698,13 +766,13 @@ class AuditDB:
             self._connect_path,
             timeout=5.0,
             check_same_thread=False,
-            uri=self._is_memory,
+            uri=self._is_memory or self._read_only,
         )
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
-            if not self._is_memory:
+            if not self._is_memory and not self._read_only:
                 _restrict_database_files(self._db_path)
         except Exception:
             conn.close()
@@ -945,7 +1013,7 @@ class AuditDB:
 
             if not meta:
                 result = {
-                    "valid": not (partial_count or chained_count),
+                    "valid": total == 0,
                     "initialized": False,
                     "format_version": _CHAIN_FORMAT_VERSION,
                     "algorithm": _CHAIN_ALGORITHM,
@@ -963,7 +1031,9 @@ class AuditDB:
                     "broken_event_id": None,
                     "error": (
                         "Hashed events exist without hash-chain metadata"
-                        if partial_count or chained_count else None
+                        if partial_count or chained_count
+                        else "Events exist but the hash chain is not initialized"
+                        if total else None
                     ),
                 }
                 conn.commit()
@@ -1049,6 +1119,13 @@ class AuditDB:
                 if row["event_hash"] != expected:
                     conn.commit()
                     return fail("Canonical event hash mismatch", event_id)
+                rewritten = _rewritten_json_column(row)
+                if rewritten is not None:
+                    conn.commit()
+                    return fail(
+                        f"Stored {rewritten} JSON was rewritten after hashing",
+                        event_id,
+                    )
                 if row["event_hash"] in visited:
                     conn.commit()
                     return fail("Hash-chain cycle detected", event_id)

@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 
 from panoptes import __version__
@@ -14,13 +15,14 @@ from panoptes.db import AuditDB
 from panoptes.policy import DEFAULT_POLICIES_DIR, PolicyEngine
 
 
-def _open_existing_db(db_path: str) -> AuditDB:
+def _open_existing_db(db_path: str, *, read_only: bool = True) -> AuditDB:
     """Open an initialized audit database without creating one by typo.
 
     ``AuditDB`` intentionally creates and migrates databases for write paths.
-    Read-only CLI commands first probe the path with SQLite's ``mode=ro`` and
-    require Panoptes' events table, so a missing or empty path is never silently
-    turned into a new audit trail.
+    CLI commands first probe the path with SQLite's ``mode=ro`` and require
+    Panoptes' events table, so a missing or empty path is never silently
+    turned into a new audit trail. Inspection commands then stay read-only, so
+    verifying evidence never migrates, re-anchors, or re-permissions it.
     """
     expanded = os.path.expanduser(db_path)
     if expanded == ":memory:" or not os.path.isfile(expanded):
@@ -51,7 +53,11 @@ def _open_existing_db(db_path: str) -> AuditDB:
             file=sys.stderr,
         )
         raise SystemExit(2)
-    return AuditDB(expanded)
+    try:
+        return AuditDB(expanded, read_only=read_only)
+    except (sqlite3.Error, RuntimeError) as exc:
+        print(f"Cannot open audit database {expanded}: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
 
 
 def cmd_query(args):
@@ -207,7 +213,7 @@ def cmd_token_revoke(args):
     """Revoke a Panoptes session token by id."""
     from panoptes.credentials import SessionTokenStore
 
-    store = SessionTokenStore(_open_existing_db(args.db_path))
+    store = SessionTokenStore(_open_existing_db(args.db_path, read_only=False))
     if not store.revoke(args.token_id):
         print(f"No live token with id: {args.token_id}", file=sys.stderr)
         raise SystemExit(1)
@@ -218,7 +224,7 @@ def cmd_token_list(args):
     """List Panoptes session tokens without their values."""
     from panoptes.credentials import SessionTokenStore
 
-    store = SessionTokenStore(_open_existing_db(args.db_path))
+    store = SessionTokenStore(_open_existing_db(args.db_path, read_only=False))
     tokens = store.list_tokens()
     if not tokens:
         print("No tokens issued.")
@@ -345,16 +351,44 @@ def cmd_policy_list(args):
 
 
 def cmd_policy_add(args):
-    """Copy a policy YAML file into the policies directory."""
+    """Copy a policy YAML file into the policies directory.
+
+    The engine publishes a snapshot only when every file in the directory is
+    valid, so one bad file would leave fail-open deployments with no policy at
+    all. The new file is checked together with the existing ones first.
+    """
     src = os.path.expanduser(args.source)
     if not os.path.isfile(src):
         print(f"Error: source file not found: {src}")
         sys.exit(1)
+    name = os.path.basename(src)
+    if not name.endswith((".yaml", ".yml")):
+        print(f"Error: policy files must end in .yaml or .yml: {name}")
+        sys.exit(1)
 
     dst_dir = os.path.expanduser(args.policies_dir)
-    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, name)
+    if os.path.exists(dst) and not args.force:
+        print(f"Error: {dst} already exists; pass --force to replace it")
+        sys.exit(1)
 
-    dst = os.path.join(dst_dir, os.path.basename(src))
+    with tempfile.TemporaryDirectory() as candidate_dir:
+        if os.path.isdir(dst_dir):
+            for existing in os.listdir(dst_dir):
+                if existing.endswith((".yaml", ".yml")) and existing != name:
+                    shutil.copy2(
+                        os.path.join(dst_dir, existing),
+                        os.path.join(candidate_dir, existing),
+                    )
+        shutil.copy2(src, os.path.join(candidate_dir, name))
+        candidate = PolicyEngine(candidate_dir)
+        if candidate.policy_snapshot_id is None or candidate.load_errors:
+            print(f"Error: {name} was not added; the policy set would not load:")
+            for error in candidate.load_errors:
+                print(f"  {error.replace(candidate_dir, dst_dir)}")
+            sys.exit(1)
+
+    os.makedirs(dst_dir, exist_ok=True)
     shutil.copy2(src, dst)
     print(f"Added policy: {os.path.basename(src)} -> {dst}")
     print("Reload the policy engine to apply changes.")
@@ -572,6 +606,10 @@ def main(argv=None):
         parents=[policy_opts],
     )
     policy_add.add_argument("source", help="Path to the policy YAML file to add")
+    policy_add.add_argument(
+        "--force", action="store_true",
+        help="Replace a policy file of the same name",
+    )
 
     # policy test
     policy_test = policy_subs.add_parser(

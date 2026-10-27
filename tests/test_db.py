@@ -2358,3 +2358,73 @@ if __name__ == "__main__":
     test_aggregate_buckets_and_filters()
     test_aggregate_validation()
     print("\n=== ALL DB TESTS PASSED ===")
+
+
+def test_verify_detects_duplicate_keys_that_keep_the_parsed_hash():
+    """Stored JSON must match its written bytes, not just its parsed value.
+
+    SQLite's json_extract keeps the first duplicate key and Python the last,
+    so a duplicate-key rewrite would otherwise verify while changing what
+    queries and aggregates read.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "audit.db")
+        db = AuditDB(db_path)
+        db.insert_event({
+            "event_id": "evt-dup",
+            "timestamp": "2026-07-17T12:00:00.000Z",
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "blocked"},
+            "context": {},
+        })
+        assert db.verify_chain()["valid"] is True
+        conn = db._get_conn()
+        try:
+            stored = conn.execute(
+                "SELECT outcome FROM events WHERE event_id = 'evt-dup'"
+            ).fetchone()[0]
+            forged = stored.replace(
+                '"status": "blocked"', '"status": "success", "status": "blocked"'
+            )
+            assert forged != stored
+            conn.execute(
+                "UPDATE events SET outcome = ? WHERE event_id = 'evt-dup'", (forged,)
+            )
+            conn.commit()
+        finally:
+            db._put_conn(conn)
+        result = db.verify_chain()
+        db.close()
+        assert result["valid"] is False
+        assert result["broken_event_id"] == "evt-dup"
+
+
+def test_read_only_audit_db_never_writes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "audit.db")
+        writer = AuditDB(db_path)
+        writer.close()
+        os.chmod(db_path, 0o644)
+
+        reader = AuditDB(db_path, read_only=True)
+        try:
+            assert reader.verify_chain()["valid"] is True
+            with pytest.raises(sqlite3.OperationalError):
+                reader.insert_event({
+                    "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                    "event_type": "model_request",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                })
+        finally:
+            reader.close()
+        assert stat.S_IMODE(os.stat(db_path).st_mode) == 0o644
+
+        # A read-only open never creates the file it was pointed at.
+        missing = os.path.join(tmpdir, "missing.db")
+        with pytest.raises(sqlite3.Error):
+            AuditDB(missing, read_only=True)
+        assert not os.path.exists(missing)

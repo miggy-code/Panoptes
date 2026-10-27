@@ -229,3 +229,80 @@ def test_policy_list_exits_nonzero_without_valid_snapshot(tmp_path, capsys):
     captured = capsys.readouterr()
     assert "No valid policy snapshot" in captured.out
     assert "Policy load error" in captured.err
+
+
+def _write_events(db_path, *event_ids):
+    db = AuditDB(str(db_path))
+    for event_id in event_ids:
+        db.insert_event(_event(event_id))
+    db.close()
+
+
+def test_verify_reads_a_read_only_copy_without_changing_it(tmp_path, capsys):
+    db_path = tmp_path / "audit.db"
+    _write_events(db_path, "event-1")
+    db_path.chmod(0o444)
+    before = db_path.read_bytes()
+
+    try:
+        main(["verify", "--db-path", str(db_path)])
+    finally:
+        db_path.chmod(0o600)
+
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+    assert db_path.read_bytes() == before
+
+
+def test_verify_never_re_anchors_a_stripped_chain(tmp_path, capsys):
+    import sqlite3
+
+    db_path = tmp_path / "audit.db"
+    _write_events(db_path, "event-1", "event-2")
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE events SET prev_hash = NULL, event_hash = NULL")
+    conn.execute("DELETE FROM chain_meta")
+    conn.execute(
+        "UPDATE events SET outcome = ? WHERE event_id = 'event-1'",
+        ('{"status": "blocked"}',),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(SystemExit) as exc:
+        main(["verify", "--db-path", str(db_path)])
+    assert exc.value.code == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["valid"] is False
+    assert "not initialized" in result["error"]
+
+    # A writer refuses to bless the stripped history with a fresh anchor.
+    from panoptes.db import ChainIntegrityError
+
+    with pytest.raises(ChainIntegrityError):
+        AuditDB(str(db_path))
+
+
+def test_policy_add_refuses_a_file_that_breaks_the_policy_set(tmp_path, capsys):
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    (policies / "block.yaml").write_text(
+        "name: block-bash\naction: block\nrule:\n  conditions:\n"
+        "    - field: action.tool_name\n      operator: ==\n      value: bash\n",
+        encoding="utf-8",
+    )
+    typo = tmp_path / "typo.yaml"
+    typo.write_text("name: typo\naction: block\nrul:\n  conditions: []\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as exc:
+        main(["policy", "add", str(typo), "--policies-dir", str(policies)])
+    assert exc.value.code == 1
+    assert "was not added" in capsys.readouterr().out
+    assert sorted(p.name for p in policies.iterdir()) == ["block.yaml"]
+
+    good = tmp_path / "block.yaml"
+    good.write_text((policies / "block.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(SystemExit) as exc:
+        main(["policy", "add", str(good), "--policies-dir", str(policies)])
+    assert exc.value.code == 1
+    assert "--force" in capsys.readouterr().out
+    main(["policy", "add", str(good), "--policies-dir", str(policies), "--force"])
