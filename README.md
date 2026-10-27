@@ -91,6 +91,9 @@ panoptes proxy \
   --policy-failure-mode fail_closed
 ```
 
+The installed Hermes plugin reads its failure mode from
+`PANOPTES_POLICY_FAILURE_MODE` (`fail_open` or `fail_closed`).
+
 The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
 and the server accepts at most 64 concurrent requests by default; tune these
 with `--client-timeout` and `--max-concurrent-requests`.

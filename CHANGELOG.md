@@ -18,6 +18,51 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Token-authenticated identity: in credential mode the token's agent type and
   session id replace the `X-Panoptes-*` headers, and events record
   `identity_assurance: "panoptes_session_token"`.
+- `PANOPTES_POLICY_FAILURE_MODE` sets the installed Hermes plugin's failure
+  mode. An unrecognized value selects `fail_closed`.
+- `panoptes policy add --force` replaces a policy file of the same name.
+- `AuditDB(path, read_only=True)` opens an existing database without creating,
+  migrating, re-anchoring, or changing file modes.
+
+### Changed
+
+- The proxy routes only exact model-API paths (query strings ignored):
+  `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`,
+  `/v1/completions`, `/v1/responses[/<id>]`, `/v1/models[/<id>]`, and
+  `/v1[beta|alpha]/models/<model>:(stream)generateContent`. Batches, files,
+  fine-tuning, Gemini's OpenAI-compatible routes, and every other path are
+  refused instead of forwarded with an injected key.
+- An event that fails normalization or validation is denied in both failure
+  modes while any enabled block policy is active, so a caller cannot shape its
+  input around a block. Without a block policy the failure mode still applies.
+- `verify`, `checkpoint`, `query`, `status`, `session`, `evidence`, and
+  `policy check` open the database read-only.
+- `verify` reports a database whose events have no hash-chain metadata as
+  invalid, and opening a schema v4 database whose chain metadata is missing
+  raises `ChainIntegrityError` instead of starting a new chain.
+- `verify` requires each stored JSON column to be byte-identical to what
+  Panoptes wrote, so duplicate keys or re-encodings are detected.
+- `panoptes policy add` validates the new file together with the existing set
+  before copying it, and refuses to overwrite without `--force`.
+- Recorded `tokens_in` includes Anthropic cache read and write tokens, and
+  Gemini `tokens_out` includes thinking tokens. Gemini events record the model
+  named in the route.
+- `cost` integers above 2^53 are rejected so SQLite sums cannot overflow.
+- Unauthenticated credential denials ignore the request body and User-Agent.
+
+### Fixed
+
+- The shared upstream client no longer stores cookies, which replayed one
+  session's upstream cookies on other sessions' requests.
+- A client's lowercase `accept-encoding` is replaced rather than forwarded
+  beside `identity`; upstream bodies in an encoding httpx cannot decode get 502.
+- Repeated request headers are combined instead of keeping only the last.
+- Lone UTF-16 surrogates and timestamps outside the UTC range are validation
+  errors instead of failures at storage or normalization time.
+- A FIFO in place of the credentials file fails fast instead of hanging.
+- Bare `pnpt_` session tokens are redacted from stored text.
+- The Hermes manifest reports the installed version, and uninstall removes only
+  the files the installer wrote.
 
 ## [0.1.1] - 2026-10-21
 
