@@ -1925,3 +1925,48 @@ if __name__ == "__main__":
     test_no_prod_access_policy()
     test_no_prod_access_with_derived_data_accessed()
     print("\n=== ALL POLICY TESTS PASSED ===")
+
+
+def test_invalid_input_is_denied_while_block_policies_are_active():
+    """A caller-shaped validation failure must not fail open past a block."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "block.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "name: block-terminal\n"
+                "action: block\n"
+                "rule:\n"
+                "  event_type: tool_call\n"
+                "  conditions:\n"
+                "    - field: action.tool_name\n"
+                "      operator: ==\n"
+                "      value: terminal\n"
+            )
+        engine = PolicyEngine(tmpdir, failure_mode="fail_open")
+        for bad in (
+            _make_event(action={"tool_name": "terminal", "parameters": ["ls"]}),
+            _make_event(timestamp="0001-01-01T00:00:00+05:00"),
+        ):
+            result = engine.evaluate(bad)
+            assert result.action == "block"
+            assert result.violated_policies[0]["policy_name"] == "invalid_event_input"
+
+
+def test_invalid_input_without_block_policies_keeps_fail_open():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, "warn.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "name: warn-terminal\n"
+                "action: warn\n"
+                "rule:\n"
+                "  event_type: tool_call\n"
+                "  conditions:\n"
+                "    - field: action.tool_name\n"
+                "      operator: ==\n"
+                "      value: terminal\n"
+            )
+        engine = PolicyEngine(tmpdir, failure_mode="fail_open")
+        result = engine.evaluate(
+            _make_event(action={"tool_name": "terminal", "parameters": ["ls"]})
+        )
+        assert result.action == "allow"
+        assert result.evaluation_errors

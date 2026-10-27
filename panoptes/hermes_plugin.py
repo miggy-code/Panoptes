@@ -41,6 +41,7 @@ from panoptes.schema import (
 
 DB_PATH = os.path.expanduser("~/.panoptes/audit.db")
 DEFAULT_MAX_ACTIVE_SESSIONS = 1024
+POLICY_FAILURE_MODE_ENV = "PANOPTES_POLICY_FAILURE_MODE"
 log = logging.getLogger("panoptes.hermes")
 
 
@@ -353,9 +354,13 @@ class AuditPlugin:
             validate_event(event)
         except Exception as exc:
             log.exception("Failed to normalize Hermes authorization event")
-            result = PolicyEngine.make_failure_result(
-                self.policy_failure_mode,
-                [f"Authorization event normalization failed: {exc}"],
+            errors = [f"Authorization event normalization failed: {exc}"]
+            result = (
+                self.policy_engine.input_failure_result(errors)
+                if self.policy_engine
+                else PolicyEngine.make_failure_result(
+                    self.policy_failure_mode, errors
+                )
             )
             fallback_session_id = _safe_identifier(
                 session_id, uuid.uuid4().hex
@@ -399,7 +404,7 @@ class AuditPlugin:
                 return AuthorizationDecision(
                     allowed=False,
                     action="block",
-                    message=result.warnings[0],
+                    message=_block_message(result),
                 )
             return AuthorizationDecision(
                 allowed=True,
@@ -623,11 +628,28 @@ class AuditPlugin:
 _plugin = None
 
 
+def _configured_failure_mode() -> str:
+    """Read the installed plugin's failure mode from the environment.
+
+    An unrecognized value means the operator asked for something other than
+    the default, so it resolves to the stricter mode rather than fail-open.
+    """
+    value = os.environ.get(POLICY_FAILURE_MODE_ENV)
+    if value is None or value == "":
+        return "fail_open"
+    if value in POLICY_FAILURE_MODES:
+        return value
+    log.error(
+        "Unrecognized %s=%r; using fail_closed", POLICY_FAILURE_MODE_ENV, value
+    )
+    return "fail_closed"
+
+
 def get_plugin() -> AuditPlugin:
     """Return the shared default AuditPlugin, creating it on first use."""
     global _plugin
     if _plugin is None:
-        _plugin = AuditPlugin()
+        _plugin = AuditPlugin(policy_failure_mode=_configured_failure_mode())
     return _plugin
 
 

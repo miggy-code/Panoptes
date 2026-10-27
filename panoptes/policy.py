@@ -909,6 +909,36 @@ class PolicyEngine:
         result.policy_snapshot_id = self.policy_snapshot_id
         return result
 
+    def input_failure_result(self, errors: List[str]) -> PolicyResult:
+        """Decide an event that could not be normalized or validated.
+
+        The event's shape is chosen by whoever produced it, so fail-open must
+        not turn a malformed input into a way around an active block policy:
+        while any enabled policy can block, invalid input is denied in both
+        modes. Without one, the configured failure posture applies.
+        """
+        if not self.has_blocking_policies:
+            return self._policy_failure_result(errors)
+        errors = [_sanitize_reason(str(error)) for error in errors]
+        message = "Event failed validation; denied while blocking policies are active"
+        violations = [
+            {
+                "policy_name": "invalid_event_input",
+                "message": message,
+                "reason": error,
+                "action": "block",
+            }
+            for error in errors
+        ]
+        return PolicyResult(
+            action="block",
+            violated_policies=violations,
+            warnings=[message],
+            evaluation_errors=errors,
+            matched_policies=list(violations),
+            policy_snapshot_id=self.policy_snapshot_id,
+        )
+
     # ── Evaluation ───────────────────────────────────────────────────────
 
     def evaluate(self, event: dict) -> PolicyResult:
@@ -931,6 +961,11 @@ class PolicyEngine:
         try:
             normalized = normalize_event(event)
             validate_event(normalized)
+        except Exception as exc:
+            error = _sanitize_reason(f"Event failed validation: {exc}")
+            log.warning(error)
+            return self.input_failure_result([error]), normalized
+        try:
             return self._evaluate_event(normalized), normalized
         except Exception as exc:
             error = _sanitize_reason(

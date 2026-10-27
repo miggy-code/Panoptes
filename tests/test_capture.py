@@ -1111,3 +1111,92 @@ def test_hermes_lifecycle_write_failures_are_observational_and_cleanup_state() -
 
         ctx.handlers["agent:end"]({"session_id": "s1"})
         assert plugin._sessions == {}
+
+
+_BLOCK_TERMINAL = """
+name: block-terminal
+enabled: true
+action: block
+message: Terminal blocked
+rule:
+  event_type: tool_call
+  conditions:
+    - field: action.tool_name
+      operator: ==
+      value: terminal
+"""
+
+
+def _deep(levels: int) -> dict:
+    value: dict = {}
+    for _ in range(levels):
+        value = {"a": value}
+    return value
+
+
+def test_hermes_malformed_input_cannot_escape_a_block_policy() -> None:
+    """Fail-open must not let the caller shape its input around a block."""
+    with tempfile.TemporaryDirectory() as directory:
+        policies_dir = os.path.join(directory, "policies")
+        os.mkdir(policies_dir)
+        Path(policies_dir, "block.yaml").write_text(_BLOCK_TERMINAL, encoding="utf-8")
+        plugin = AuditPlugin(
+            db_path=os.path.join(directory, "audit.db"),
+            policies_dir=policies_dir,
+        )
+        try:
+            for tool_input in (["ls"], _deep(70)):
+                decision = plugin.authorize_tool_call({
+                    "session_id": "session-1",
+                    "run_id": "run-1",
+                    "tool_name": "terminal",
+                    "tool_input": tool_input,
+                })
+                assert not decision.allowed
+                assert decision.action == "block"
+        finally:
+            plugin.db.close()
+
+
+def test_hermes_malformed_input_without_block_policies_follows_failure_mode() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        plugin = AuditPlugin(
+            db_path=os.path.join(directory, "audit.db"), policies_dir=None
+        )
+        try:
+            decision = plugin.authorize_tool_call({
+                "session_id": "session-1",
+                "run_id": "run-1",
+                "tool_name": "terminal",
+                "tool_input": ["ls"],
+            })
+            assert decision.allowed
+        finally:
+            plugin.db.close()
+
+
+def test_installed_hermes_plugin_reads_failure_mode_from_environment(
+    monkeypatch,
+) -> None:
+    import panoptes.hermes_plugin as hermes_plugin
+
+    monkeypatch.delenv(hermes_plugin.POLICY_FAILURE_MODE_ENV, raising=False)
+    assert hermes_plugin._configured_failure_mode() == "fail_open"
+    monkeypatch.setenv(hermes_plugin.POLICY_FAILURE_MODE_ENV, "fail_closed")
+    assert hermes_plugin._configured_failure_mode() == "fail_closed"
+    # A typo must not silently fall back to the permissive default.
+    monkeypatch.setenv(hermes_plugin.POLICY_FAILURE_MODE_ENV, "fail-closed")
+    assert hermes_plugin._configured_failure_mode() == "fail_closed"
+
+    with tempfile.TemporaryDirectory() as directory:
+        monkeypatch.setattr(
+            hermes_plugin, "DB_PATH", os.path.join(directory, "audit.db")
+        )
+        monkeypatch.setattr(hermes_plugin, "_plugin", None)
+        plugin = hermes_plugin.get_plugin()
+        try:
+            assert plugin.policy_failure_mode == "fail_closed"
+            assert plugin.policy_engine.failure_mode == "fail_closed"
+        finally:
+            plugin.db.close()
+            monkeypatch.setattr(hermes_plugin, "_plugin", None)
