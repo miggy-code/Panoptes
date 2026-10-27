@@ -51,3 +51,30 @@ def test_installer_rejects_symlink_plugin_file(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="symlink"):
         installer.install()
     assert target.read_text(encoding="utf-8") == "do not replace"
+
+
+def test_manifest_reports_the_installed_version(tmp_path, monkeypatch):
+    import json
+
+    from panoptes import __version__
+
+    plugin_dir = tmp_path / "panoptes"
+    monkeypatch.setattr(installer, "get_plugin_dir", lambda: plugin_dir)
+    assert installer.install()
+    manifest = json.loads((plugin_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["version"] == __version__
+
+
+def test_uninstall_removes_only_installed_files(tmp_path, monkeypatch):
+    plugin_dir = tmp_path / "panoptes"
+    monkeypatch.setattr(installer, "get_plugin_dir", lambda: plugin_dir)
+    assert installer.install()
+    (plugin_dir / "notes.txt").write_text("mine", encoding="utf-8")
+
+    assert installer.uninstall()
+    assert sorted(p.name for p in plugin_dir.iterdir()) == ["notes.txt"]
+
+    (plugin_dir / "notes.txt").unlink()
+    assert installer.install()
+    assert installer.uninstall()
+    assert not plugin_dir.exists()
