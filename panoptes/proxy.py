@@ -35,6 +35,7 @@ Usage:
 
 from __future__ import annotations
 
+import http.cookiejar
 import http.server
 import ipaddress
 import json
@@ -503,7 +504,7 @@ class AuditEventWriter:
             if identity is not None
             else detect_agent_type(path, req_headers, req_body)
         )
-        req_info = provider.extract_request_info(req_body)
+        req_info = provider.extract_request_info(req_body, path=path)
         requested_tools = (
             provider.extract_requested_tools(req_body)
             if isinstance(req_body, dict)
@@ -650,7 +651,7 @@ class AuditEventWriter:
             )
         req_info = exchange_ctx.get("req_info")
         if req_info is None:
-            req_info = provider.extract_request_info(req_body)
+            req_info = provider.extract_request_info(req_body, path=path)
             # Streaming can be signalled by the path (Gemini), not just the body;
             # always re-derive it here to match the logic in build_request_events.
             req_info["stream"] = provider.is_streaming(path, req_body)
@@ -1211,6 +1212,43 @@ def _presented_token(
     return next(iter(distinct), None)
 
 
+def _merged_headers(items: Any) -> dict[str, str]:
+    """Combine repeated request headers instead of keeping only the last.
+
+    RFC 9110 lets a recipient join repeated fields with commas (Cookie uses
+    "; "), so e.g. two ``anthropic-beta`` lines both reach the upstream.
+    """
+    merged: dict[str, str] = {}
+    names: dict[str, str] = {}
+    for key, value in items:
+        lowered = key.lower()
+        if lowered not in names:
+            names[lowered] = key
+            merged[key] = value
+            continue
+        first = names[lowered]
+        separator = "; " if lowered == "cookie" else ", "
+        merged[first] = f"{merged[first]}{separator}{value}"
+    return merged
+
+
+def _upstream_client(timeout: float) -> httpx.Client:
+    """An upstream client whose cookie jar never stores anything.
+
+    One client serves every session and token, so a stored ``Set-Cookie``
+    would be replayed on other agents' requests and link or leak sessions.
+    """
+    no_cookies = http.cookiejar.CookieJar(
+        policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
+    )
+    return httpx.Client(
+        timeout=timeout,
+        follow_redirects=False,
+        trust_env=False,
+        cookies=no_cookies,
+    )
+
+
 def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
     connection_nominated: set[str] = set()
     for key, value in headers.items():
@@ -1223,6 +1261,22 @@ def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
         )
     blocked = HOP_BY_HOP | connection_nominated
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
+
+
+# Codings httpx always decodes; br and zstd depend on optional packages and
+# would otherwise pass through as raw bytes under a stripped header.
+_DECODABLE_CONTENT_CODINGS = frozenset({"identity", "gzip", "deflate"})
+
+
+def _check_content_encoding(headers: Any) -> None:
+    """Refuse an upstream body Panoptes cannot decode, inspect, or relay."""
+    for value in _header_values(headers, "Content-Encoding"):
+        for coding in value.split(","):
+            coding = coding.strip().lower()
+            if coding and coding not in _DECODABLE_CONTENT_CODINGS:
+                raise ResponseInspectionError(
+                    f"Unsupported upstream Content-Encoding {coding!r}"
+                )
 
 
 def _decoded_body_headers(
@@ -1487,8 +1541,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         fwd = {
             key: value
             for key, value in _filter_headers(dict(headers)).items()
-            if key.lower() not in PANOPTES_INTERNAL_HEADERS and key.lower() != "host"
+            if key.lower() not in PANOPTES_INTERNAL_HEADERS
+            and key.lower() not in ("host", "accept-encoding")
         }
+        # Replaced case-insensitively: a client's lowercase accept-encoding
+        # would otherwise go upstream beside this one and invite br/zstd
+        # bodies that reach the client undecoded and the audit unparsed.
         fwd["Accept-Encoding"] = "identity"
         return fwd
 
@@ -1496,14 +1554,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """Return (client, owned). If owned=True, caller must close it."""
         if self.http_client is not None:
             return self.http_client, False
-        return (
-            httpx.Client(
-                timeout=self.upstream_timeout,
-                follow_redirects=False,
-                trust_env=False,
-            ),
-            True,
-        )
+        return _upstream_client(self.upstream_timeout), True
 
     def _forward_request(
         self,
@@ -1533,6 +1584,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 method, upstream_url, headers=fwd_headers, content=body
             ) as resp:
                 response_headers = dict(resp.headers)
+                _check_content_encoding(resp.headers)
                 content_lengths = _header_values(resp.headers, "Content-Length")
                 transfer_encodings = _header_values(
                     resp.headers, "Transfer-Encoding"
@@ -1639,6 +1691,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         try:
             with client.stream(method, upstream_url, headers=fwd_headers, content=body) as resp:
+                _check_content_encoding(resp.headers)
                 # Send status and headers to client (strip Content-Length — unknown)
                 resp_headers = _decoded_body_headers(
                     dict(resp.headers), streaming=True
@@ -1724,7 +1777,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # 1. Parse target and read body
         try:
             scheme, host, port, path = self._parse_target()
-            req_headers = dict(self.headers.items())
+            req_headers = _merged_headers(self.headers.items())
             body = self._read_body()
         except ProxyRequestError as exc:
             self._send_json_error(exc.status_code, str(exc))
@@ -1892,21 +1945,30 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     ) -> None:
         """Record and refuse a request that failed credential checks.
 
-        Without a resolved token, identity headers are ignored so an
-        unauthenticated caller cannot write into another session's timeline.
+        Without a resolved token, identity headers (User-Agent included) and
+        the request body are ignored, so an unauthenticated caller can neither
+        write into another session's timeline, claim an agent type, nor store
+        its own text in the hash-chained log.
         """
         writer = self.writer
         audit_persisted = False
         if writer:
+            ignored = (
+                PANOPTES_INTERNAL_HEADERS
+                if identity is not None
+                else PANOPTES_INTERNAL_HEADERS | {"user-agent"}
+            )
             headers = {
                 key: value
                 for key, value in req_headers.items()
-                if key.lower() not in PANOPTES_INTERNAL_HEADERS
+                if key.lower() not in ignored
             }
-            try:
-                req_body = _strict_json_loads(body) if body else None
-            except (json.JSONDecodeError, ValueError):
-                req_body = None
+            req_body = None
+            if identity is not None and body:
+                try:
+                    req_body = _strict_json_loads(body)
+                except (json.JSONDecodeError, ValueError):
+                    req_body = None
             if not isinstance(req_body, dict):
                 req_body = None
             try:
@@ -2509,11 +2571,7 @@ class ProxyServer:
 
         try:
             self._db = AuditDB(actual_db_path)
-            self._http_client = httpx.Client(
-                timeout=120.0,
-                follow_redirects=False,
-                trust_env=False,
-            )
+            self._http_client = _upstream_client(120.0)
             self.writer = AuditEventWriter(
                 self._db,
                 policies_dir=self.policies_dir,

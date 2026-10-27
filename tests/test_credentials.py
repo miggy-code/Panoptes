@@ -491,3 +491,63 @@ def test_token_cli_issue_list_and_revoke(tmp_path, capsys):
 def test_proxy_cli_requires_flag_for_credentials_file(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["proxy", "--credentials-file", str(tmp_path / "keys.yaml")])
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("POST", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1/results"),
+        ("GET", "/v1/files?x=/models"),
+        ("POST", "/v1/fine_tuning/jobs?route=/chat/completions"),
+        ("POST", "/v1beta/openai/chat/completions"),
+        ("GET", "/v1beta/cachedContents"),
+    ],
+)
+def test_only_inspectable_model_routes_receive_an_injected_key(
+    injecting_proxy, upstream, method, path
+):
+    """Routes are matched exactly on the path, never by substring or query.
+
+    Other provider endpoints would get the real key and return responses
+    the parsers cannot inspect, which then read as "no tool calls".
+    """
+    server, client = injecting_proxy
+    token, _ = server.token_store.issue("claude_code", "sess-route")
+    response = client.request(
+        method, path, headers={"x-api-key": token, "Authorization": f"Bearer {token}"},
+        json={} if method == "POST" else None,
+    )
+    assert response.status_code == 502
+    assert "No supported provider route" in response.json()["error"]
+    assert upstream == []
+
+
+def test_unauthenticated_denial_records_no_client_identity_or_content(
+    injecting_proxy, upstream
+):
+    server, client = injecting_proxy
+    response = client.post(
+        "/v1/messages",
+        json={**ANTHROPIC_BODY, "messages": [{"role": "user", "content": "attacker text"}]},
+        headers={"x-api-key": "pnpt_not-a-token-panoptes-issued", "User-Agent": "claude-code/2.0"},
+    )
+    assert response.status_code == 401
+    [event] = server.events
+    assert event["agent"]["type"] == "unknown"
+    assert "attacker text" not in json.dumps(event)
+
+
+def test_credentials_file_that_is_a_fifo_fails_fast(tmp_path):
+    path = tmp_path / "keys.yaml"
+    os.mkfifo(path)
+    with pytest.raises(CredentialConfigError, match="regular file"):
+        load_provider_keys(str(path))
+
+
+def test_bare_session_tokens_are_redacted(injecting_proxy):
+    from panoptes.schema import redact_secrets
+
+    server, _ = injecting_proxy
+    token, _ = server.token_store.issue("claude_code", "sess-redact")
+    assert token not in redact_secrets(f"echo {token}")

@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .base import (
     Provider,
     SSEParseError,
     _parse_sse_events,
+    _route_matches,
     _strict_json_loads,
+    _usage_count,
 )
+
+_ROUTES = (
+    re.compile(r"/v1/messages"),
+    re.compile(r"/v1/messages/count_tokens"),
+)
+
+_INPUT_USAGE_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+)
+_USAGE_FIELDS = _INPUT_USAGE_FIELDS + ("output_tokens",)
+
 
 _SERVER_RESULT_TYPES = frozenset({
     "web_search_tool_result",
@@ -46,7 +62,7 @@ class AnthropicProvider(Provider):
     name = "anthropic"
 
     def matches_path(self, path: str) -> bool:
-        return "/v1/messages" in path
+        return _route_matches(path, _ROUTES)
 
     def matches_body(self, body: dict | None) -> bool:
         if not isinstance(body, dict):
@@ -257,9 +273,13 @@ class AnthropicProvider(Provider):
 
     def extract_usage(self, resp_body: dict) -> dict:
         usage = resp_body.get("usage", {})
+        # input_tokens excludes cached context; count every input token the
+        # model processed, or cache-heavy agents record a tiny fraction.
         return {
-            "tokens_in": usage.get("input_tokens", 0),
-            "tokens_out": usage.get("output_tokens", 0),
+            "tokens_in": sum(
+                _usage_count(usage, field) for field in _INPUT_USAGE_FIELDS
+            ),
+            "tokens_out": _usage_count(usage, "output_tokens"),
         }
 
     def reassemble_sse(
@@ -302,8 +322,9 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
             usage = msg.get("usage", {})
             if not isinstance(usage, dict):
                 raise SSEParseError("message_start usage must be an object")
-            message["usage"]["input_tokens"] = usage.get("input_tokens", 0)
-            message["usage"]["output_tokens"] = usage.get("output_tokens", 0)
+            for field in _USAGE_FIELDS:
+                if field in usage:
+                    message["usage"][field] = usage[field]
 
         elif ev_type == "content_block_start":
             index = _anthropic_index(ev)
@@ -453,8 +474,10 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
             delta_usage = ev.get("usage", {})
             if not isinstance(delta_usage, dict):
                 raise SSEParseError("message_delta usage must be an object")
-            if "output_tokens" in delta_usage:
-                message["usage"]["output_tokens"] = delta_usage["output_tokens"]
+            # message_delta usage is cumulative and may revise any field.
+            for field in _USAGE_FIELDS:
+                if field in delta_usage:
+                    message["usage"][field] = delta_usage[field]
         elif ev_type in ("ping", "message_stop"):
             continue
         elif ev_type == "error":

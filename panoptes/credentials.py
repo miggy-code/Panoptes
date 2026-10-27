@@ -93,7 +93,13 @@ def _validate_provider_key(provider: str, value: Any) -> str:
 def _read_credentials_file(path: str) -> dict[str, Any]:
     """Read an owner-only YAML mapping of provider name to API key."""
     expanded = os.path.expanduser(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps a FIFO in place of the file from hanging startup inside
+    # open() before the regular-file check; it does not affect regular files.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(expanded, flags)
     except OSError as exc:

@@ -2071,3 +2071,86 @@ if __name__ == "__main__":
     test_preflight_block_prevents_forward()
     test_preflight_allow_writes_all_events()
     print("\nAll tests passed!")
+
+
+def test_upstream_client_never_stores_cookies():
+    """One client serves every session, so it must not replay Set-Cookie."""
+    import httpx
+
+    from panoptes.proxy import _upstream_client
+
+    client = _upstream_client(5.0)
+    try:
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(
+            200, headers={"set-cookie": "sess=SECRET; Path=/"}, request=request
+        )
+        client.cookies.extract_cookies(response)
+        assert len(client.cookies.jar) == 0
+    finally:
+        client.close()
+
+
+def test_forwarded_accept_encoding_is_replaced_case_insensitively():
+    fwd = ProxyHandler._build_fwd_headers(
+        None, {"accept-encoding": "gzip, br", "content-type": "application/json"}
+    )
+    assert [k for k in fwd if k.lower() == "accept-encoding"] == ["Accept-Encoding"]
+    assert fwd["Accept-Encoding"] == "identity"
+
+
+def test_undecodable_upstream_content_encoding_is_refused():
+    from panoptes.proxy import ResponseInspectionError, _check_content_encoding
+
+    _check_content_encoding({"Content-Encoding": "gzip"})
+    _check_content_encoding({})
+    for coding in ("br", "zstd", "gzip, br"):
+        with pytest.raises(ResponseInspectionError):
+            _check_content_encoding({"Content-Encoding": coding})
+
+
+def test_repeated_request_headers_are_combined():
+    from panoptes.proxy import _merged_headers
+
+    merged = _merged_headers([
+        ("anthropic-beta", "beta-one"),
+        ("Anthropic-Beta", "beta-two"),
+        ("Cookie", "a=1"),
+        ("cookie", "b=2"),
+    ])
+    assert merged == {"anthropic-beta": "beta-one, beta-two", "Cookie": "a=1; b=2"}
+
+
+def test_usage_counts_cached_and_thinking_tokens():
+    from panoptes.providers.gemini import GeminiProvider
+
+    usage = AnthropicProvider().extract_usage({"usage": {
+        "input_tokens": 3,
+        "cache_read_input_tokens": 90_000,
+        "cache_creation_input_tokens": 5_000,
+        "output_tokens": 7,
+    }})
+    assert usage == {"tokens_in": 95_003, "tokens_out": 7}
+
+    stream = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"m",'
+        b'"model":"claude-x","usage":{"input_tokens":3,"cache_read_input_tokens":10,'
+        b'"output_tokens":1}}}\n\n'
+        b'event: message_delta\ndata: {"type":"message_delta","delta":'
+        b'{"stop_reason":"end_turn"},"usage":{"output_tokens":9,'
+        b'"cache_read_input_tokens":20}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    message = _reassemble_anthropic_sse(_parse_sse_events(stream))
+    assert AnthropicProvider().extract_usage(message) == {
+        "tokens_in": 23, "tokens_out": 9,
+    }
+
+    gemini = GeminiProvider()
+    assert gemini.extract_usage({"usageMetadata": {
+        "promptTokenCount": 3, "candidatesTokenCount": 1, "thoughtsTokenCount": 500,
+    }}) == {"tokens_in": 3, "tokens_out": 501}
+    assert gemini.extract_request_info(
+        {"contents": []},
+        path="/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+    )["model"] == "gemini-2.5-pro"

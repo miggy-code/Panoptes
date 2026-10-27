@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,9 +11,17 @@ from .base import (
     Provider,
     SSEParseError,
     _parse_sse_events,
+    _route_matches,
     _strict_json_loads,
 )
 
+
+_ROUTES = (
+    re.compile(r"/v1/chat/completions"),
+    re.compile(r"/v1/completions"),
+    re.compile(r"/v1/responses(?:/[^/]+)?"),
+    re.compile(r"/v1/models(?:/[^/]+)?"),
+)
 
 _CLIENT_ACTION_OUTPUT_TYPES = frozenset({
     "function_call",
@@ -222,7 +231,7 @@ class OpenAIProvider(Provider):
     name = "openai"
 
     def matches_path(self, path: str) -> bool:
-        return any(pat in path for pat in ("/chat/completions", "/responses", "/completions", "/models"))
+        return _route_matches(path, _ROUTES)
 
     def matches_body(self, body: dict | None) -> bool:
         if not isinstance(body, dict):

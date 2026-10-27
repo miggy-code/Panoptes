@@ -6,6 +6,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlparse
 
 
 class SSEParseError(ValueError):
@@ -139,6 +140,25 @@ def _parse_sse_events(data: bytes) -> list[dict]:
     return events
 
 
+def _route_matches(path: str, routes: tuple[re.Pattern[str], ...]) -> bool:
+    """Match the path component, never the query, against an exact route list.
+
+    Substring matching would forward any provider endpoint (batches, files,
+    fine-tuning) with an injected key and parse its response as "no tool
+    calls", so each provider lists the model-API routes it can inspect.
+    """
+    route = urlparse(path).path
+    return any(pattern.fullmatch(route) for pattern in routes)
+
+
+def _usage_count(usage: Any, field: str) -> int:
+    """A usage counter, or 0 when absent or not a non-negative integer."""
+    value = usage.get(field) if isinstance(usage, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def _empty_request_info() -> dict[str, Any]:
     """Request info returned when there is no parseable request body."""
     return {"model": "unknown", "messages_count": 0, "tools_count": 0, "stream": False}
@@ -184,16 +204,28 @@ class Provider(ABC):
         multiple wire protocols. Enforcement callers should always supply it.
         """
 
-    def extract_request_info(self, body: dict | None) -> dict[str, Any]:
+    def extract_request_info(
+        self, body: dict | None, *, path: str | None = None
+    ) -> dict[str, Any]:
         """Extract normalized request info from a request body.
 
         Returns dict with keys: model, messages_count, tools_count, stream.
         Non-dict bodies yield the empty defaults; dict bodies are delegated
-        to the provider-specific _request_info hook.
+        to the provider-specific _request_info hook. Providers that name the
+        model in the route rather than the body fill it in from ``path``.
         """
-        if not isinstance(body, dict):
-            return _empty_request_info()
-        return self._request_info(body)
+        info = (
+            self._request_info(body)
+            if isinstance(body, dict)
+            else _empty_request_info()
+        )
+        if info.get("model") in (None, "unknown") and path:
+            info["model"] = self.model_from_path(path) or info.get("model", "unknown")
+        return info
+
+    def model_from_path(self, path: str) -> str | None:
+        """The model a route names, for providers that put it in the URL."""
+        return None
 
     def _request_info(self, body: dict) -> dict[str, Any]:
         """Provider-specific request info extraction (body is a dict)."""

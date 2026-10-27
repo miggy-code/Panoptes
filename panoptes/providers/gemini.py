@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from .base import (
     Provider,
     SSEParseError,
     _parse_sse_events,
+    _route_matches,
     _strict_json_loads,
+    _usage_count,
 )
+
+# Gemini's OpenAI-compatible routes (/v1beta/openai/...) are deliberately
+# absent: their payloads are OpenAI-shaped and this parser would see no tools.
+_ROUTES = (
+    re.compile(r"/v1(?:beta|alpha)?/models/[^/:]+:(?:generateContent|streamGenerateContent)"),
+)
+
+_MODEL_IN_ROUTE = re.compile(r"/models/([^/:]+):")
 
 _GEMINI_PART_FIELDS = frozenset({
     "text",
@@ -116,10 +128,7 @@ class GeminiProvider(Provider):
     name = "gemini"
 
     def matches_path(self, path: str) -> bool:
-        return any(
-            pat in path
-            for pat in ("generateContent", "streamGenerateContent", "/v1beta/", "/v1alpha/")
-        )
+        return _route_matches(path, _ROUTES)
 
     def matches_body(self, body: dict | None) -> bool:
         if not isinstance(body, dict):
@@ -129,6 +138,10 @@ class GeminiProvider(Provider):
     @property
     def default_upstream(self) -> str:
         return "https://generativelanguage.googleapis.com"
+
+    def model_from_path(self, path: str) -> str | None:
+        match = _MODEL_IN_ROUTE.search(urlparse(path).path)
+        return match.group(1) if match else None
 
     def _request_info(self, body: dict) -> dict[str, Any]:
         contents = body.get("contents", [])
@@ -464,8 +477,12 @@ class GeminiProvider(Provider):
     def extract_usage(self, resp_body: dict) -> dict:
         usage = resp_body.get("usageMetadata", {})
         return {
-            "tokens_in": usage.get("promptTokenCount", 0),
-            "tokens_out": usage.get("candidatesTokenCount", 0),
+            "tokens_in": _usage_count(usage, "promptTokenCount"),
+            # Thinking tokens are billed as output but counted separately.
+            "tokens_out": (
+                _usage_count(usage, "candidatesTokenCount")
+                + _usage_count(usage, "thoughtsTokenCount")
+            ),
         }
 
     def reassemble_sse(
