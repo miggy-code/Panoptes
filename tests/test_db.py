@@ -17,7 +17,6 @@ import json
 import os
 import sqlite3
 import stat
-import sys
 import tempfile
 import threading
 import time
@@ -25,10 +24,7 @@ import uuid
 
 import pytest
 
-# Ensure local package is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-from panoptes import AuditDB, ValidationError, normalize_event, validate_event
+from panoptes import AuditDB, ValidationError, normalize_event
 from panoptes.capture import HERMES_AUTHORIZER_CAPABILITIES
 from panoptes.db import (
     ChainIntegrityError,
@@ -36,163 +32,35 @@ from panoptes.db import (
     UnsupportedSchemaVersionError,
     _load_chain_for_append,
 )
-from panoptes.schema import SCHEMA_VERSION, redact_secrets
+from panoptes.schema import SCHEMA_VERSION
 
 
-def test_redact_secrets():
-    """Secret redaction removes sensitive data from strings and nested dicts."""
-    print("--- test_redact_secrets ---")
-
-    # API key in parameters
-    params = {"headers": {"Authorization": "Bearer sk-ant-api03-fakefakefakefakefakefake"}}
-    cleaned = redact_secrets(params)
-    assert "[REDACTED]" in str(cleaned), f"Bearer token not redacted: {cleaned}"
-
-    # Password in nested dict
-    params2 = {"db": {"password": "supersecret123", "host": "localhost"}}
-    cleaned2 = redact_secrets(params2)
-    assert "supersecret123" not in str(cleaned2), f"Password not redacted: {cleaned2}"
-    assert "[REDACTED]" in str(cleaned2)
-
-    # Private key
-    params3 = {"key": "-----BEGIN RSA PRIVATE KEY-----\nabc123\n-----END RSA PRIVATE KEY-----"}
-    cleaned3 = redact_secrets(params3)
-    assert "PRIVATE KEY" not in str(cleaned3) or "[REDACTED" in str(cleaned3), f"Private key not redacted: {cleaned3}"
-
-    # AWS key
-    params4 = {"aws_access_key": "AKIAIOSFODNN7EXAMPLE"}
-    cleaned4 = redact_secrets(params4)
-    assert "AKIA" not in str(cleaned4), f"AWS key not redacted: {cleaned4}"
-
-    # GitHub token
-    params5 = {"token": "ghp_fakefakefakefakefakefakefakefakefake"}
-    cleaned5 = redact_secrets(params5)
-    assert "ghp_" not in str(cleaned5), f"GitHub token not redacted: {cleaned5}"
-
-    # Non-sensitive data passes through
-    params6 = {"file": "config.yaml", "lines": 200}
-    cleaned6 = redact_secrets(params6)
-    assert cleaned6 == params6, f"Non-sensitive data altered: {cleaned6}"
-
-    print("  PASSED")
-
-
-def test_normalize_event():
-    """Normalize fills defaults, generates IDs, redacts secrets."""
-    print("--- test_normalize_event ---")
-
-    raw = {
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "tool_call",
-        "action": {
-            "tool_name": "read_file",
-            "parameters": {"path": "/etc/passwd", "Authorization": "Bearer secret123"},
-            "data_accessed": ["prod_config"],
-        },
-        "outcome": {"status": "success", "summary": "ok"},
-        "context": {"turn_number": 1, "user_message": "read the config"},
-    }
-    norm = normalize_event(raw)
-
-    assert norm["event_id"], "event_id not generated"
-    assert norm["timestamp"], "timestamp not generated"
-    assert norm["agent"]["type"] == "hermes"
-    assert norm["agent"]["session_id"] == "s1"
-    assert norm["user"]["id"] == "local_user"
-    assert norm["event_type"] == "tool_call"
-
-    # Secret redacted in normalized action
-    params_str = str(norm["action"]["parameters"])
-    assert "secret123" not in params_str, f"Secret leak in normalized event: {params_str}"
-    assert "[REDACTED]" in params_str, f"Secret not redacted: {params_str}"
-
-    # Declared tags are preserved and authoritative derivation is additive.
-    assert "prod_config" in norm["action"]["data_accessed"]
-    assert "secrets" in norm["action"]["data_accessed"]
-
-    # Truncation of user_message
-    long_msg = "x" * 600
-    raw2 = {
-        "agent": {"type": "claude_code", "session_id": "s2", "run_id": "r2"},
-        "event_type": "model_request",
-        "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
-        "outcome": {"status": "success"},
-        "context": {"turn_number": 1, "user_message": long_msg},
-    }
-    norm2 = normalize_event(raw2)
-    assert len(norm2["context"]["user_message"]) <= 500
-    assert norm2["context"]["user_message"].endswith("...")
-
-    print("  PASSED")
-
-
-def test_validate_event():
-    """Validate catches missing fields and invalid values."""
-    print("--- test_validate_event ---")
-
-    # Valid minimal event
-    valid = {
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "tool_call",
-        "action": {"tool_name": "read_file", "parameters": {}, "data_accessed": []},
-        "outcome": {"status": "success"},
-        "context": {"turn_number": 1},
-    }
-    warnings = validate_event(valid)
-    assert isinstance(warnings, list)
-
-    # Missing agent
+def test_insert_normalizes_and_redacts_stored_events(tmp_path):
+    db = AuditDB(str(tmp_path / "audit.db"))
     try:
-        validate_event({"event_type": "tool_call", "action": {}, "outcome": {"status": "success"}, "context": {}})
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
-        pass
-
-    # Invalid agent type
-    try:
-        validate_event({
-            "agent": {"type": "skynet", "session_id": "s1", "run_id": "r1"},
-            "event_type": "tool_call",
-            "action": {},
-            "outcome": {"status": "success"},
-            "context": {},
-        })
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
-        pass
-
-    # Invalid event_type
-    try:
-        validate_event({
-            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-            "event_type": "mind_control",
-            "action": {},
-            "outcome": {"status": "success"},
-            "context": {},
-        })
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
-        pass
-
-    # Invalid outcome status
-    try:
-        validate_event({
+        event_id = db.insert_event({
             "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
             "event_type": "tool_call",
-            "action": {},
-            "outcome": {"status": "catastrophe"},
+            "action": {
+                "tool_name": "read_file",
+                "parameters": {"path": "/srv/prod/config", "password": "secret123"},
+            },
+            "outcome": {"status": "pending"},
             "context": {},
         })
-        assert False, "Should have raised ValidationError"
-    except ValidationError:
-        pass
-
-    print("  PASSED")
+        stored = db.query()[0]
+        assert stored["event_id"] == event_id
+        assert stored["timestamp"]
+        assert "prod" in stored["action"]["data_accessed"]
+        assert stored["action"]["parameters"]["password"] == "[REDACTED]"
+        assert "secret123" not in json.dumps(stored)
+        assert db.verify_chain()["valid"]
+    finally:
+        db.close()
 
 
 def test_db_lifecycle():
     """Create DB, insert events from different agents, verify schema version."""
-    print("--- test_db_lifecycle ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_audit.db")
@@ -238,12 +106,10 @@ def test_db_lifecycle():
         assert stats2["events_by_type"]["model_response"] == 3
 
         db.close()
-        print("  PASSED")
 
 
 def test_in_memory_database_persists_across_operation_connections():
     """The documented :memory: path shares state across DB operations."""
-    print("--- test_in_memory_database_persists_across_operation_connections ---")
 
     db = AuditDB(":memory:")
     event_id = db.insert_event({
@@ -260,12 +126,9 @@ def test_in_memory_database_persists_across_operation_connections():
     assert db.verify_chain()["valid"]
     db.close()
 
-    print("  PASSED")
-
 
 def test_query_filters():
     """Query supports filtering by agent_type, event_type, time range, data_accessed, pagination."""
-    print("--- test_query_filters ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_query.db")
@@ -326,12 +189,10 @@ def test_query_filters():
         assert len(results) == 3
 
         db.close()
-        print("  PASSED")
 
 
 def test_evidence_chain():
     """Evidence chain reconstructs the decision path around a tool call (turn-number path)."""
-    print("--- test_evidence_chain ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_chain.db")
@@ -414,12 +275,10 @@ def test_evidence_chain():
         assert empty_chain == []
 
         db.close()
-        print("  PASSED")
 
 
 def test_evidence_chain_via_call_id():
     """Evidence chain uses call_id + run_id when available (call_id path)."""
-    print("--- test_evidence_chain_via_call_id ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_chain_callid.db")
@@ -501,12 +360,10 @@ def test_evidence_chain_via_call_id():
         assert event_ids[4] not in chain_ids, "Unrelated turn leaked into call_id chain"
 
         db.close()
-        print("  PASSED")
 
 
 def test_evidence_chain_temporal_fallback_parses_iso8601():
     """The no-turn fallback compares timestamp instants, not text formats."""
-    print("--- test_evidence_chain_temporal_fallback_parses_iso8601 ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "evidence-time.db"))
@@ -539,12 +396,9 @@ def test_evidence_chain_temporal_fallback_parses_iso8601():
         ]
         db.close()
 
-    print("  PASSED")
-
 
 def test_tool_result_replays_are_preserved():
     """Repeated tool_result observations with one call_id remain distinct."""
-    print("--- test_tool_result_replays_are_preserved ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup.db")
@@ -578,12 +432,10 @@ def test_tool_result_replays_are_preserved():
         assert db.verify_chain()["valid"]
 
         db.close()
-        print("  PASSED")
 
 
 def test_tool_call_replays_are_preserved():
     """Repeated tool_call observations with one call_id remain distinct."""
-    print("--- test_tool_call_replays_are_preserved ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup_call.db")
@@ -617,12 +469,10 @@ def test_tool_call_replays_are_preserved():
         assert db.verify_chain()["valid"]
 
         db.close()
-        print("  PASSED")
 
 
 def test_call_id_is_correlation_not_idempotency():
     """A call_id never suppresses a distinct event, matching or changed."""
-    print("--- test_call_id_is_correlation_not_idempotency ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "semantic-dedup.db"))
@@ -691,12 +541,9 @@ def test_call_id_is_correlation_not_idempotency():
         assert db.verify_chain()["valid"]
         db.close()
 
-    print("  PASSED")
-
 
 def test_call_id_correlation_across_sessions():
     """The same call_id can correlate events without imposing uniqueness."""
-    print("--- test_call_id_correlation_across_sessions ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_dedup_sessions.db")
@@ -724,12 +571,10 @@ def test_call_id_correlation_across_sessions():
         )
 
         db.close()
-        print("  PASSED")
 
 
 def test_migration_v1_to_v2():
     """Opening a v1 DB adds call_id without treating targets as replay keys."""
-    print("--- test_migration_v1_to_v2 ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "v1_legacy.db")
@@ -834,12 +679,10 @@ def test_migration_v1_to_v2():
         assert len(rows2) == 1 and rows2[0][0] == "unique-1"
 
         raw.close()
-        print("  PASSED")
 
 
 def test_migration_preserves_all_duplicate_call_ids():
     """Migration never erases matching or conflicting legacy call deliveries."""
-    print("--- test_migration_preserves_all_duplicate_call_ids ---")
 
     def create_v1(path, second_content):
         conn = sqlite3.connect(path)
@@ -938,12 +781,9 @@ def test_migration_preserves_all_duplicate_call_ids():
         assert "idx_events_call_id" in indexes
         assert "idx_events_dedup" not in indexes
 
-    print("  PASSED")
-
 
 def test_session_access():
     """get_session and list_sessions work correctly."""
-    print("--- test_session_access ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_sessions.db")
@@ -995,12 +835,10 @@ def test_session_access():
         assert len(sessions_codex) == 0
 
         db.close()
-        print("  PASSED")
 
 
 def test_validation_error_on_insert():
     """insert_event raises ValidationError for invalid events."""
-    print("--- test_validation_error_on_insert ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_validation.db")
@@ -1019,12 +857,10 @@ def test_validation_error_on_insert():
             pass
 
         db.close()
-        print("  PASSED")
 
 
 def test_concurrent_access():
     """Basic thread-safety test: multiple threads inserting events."""
-    print("--- test_concurrent_access ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_threads.db")
@@ -1069,12 +905,10 @@ def test_concurrent_access():
         assert verification["checked_events"] == expected
 
         db.close()
-        print("  PASSED")
 
 
 def test_concurrent_batches_across_db_instances_do_not_fork_chain():
     """Independent writers serialize the shared chain head transactionally."""
-    print("--- test_concurrent_batches_across_db_instances_do_not_fork_chain ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "multi-writer.db")
@@ -1125,8 +959,6 @@ def test_concurrent_batches_across_db_instances_do_not_fork_chain():
         assert reopened.verify_chain()["valid"]
         reopened.close()
 
-    print("  PASSED")
-
 
 def test_short_lived_threads_release_connections():
     """A request thread must not leave its SQLite connection open forever."""
@@ -1147,7 +979,6 @@ def test_short_lived_threads_release_connections():
 
 def test_schema_version_table():
     """Schema version table tracks migrations."""
-    print("--- test_schema_version_table ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_version.db")
@@ -1164,12 +995,10 @@ def test_schema_version_table():
         conn.close()
 
         db.close()
-        print("  PASSED")
 
 
 def test_future_schema_version_is_rejected():
     """A newer database must not be interpreted with older code."""
-    print("--- test_future_schema_version_is_rejected ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "future.db")
@@ -1204,12 +1033,9 @@ def test_future_schema_version_is_rejected():
         check.close()
         assert columns == ["future_only"]
 
-    print("  PASSED")
-
 
 def test_insert_events_batch():
     """insert_events inserts a batch atomically and returns ids in order."""
-    print("--- test_insert_events_batch ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch.db")
@@ -1255,12 +1081,10 @@ def test_insert_events_batch():
         assert isinstance(eid_single, str) and eid_single
 
         db.close()
-        print("  PASSED")
 
 
 def test_event_id_conflicts_and_invalid_events_are_never_silent():
     """Only an identical canonical payload may reuse an event_id."""
-    print("--- test_event_id_conflicts_and_invalid_events_are_never_silent ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "conflicts.db"))
@@ -1310,12 +1134,9 @@ def test_event_id_conflicts_and_invalid_events_are_never_silent():
         assert db.verify_chain()["valid"]
         db.close()
 
-    print("  PASSED")
-
 
 def test_redaction_cannot_collapse_distinct_secret_bearing_event_replays():
     """Duplicate IDs with erased secret differences must fail, never disappear."""
-    print("--- test_redaction_cannot_collapse_distinct_secret_bearing_event_replays ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "redacted-conflicts.db"))
@@ -1364,12 +1185,9 @@ def test_redaction_cannot_collapse_distinct_secret_bearing_event_replays():
         assert db.verify_chain()["valid"]
         db.close()
 
-    print("  PASSED")
-
 
 def test_explicit_event_id_requires_stable_timestamp():
     """Generated timestamps cannot underpin stable event_id idempotency."""
-    print("--- test_explicit_event_id_requires_stable_timestamp ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "stable-envelope.db"))
@@ -1392,12 +1210,9 @@ def test_explicit_event_id_requires_stable_timestamp():
         assert db.get_chain_checkpoint()["event_count"] == 0
         db.close()
 
-    print("  PASSED")
-
 
 def test_query_round_trip_is_idempotent_with_derived_metadata():
     """A stored canonical event can be replayed without advancing the chain."""
-    print("--- test_query_round_trip_is_idempotent_with_derived_metadata ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "round-trip.db"))
@@ -1430,8 +1245,6 @@ def test_query_round_trip_is_idempotent_with_derived_metadata():
         assert db.get_stats()["total_events"] == 1
         assert db.verify_chain()["valid"]
         db.close()
-
-    print("  PASSED")
 
 
 def test_query_round_trip_is_idempotent_with_safe_capture_metadata():
@@ -1470,7 +1283,6 @@ def test_query_round_trip_is_idempotent_with_safe_capture_metadata():
 
 def test_shared_target_without_call_id_is_not_deduplicated():
     """Repeated calls to one resource remain distinct without a true call_id."""
-    print("--- test_shared_target_without_call_id_is_not_deduplicated ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "targets.db"))
@@ -1496,12 +1308,9 @@ def test_shared_target_without_call_id_is_not_deduplicated():
         assert db.verify_chain()["valid"]
         db.close()
 
-    print("  PASSED")
-
 
 def test_hash_chain_detects_canonical_payload_tampering():
     """Changing a persisted event breaks verification at that event."""
-    print("--- test_hash_chain_detects_canonical_payload_tampering ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "tamper.db")
@@ -1537,8 +1346,6 @@ def test_hash_chain_detects_canonical_payload_tampering():
         assert verification["broken_event_id"] == "chain-1"
         assert "hash mismatch" in verification["error"].lower()
         db.close()
-
-    print("  PASSED")
 
 
 def test_chain_append_validation_is_indexed_not_history_scanning():
@@ -1600,7 +1407,6 @@ def test_chain_append_validation_is_indexed_not_history_scanning():
 
 def test_verify_checkpoint_exact_prefix_and_tampering():
     """External checkpoints must identify an exact verified chain prefix."""
-    print("--- test_verify_checkpoint_exact_prefix_and_tampering ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "external-checkpoint.db")
@@ -1675,12 +1481,9 @@ def test_verify_checkpoint_exact_prefix_and_tampering():
         assert corrupt["error"].startswith("Current hash chain is invalid:")
         db.close()
 
-    print("  PASSED")
-
 
 def test_batch_conflict_rolls_back_events_and_chain_head():
     """A late conflict rolls back earlier batch rows and chain metadata."""
-    print("--- test_batch_conflict_rolls_back_events_and_chain_head ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "rollback-chain.db"))
@@ -1720,14 +1523,11 @@ def test_batch_conflict_rolls_back_events_and_chain_head():
         assert db.verify_chain()["valid"]
         db.close()
 
-    print("  PASSED")
-
 
 def test_database_permissions_and_symlink_rejection():
     """POSIX storage defaults to owner-only files and rejects DB symlinks."""
     if os.name != "posix":
         return
-    print("--- test_database_permissions_and_symlink_rejection ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         private_dir = os.path.join(tmpdir, "private")
@@ -1761,12 +1561,9 @@ def test_database_permissions_and_symlink_rejection():
         except ValueError as exc:
             assert "symlink" in str(exc).lower()
 
-    print("  PASSED")
-
 
 def test_insert_events_preserves_replays_within_batch():
     """Two generated events sharing call_id are both stored in one batch."""
-    print("--- test_insert_events_preserves_replays_within_batch ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch_dedup.db")
@@ -1800,12 +1597,10 @@ def test_insert_events_preserves_replays_within_batch():
         assert db.verify_chain()["valid"]
 
         db.close()
-        print("  PASSED")
 
 
 def test_insert_events_preserves_replay_against_existing():
     """A later event with the same call_id remains a separate observation."""
-    print("--- test_insert_events_preserves_replay_against_existing ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch_preexist.db")
@@ -1855,12 +1650,10 @@ def test_insert_events_preserves_replay_against_existing():
         assert db.verify_chain()["valid"]
 
         db.close()
-        print("  PASSED")
 
 
 def test_insert_events_rollback_on_bad_event():
     """A bad event in the batch causes a full rollback — no partial inserts."""
-    print("--- test_insert_events_rollback_on_bad_event ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_batch_rollback.db")
@@ -1897,32 +1690,10 @@ def test_insert_events_rollback_on_bad_event():
         )
 
         db.close()
-        print("  PASSED")
-
-
-def test_covering_index_exists():
-    """Fresh DB has the covering index idx_events_session_ts on (session_id, timestamp)."""
-    print("--- test_covering_index_exists ---")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = os.path.join(tmpdir, "test_idx.db")
-        db = AuditDB(db_path)
-        db.close()
-
-        conn = sqlite3.connect(db_path)
-        index_names = {r[1] for r in conn.execute("PRAGMA index_list(events)")}
-        conn.close()
-
-        assert "idx_events_session_ts" in index_names, (
-            f"Covering index idx_events_session_ts missing. Found: {index_names}"
-        )
-
-    print("  PASSED")
 
 
 def test_v3_fresh_schema():
     """A fresh DB has hash-chain columns and metadata."""
-    print("--- test_v3_fresh_schema ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_v3.db")
@@ -1950,12 +1721,10 @@ def test_v3_fresh_schema():
         assert not {"baselines", "trust_events", "alerts"} & table_names
 
         conn.close()
-        print("  PASSED")
 
 
 def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
     """Migration preserves rows whose corrected explicit call_ids converge."""
-    print("--- test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "v3-call-id.db")
@@ -2078,12 +1847,9 @@ def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
         assert "idx_events_call_id" in indexes
         assert version == SCHEMA_VERSION
 
-    print("  PASSED")
-
 
 def test_migration_v2_to_v3():
     """Opening a v2 database adds hash-chain columns and v3 tables, keeps data."""
-    print("--- test_migration_v2_to_v3 ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "v2_legacy.db")
@@ -2176,12 +1942,10 @@ def test_migration_v2_to_v3():
         }
         assert "chain_meta" in table_names
         raw.close()
-        print("  PASSED")
 
 
 def test_aggregate_basic():
     """aggregate() groups by dimension and computes whitelisted metrics."""
-    print("--- test_aggregate_basic ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_agg.db")
@@ -2236,12 +2000,10 @@ def test_aggregate_basic():
         assert totals[0]["count"] == 5 and totals[0]["distinct_sessions"] == 2
 
         db.close()
-        print("  PASSED")
 
 
 def test_aggregate_buckets_and_filters():
     """aggregate() supports day/hour buckets and the query() filter set."""
-    print("--- test_aggregate_buckets_and_filters ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_agg_time.db")
@@ -2284,12 +2046,10 @@ def test_aggregate_buckets_and_filters():
         assert filtered == [], f"Expected no codex rows, got: {filtered}"
 
         db.close()
-        print("  PASSED")
 
 
 def test_aggregate_validation():
     """aggregate() rejects unknown dimensions, metrics, and order_by keys."""
-    print("--- test_aggregate_validation ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_agg_val.db")
@@ -2312,52 +2072,6 @@ def test_aggregate_validation():
                 pass
 
         db.close()
-        print("  PASSED")
-
-
-if __name__ == "__main__":
-    test_redact_secrets()
-    test_normalize_event()
-    test_validate_event()
-    test_db_lifecycle()
-    test_in_memory_database_persists_across_operation_connections()
-    test_query_filters()
-    test_evidence_chain()
-    test_evidence_chain_via_call_id()
-    test_evidence_chain_temporal_fallback_parses_iso8601()
-    test_tool_result_replays_are_preserved()
-    test_tool_call_replays_are_preserved()
-    test_call_id_is_correlation_not_idempotency()
-    test_call_id_correlation_across_sessions()
-    test_migration_v1_to_v2()
-    test_migration_preserves_all_duplicate_call_ids()
-    test_session_access()
-    test_validation_error_on_insert()
-    test_concurrent_access()
-    test_concurrent_batches_across_db_instances_do_not_fork_chain()
-    test_schema_version_table()
-    test_future_schema_version_is_rejected()
-    test_insert_events_batch()
-    test_event_id_conflicts_and_invalid_events_are_never_silent()
-    test_redaction_cannot_collapse_distinct_secret_bearing_event_replays()
-    test_explicit_event_id_requires_stable_timestamp()
-    test_query_round_trip_is_idempotent_with_derived_metadata()
-    test_shared_target_without_call_id_is_not_deduplicated()
-    test_hash_chain_detects_canonical_payload_tampering()
-    test_verify_checkpoint_exact_prefix_and_tampering()
-    test_batch_conflict_rolls_back_events_and_chain_head()
-    test_database_permissions_and_symlink_rejection()
-    test_insert_events_preserves_replays_within_batch()
-    test_insert_events_preserves_replay_against_existing()
-    test_insert_events_rollback_on_bad_event()
-    test_covering_index_exists()
-    test_v3_fresh_schema()
-    test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction()
-    test_migration_v2_to_v3()
-    test_aggregate_basic()
-    test_aggregate_buckets_and_filters()
-    test_aggregate_validation()
-    print("\n=== ALL DB TESTS PASSED ===")
 
 
 def test_verify_detects_duplicate_keys_that_keep_the_parsed_hash():

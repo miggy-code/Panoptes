@@ -8,8 +8,9 @@ import secrets
 import sqlite3
 import stat
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from .schema import (
     SCHEMA_VERSION,
@@ -550,8 +551,7 @@ def _ensure_schema(db: "AuditDB") -> None:
       v3 → v4: drop the legacy call_id uniqueness constraint. call_id is a
                            correlation key; every distinct event is retained.
     """
-    conn = db._get_conn()
-    try:
+    with db._connection() as conn:
         # Schema changes and the chain boundary must be observed atomically by
         # every process opening the same database.
         conn.execute("BEGIN IMMEDIATE")
@@ -645,14 +645,11 @@ def _ensure_schema(db: "AuditDB") -> None:
                 (SCHEMA_VERSION,),
             )
         conn.commit()
-    finally:
-        db._put_conn(conn)
 
 
 def _check_read_only_schema(db: "AuditDB") -> None:
     """Refuse a read-only open of a database that would need migrating."""
-    conn = db._get_conn()
-    try:
+    with db._connection() as conn:
         try:
             row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
         except sqlite3.OperationalError as exc:
@@ -665,8 +662,6 @@ def _check_read_only_schema(db: "AuditDB") -> None:
                 f"Database schema version {current} differs from supported "
                 f"version {SCHEMA_VERSION}; open it with a writer to migrate"
             )
-    finally:
-        db._put_conn(conn)
 
 
 # ── AuditDB ───────────────────────────────────────────────────────────────────
@@ -739,14 +734,11 @@ class AuditDB:
 
             # WAL is a persistent database property — set it once here. SQLite
             # keeps its in-memory journal mode for the shared-memory variant.
-            conn = self._get_conn()
-            try:
+            with self._connection() as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.commit()
                 _restrict_database_files(self._db_path)
-            finally:
-                self._put_conn(conn)
 
             # Run migrations / create tables
             _ensure_schema(self)
@@ -786,6 +778,15 @@ class AuditDB:
         with self._conns_lock:
             self._all_conns.discard(conn)
         conn.close()
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Release an operation's connection without changing its transaction rules."""
+        conn = self._get_conn()
+        try:
+            yield conn
+        finally:
+            self._put_conn(conn)
 
     def close(self) -> None:
         """Close all connections opened by this AuditDB, across all threads."""
@@ -851,76 +852,74 @@ class AuditDB:
         # Step 2: serialize writers with BEGIN IMMEDIATE. Reading and updating
         # the chain head must be one transaction across threads and processes;
         # otherwise concurrent writers can create a fork.
-        conn = self._get_conn()
-        try:
-            if not prepared:
-                return []
+        with self._connection() as conn:
+            try:
+                if not prepared:
+                    return []
 
-            conn.execute("BEGIN IMMEDIATE")
-            event_ids: List[str] = []
-            checkpoint: Optional[Dict[str, Any]] = None
-            payload_columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                conn.execute("BEGIN IMMEDIATE")
+                event_ids: List[str] = []
+                checkpoint: Optional[Dict[str, Any]] = None
+                payload_columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
 
-            for normalized, flat, input_requires_redaction in prepared:
-                # Defense in depth while schema adapters transition away from
-                # legacy target-based call IDs: only preserve an explicit
-                # provider/host call ID as correlation metadata.
-                action = normalized.get("action", {}) or {}
-                flat["call_id"] = action.get("call_id") or ""
+                for normalized, flat, input_requires_redaction in prepared:
+                    # Defense in depth while schema adapters transition away from
+                    # legacy target-based call IDs: only preserve an explicit
+                    # provider/host call ID as correlation metadata.
+                    action = normalized.get("action", {}) or {}
+                    flat["call_id"] = action.get("call_id") or ""
 
-                values = _build_params(normalized, flat)
-                payload = _canonical_payload_from_values(values)
-                event_id = values[0]
+                    values = _build_params(normalized, flat)
+                    payload = _canonical_payload_from_values(values)
+                    event_id = values[0]
 
-                # event_id replay is idempotent only when every canonical
-                # persisted field matches. A different payload is evidence of
-                # an upstream collision or attempted history rewrite.
-                existing = conn.execute(
-                    f"SELECT {payload_columns} FROM events WHERE event_id = ?",
-                    (event_id,),
-                ).fetchone()
-                if existing is not None:
-                    if input_requires_redaction:
-                        raise EventConflictError(
-                            f"event_id {event_id!r} already exists and the "
-                            "incoming raw payload contains redacted material; "
-                            "secret-bearing retries cannot be proven identical"
-                        )
-                    if (
-                        _canonical_json(_canonical_payload_from_row(existing))
-                        != _canonical_json(payload)
-                    ):
-                        raise EventConflictError(
-                            f"event_id {event_id!r} already exists with a "
-                            "different canonical payload"
-                        )
-                    event_ids.append(existing["event_id"])
-                    continue
+                    # event_id replay is idempotent only when every canonical
+                    # persisted field matches. A different payload is evidence of
+                    # an upstream collision or attempted history rewrite.
+                    existing = conn.execute(
+                        f"SELECT {payload_columns} FROM events WHERE event_id = ?",
+                        (event_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        if input_requires_redaction:
+                            raise EventConflictError(
+                                f"event_id {event_id!r} already exists and the "
+                                "incoming raw payload contains redacted material; "
+                                "secret-bearing retries cannot be proven identical"
+                            )
+                        if (
+                            _canonical_json(_canonical_payload_from_row(existing))
+                            != _canonical_json(payload)
+                        ):
+                            raise EventConflictError(
+                                f"event_id {event_id!r} already exists with a "
+                                "different canonical payload"
+                            )
+                        event_ids.append(existing["event_id"])
+                        continue
 
-                if checkpoint is None:
-                    checkpoint = _load_chain_for_append(conn)
+                    if checkpoint is None:
+                        checkpoint = _load_chain_for_append(conn)
 
-                prev_hash = checkpoint["head"]
-                digest = _event_hash(prev_hash, payload)
-                conn.execute(_INSERT_SQL, values + (prev_hash, digest))
+                    prev_hash = checkpoint["head"]
+                    digest = _event_hash(prev_hash, payload)
+                    conn.execute(_INSERT_SQL, values + (prev_hash, digest))
 
-                checkpoint["head"] = digest
-                checkpoint["event_count"] += 1
-                if checkpoint["first_event_id"] is None:
-                    checkpoint["first_event_id"] = event_id
-                checkpoint["last_event_id"] = event_id
-                event_ids.append(event_id)
+                    checkpoint["head"] = digest
+                    checkpoint["event_count"] += 1
+                    if checkpoint["first_event_id"] is None:
+                        checkpoint["first_event_id"] = event_id
+                    checkpoint["last_event_id"] = event_id
+                    event_ids.append(event_id)
 
-            if checkpoint is not None:
-                _persist_chain_checkpoint(conn, checkpoint)
-            conn.commit()
-            return event_ids
+                if checkpoint is not None:
+                    _persist_chain_checkpoint(conn, checkpoint)
+                conn.commit()
+                return event_ids
 
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self._put_conn(conn)
+            except Exception:
+                conn.rollback()
+                raise
 
     def insert_event(self, event: Dict[str, Any]) -> str:
         """Validate, normalize, and insert a single event. Returns the event_id.
@@ -944,47 +943,45 @@ class AuditDB:
         Persist ``head`` and ``event_count`` in an external signed/WORM system
         when the checkpoint must survive full local-database compromise.
         """
-        conn = self._get_conn()
-        try:
-            conn.execute("BEGIN")
-            meta = _read_chain_meta(conn)
-            if meta:
-                checkpoint = _checkpoint_from_meta(meta)
-            else:
-                legacy_count = conn.execute(
-                    "SELECT COUNT(*) FROM events "
-                    "WHERE prev_hash IS NULL AND event_hash IS NULL"
-                ).fetchone()[0]
-                hashed_count = conn.execute(
-                    "SELECT COUNT(*) FROM events "
-                    "WHERE prev_hash IS NOT NULL OR event_hash IS NOT NULL"
-                ).fetchone()[0]
-                if hashed_count:
-                    raise ChainIntegrityError(
-                        "Hashed events exist but hash-chain metadata is missing"
-                    )
-                checkpoint = {
-                    "initialized": False,
-                    "format_version": _CHAIN_FORMAT_VERSION,
-                    "algorithm": _CHAIN_ALGORITHM,
-                    "anchor": None,
-                    "head": None,
-                    "event_count": 0,
-                    "legacy_event_count": legacy_count,
-                    "started_at": None,
-                    "first_event_id": None,
-                    "last_event_id": None,
-                    "coverage": "none",
-                    "checkpoint_scope": "database_internal",
-                    "external_anchor_required": True,
-                }
-            conn.commit()
-            return checkpoint
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            self._put_conn(conn)
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN")
+                meta = _read_chain_meta(conn)
+                if meta:
+                    checkpoint = _checkpoint_from_meta(meta)
+                else:
+                    legacy_count = conn.execute(
+                        "SELECT COUNT(*) FROM events "
+                        "WHERE prev_hash IS NULL AND event_hash IS NULL"
+                    ).fetchone()[0]
+                    hashed_count = conn.execute(
+                        "SELECT COUNT(*) FROM events "
+                        "WHERE prev_hash IS NOT NULL OR event_hash IS NOT NULL"
+                    ).fetchone()[0]
+                    if hashed_count:
+                        raise ChainIntegrityError(
+                            "Hashed events exist but hash-chain metadata is missing"
+                        )
+                    checkpoint = {
+                        "initialized": False,
+                        "format_version": _CHAIN_FORMAT_VERSION,
+                        "algorithm": _CHAIN_ALGORITHM,
+                        "anchor": None,
+                        "head": None,
+                        "event_count": 0,
+                        "legacy_event_count": legacy_count,
+                        "started_at": None,
+                        "first_event_id": None,
+                        "last_event_id": None,
+                        "coverage": "none",
+                        "checkpoint_scope": "database_internal",
+                        "external_anchor_required": True,
+                    }
+                conn.commit()
+                return checkpoint
+            except Exception:
+                conn.rollback()
+                raise
 
     def verify_chain(self) -> Dict[str, Any]:
         """Verify links, canonical event hashes, head, count, and boundary.
@@ -993,169 +990,167 @@ class AuditDB:
         so callers can report the first broken event. Operational SQLite errors
         still propagate.
         """
-        conn = self._get_conn()
-        try:
-            conn.execute("BEGIN")
-            meta = _read_chain_meta(conn)
-            total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            partial_count = conn.execute(
-                """
-                SELECT COUNT(*) FROM events
-                WHERE (prev_hash IS NULL AND event_hash IS NOT NULL)
-                   OR (prev_hash IS NOT NULL AND event_hash IS NULL)
-                """
-            ).fetchone()[0]
-            chained_count = conn.execute(
-                "SELECT COUNT(*) FROM events "
-                "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
-            ).fetchone()[0]
-            legacy_count = total - chained_count - partial_count
-
-            if not meta:
-                result = {
-                    "valid": total == 0,
-                    "initialized": False,
-                    "format_version": _CHAIN_FORMAT_VERSION,
-                    "algorithm": _CHAIN_ALGORITHM,
-                    "anchor": None,
-                    "head": None,
-                    "event_count": 0,
-                    "legacy_event_count": legacy_count,
-                    "started_at": None,
-                    "first_event_id": None,
-                    "last_event_id": None,
-                    "coverage": "none",
-                    "checkpoint_scope": "database_internal",
-                    "external_anchor_required": True,
-                    "checked_events": 0,
-                    "broken_event_id": None,
-                    "error": (
-                        "Hashed events exist without hash-chain metadata"
-                        if partial_count or chained_count
-                        else "Events exist but the hash chain is not initialized"
-                        if total else None
-                    ),
-                }
-                conn.commit()
-                return result
-
+        with self._connection() as conn:
             try:
-                checkpoint = _checkpoint_from_meta(meta)
-            except ChainIntegrityError as exc:
-                conn.commit()
-                return {
+                conn.execute("BEGIN")
+                meta = _read_chain_meta(conn)
+                total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                partial_count = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM events
+                    WHERE (prev_hash IS NULL AND event_hash IS NOT NULL)
+                       OR (prev_hash IS NOT NULL AND event_hash IS NULL)
+                    """
+                ).fetchone()[0]
+                chained_count = conn.execute(
+                    "SELECT COUNT(*) FROM events "
+                    "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
+                ).fetchone()[0]
+                legacy_count = total - chained_count - partial_count
+
+                if not meta:
+                    result = {
+                        "valid": total == 0,
+                        "initialized": False,
+                        "format_version": _CHAIN_FORMAT_VERSION,
+                        "algorithm": _CHAIN_ALGORITHM,
+                        "anchor": None,
+                        "head": None,
+                        "event_count": 0,
+                        "legacy_event_count": legacy_count,
+                        "started_at": None,
+                        "first_event_id": None,
+                        "last_event_id": None,
+                        "coverage": "none",
+                        "checkpoint_scope": "database_internal",
+                        "external_anchor_required": True,
+                        "checked_events": 0,
+                        "broken_event_id": None,
+                        "error": (
+                            "Hashed events exist without hash-chain metadata"
+                            if partial_count or chained_count
+                            else "Events exist but the hash chain is not initialized"
+                            if total else None
+                        ),
+                    }
+                    conn.commit()
+                    return result
+
+                try:
+                    checkpoint = _checkpoint_from_meta(meta)
+                except ChainIntegrityError as exc:
+                    conn.commit()
+                    return {
+                        "valid": False,
+                        "initialized": True,
+                        "checked_events": 0,
+                        "broken_event_id": None,
+                        "error": str(exc),
+                    }
+
+                result = {
+                    **checkpoint,
                     "valid": False,
-                    "initialized": True,
                     "checked_events": 0,
                     "broken_event_id": None,
-                    "error": str(exc),
+                    "error": None,
                 }
 
-            result = {
-                **checkpoint,
-                "valid": False,
-                "checked_events": 0,
-                "broken_event_id": None,
-                "error": None,
-            }
+                def fail(message: str, event_id: Optional[str] = None) -> Dict[str, Any]:
+                    result["error"] = message
+                    result["broken_event_id"] = event_id
+                    return result
 
-            def fail(message: str, event_id: Optional[str] = None) -> Dict[str, Any]:
-                result["error"] = message
-                result["broken_event_id"] = event_id
+                if (
+                    checkpoint["format_version"] != _CHAIN_FORMAT_VERSION
+                    or checkpoint["algorithm"] != _CHAIN_ALGORITHM
+                ):
+                    conn.commit()
+                    return fail("Unsupported hash-chain format or algorithm")
+                if partial_count:
+                    conn.commit()
+                    return fail("Found events with only one hash-chain field")
+                if chained_count != checkpoint["event_count"]:
+                    conn.commit()
+                    return fail("Hash-chain event count does not match metadata")
+                if legacy_count != checkpoint["legacy_event_count"]:
+                    conn.commit()
+                    return fail("Unchained event count changed after chain start")
+
+                columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                rows = conn.execute(
+                    f"SELECT {columns}, prev_hash, event_hash FROM events "
+                    "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
+                ).fetchall()
+                by_prev: Dict[str, sqlite3.Row] = {}
+                for row in rows:
+                    prev_hash = row["prev_hash"]
+                    if prev_hash in by_prev:
+                        conn.commit()
+                        return fail(
+                            "Hash-chain fork: multiple events share one predecessor",
+                            row["event_id"],
+                        )
+                    by_prev[prev_hash] = row
+
+                current = checkpoint["anchor"]
+                first_event_id: Optional[str] = None
+                last_event_id: Optional[str] = None
+                visited: set = set()
+                for _ in range(checkpoint["event_count"]):
+                    row = by_prev.get(current)
+                    if row is None:
+                        conn.commit()
+                        return fail("Hash-chain link is missing")
+                    event_id = row["event_id"]
+                    try:
+                        expected = _event_hash(
+                            current, _canonical_payload_from_row(row)
+                        )
+                    except Exception as exc:
+                        conn.commit()
+                        return fail(
+                            f"Stored event cannot be canonicalized: {exc}",
+                            event_id,
+                        )
+                    if row["event_hash"] != expected:
+                        conn.commit()
+                        return fail("Canonical event hash mismatch", event_id)
+                    rewritten = _rewritten_json_column(row)
+                    if rewritten is not None:
+                        conn.commit()
+                        return fail(
+                            f"Stored {rewritten} JSON was rewritten after hashing",
+                            event_id,
+                        )
+                    if row["event_hash"] in visited:
+                        conn.commit()
+                        return fail("Hash-chain cycle detected", event_id)
+                    visited.add(row["event_hash"])
+                    first_event_id = first_event_id or event_id
+                    last_event_id = event_id
+                    current = row["event_hash"]
+                    result["checked_events"] += 1
+
+                if len(visited) != len(rows):
+                    conn.commit()
+                    return fail("Hash-chain contains unreachable events")
+                if current != checkpoint["head"]:
+                    conn.commit()
+                    return fail("Computed hash-chain head does not match metadata")
+                if first_event_id != checkpoint["first_event_id"]:
+                    conn.commit()
+                    return fail("First chained event does not match metadata")
+                if last_event_id != checkpoint["last_event_id"]:
+                    conn.commit()
+                    return fail("Last chained event does not match metadata")
+
+                result["valid"] = True
+                conn.commit()
                 return result
-
-            if (
-                checkpoint["format_version"] != _CHAIN_FORMAT_VERSION
-                or checkpoint["algorithm"] != _CHAIN_ALGORITHM
-            ):
-                conn.commit()
-                return fail("Unsupported hash-chain format or algorithm")
-            if partial_count:
-                conn.commit()
-                return fail("Found events with only one hash-chain field")
-            if chained_count != checkpoint["event_count"]:
-                conn.commit()
-                return fail("Hash-chain event count does not match metadata")
-            if legacy_count != checkpoint["legacy_event_count"]:
-                conn.commit()
-                return fail("Unchained event count changed after chain start")
-
-            columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
-            rows = conn.execute(
-                f"SELECT {columns}, prev_hash, event_hash FROM events "
-                "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
-            ).fetchall()
-            by_prev: Dict[str, sqlite3.Row] = {}
-            for row in rows:
-                prev_hash = row["prev_hash"]
-                if prev_hash in by_prev:
-                    conn.commit()
-                    return fail(
-                        "Hash-chain fork: multiple events share one predecessor",
-                        row["event_id"],
-                    )
-                by_prev[prev_hash] = row
-
-            current = checkpoint["anchor"]
-            first_event_id: Optional[str] = None
-            last_event_id: Optional[str] = None
-            visited: set = set()
-            for _ in range(checkpoint["event_count"]):
-                row = by_prev.get(current)
-                if row is None:
-                    conn.commit()
-                    return fail("Hash-chain link is missing")
-                event_id = row["event_id"]
-                try:
-                    expected = _event_hash(
-                        current, _canonical_payload_from_row(row)
-                    )
-                except Exception as exc:
-                    conn.commit()
-                    return fail(
-                        f"Stored event cannot be canonicalized: {exc}",
-                        event_id,
-                    )
-                if row["event_hash"] != expected:
-                    conn.commit()
-                    return fail("Canonical event hash mismatch", event_id)
-                rewritten = _rewritten_json_column(row)
-                if rewritten is not None:
-                    conn.commit()
-                    return fail(
-                        f"Stored {rewritten} JSON was rewritten after hashing",
-                        event_id,
-                    )
-                if row["event_hash"] in visited:
-                    conn.commit()
-                    return fail("Hash-chain cycle detected", event_id)
-                visited.add(row["event_hash"])
-                first_event_id = first_event_id or event_id
-                last_event_id = event_id
-                current = row["event_hash"]
-                result["checked_events"] += 1
-
-            if len(visited) != len(rows):
-                conn.commit()
-                return fail("Hash-chain contains unreachable events")
-            if current != checkpoint["head"]:
-                conn.commit()
-                return fail("Computed hash-chain head does not match metadata")
-            if first_event_id != checkpoint["first_event_id"]:
-                conn.commit()
-                return fail("First chained event does not match metadata")
-            if last_event_id != checkpoint["last_event_id"]:
-                conn.commit()
-                return fail("Last chained event does not match metadata")
-
-            result["valid"] = True
-            conn.commit()
-            return result
-        except sqlite3.Error:
-            conn.rollback()
-            raise
-        finally:
-            self._put_conn(conn)
+            except sqlite3.Error:
+                conn.rollback()
+                raise
 
     def verify_checkpoint(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
         """Prove that an external checkpoint is an exact prefix of this chain.
@@ -1242,124 +1237,122 @@ class AuditDB:
                     **details,
                 )
 
-            conn = self._get_conn()
-            try:
-                conn.execute("BEGIN")
-                meta = _read_chain_meta(conn)
-                current = _checkpoint_from_meta(meta)
-                snapshot_identity = (
-                    current["format_version"],
-                    current["algorithm"],
-                    current["anchor"],
-                    current["head"],
-                    current["event_count"],
-                    current["legacy_event_count"],
-                )
-                verified_identity = (
-                    verification["format_version"],
-                    verification["algorithm"],
-                    verification["anchor"],
-                    verification["head"],
-                    verification["event_count"],
-                    verification["legacy_event_count"],
-                )
-                if snapshot_identity != verified_identity:
-                    conn.commit()
-                    continue
+            with self._connection() as conn:
+                try:
+                    conn.execute("BEGIN")
+                    meta = _read_chain_meta(conn)
+                    current = _checkpoint_from_meta(meta)
+                    snapshot_identity = (
+                        current["format_version"],
+                        current["algorithm"],
+                        current["anchor"],
+                        current["head"],
+                        current["event_count"],
+                        current["legacy_event_count"],
+                    )
+                    verified_identity = (
+                        verification["format_version"],
+                        verification["algorithm"],
+                        verification["anchor"],
+                        verification["head"],
+                        verification["event_count"],
+                        verification["legacy_event_count"],
+                    )
+                    if snapshot_identity != verified_identity:
+                        conn.commit()
+                        continue
 
-                details = {
-                    "checkpoint_event_count": external_count,
-                    "current_event_count": current["event_count"],
-                    "current_head": current["head"],
-                }
-                identity_fields = (
-                    "format_version",
-                    "algorithm",
-                    "anchor",
-                    "legacy_event_count",
-                )
-                for field in identity_fields:
-                    if checkpoint[field] != current[field]:
+                    details = {
+                        "checkpoint_event_count": external_count,
+                        "current_event_count": current["event_count"],
+                        "current_head": current["head"],
+                    }
+                    identity_fields = (
+                        "format_version",
+                        "algorithm",
+                        "anchor",
+                        "legacy_event_count",
+                    )
+                    for field in identity_fields:
+                        if checkpoint[field] != current[field]:
+                            conn.commit()
+                            return fail(
+                                f"Checkpoint {field} does not match this chain",
+                                **details,
+                            )
+
+                    if external_count > current["event_count"]:
                         conn.commit()
                         return fail(
-                            f"Checkpoint {field} does not match this chain",
+                            "Checkpoint is ahead of the current chain",
                             **details,
                         )
 
-                if external_count > current["event_count"]:
+                    rows = conn.execute(
+                        """
+                        SELECT event_id, prev_hash, event_hash
+                        FROM events
+                        WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL
+                        """
+                    ).fetchall()
+                    by_prev: Dict[str, sqlite3.Row] = {}
+                    for row in rows:
+                        if row["prev_hash"] in by_prev:
+                            conn.commit()
+                            return fail(
+                                "Current hash chain forked during checkpoint comparison",
+                                **details,
+                            )
+                        by_prev[row["prev_hash"]] = row
+
+                    prefix_head = current["anchor"]
+                    prefix_first_event_id: Optional[str] = None
+                    prefix_last_event_id: Optional[str] = None
+                    for _ in range(external_count):
+                        row = by_prev.get(prefix_head)
+                        if row is None:
+                            conn.commit()
+                            return fail(
+                                "Current hash chain changed during checkpoint comparison",
+                                **details,
+                            )
+                        prefix_first_event_id = (
+                            prefix_first_event_id or row["event_id"]
+                        )
+                        prefix_last_event_id = row["event_id"]
+                        prefix_head = row["event_hash"]
+
+                    if checkpoint["head"] != prefix_head:
+                        conn.commit()
+                        return fail(
+                            "Checkpoint head is not the chain prefix at event_count",
+                            **details,
+                        )
+                    optional_boundaries = {
+                        "first_event_id": prefix_first_event_id,
+                        "last_event_id": prefix_last_event_id,
+                    }
+                    for field, expected in optional_boundaries.items():
+                        if field in checkpoint and checkpoint[field] != expected:
+                            conn.commit()
+                            return fail(
+                                f"Checkpoint {field} does not match its chain prefix",
+                                **details,
+                            )
+
+                    appended = current["event_count"] - external_count
                     conn.commit()
-                    return fail(
-                        "Checkpoint is ahead of the current chain",
+                    return {
+                        **base_result,
                         **details,
-                    )
-
-                rows = conn.execute(
-                    """
-                    SELECT event_id, prev_hash, event_hash
-                    FROM events
-                    WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL
-                    """
-                ).fetchall()
-                by_prev: Dict[str, sqlite3.Row] = {}
-                for row in rows:
-                    if row["prev_hash"] in by_prev:
-                        conn.commit()
-                        return fail(
-                            "Current hash chain forked during checkpoint comparison",
-                            **details,
-                        )
-                    by_prev[row["prev_hash"]] = row
-
-                prefix_head = current["anchor"]
-                prefix_first_event_id: Optional[str] = None
-                prefix_last_event_id: Optional[str] = None
-                for _ in range(external_count):
-                    row = by_prev.get(prefix_head)
-                    if row is None:
-                        conn.commit()
-                        return fail(
-                            "Current hash chain changed during checkpoint comparison",
-                            **details,
-                        )
-                    prefix_first_event_id = (
-                        prefix_first_event_id or row["event_id"]
-                    )
-                    prefix_last_event_id = row["event_id"]
-                    prefix_head = row["event_hash"]
-
-                if checkpoint["head"] != prefix_head:
-                    conn.commit()
-                    return fail(
-                        "Checkpoint head is not the chain prefix at event_count",
-                        **details,
-                    )
-                optional_boundaries = {
-                    "first_event_id": prefix_first_event_id,
-                    "last_event_id": prefix_last_event_id,
-                }
-                for field, expected in optional_boundaries.items():
-                    if field in checkpoint and checkpoint[field] != expected:
-                        conn.commit()
-                        return fail(
-                            f"Checkpoint {field} does not match its chain prefix",
-                            **details,
-                        )
-
-                appended = current["event_count"] - external_count
-                conn.commit()
-                return {
-                    **base_result,
-                    **details,
-                    "valid": True,
-                    "exact": appended == 0,
-                    "appended_events": appended,
-                    "error": None,
-                }
-            except sqlite3.Error:
-                conn.rollback()
-                raise
-            finally:
-                self._put_conn(conn)
+                        "valid": True,
+                        "exact": appended == 0,
+                        "appended_events": appended,
+                        "error": None,
+                    }
+                except sqlite3.Error:
+                    conn.rollback()
+                    raise
 
         return fail(
             "Hash chain changed repeatedly during checkpoint verification; retry",
@@ -1401,12 +1394,9 @@ class AuditDB:
         )
         params.extend([limit, offset])
 
-        conn = self._get_conn()
-        try:
+        with self._connection() as conn:
             cur = conn.execute(sql, params)
             rows = cur.fetchall()
-        finally:
-            self._put_conn(conn)
 
         return [_row_to_event(r) for r in rows]
 
@@ -1512,11 +1502,8 @@ class AuditDB:
         )
         params.append(limit)
 
-        conn = self._get_conn()
-        try:
+        with self._connection() as conn:
             rows = conn.execute(sql, params).fetchall()
-        finally:
-            self._put_conn(conn)
 
         return [dict(r) for r in rows]
 
@@ -1546,8 +1533,7 @@ class AuditDB:
 
         Results are ordered chronologically.
         """
-        conn = self._get_conn()
-        try:
+        with self._connection() as conn:
             # 1. Get the anchor event
             cur = conn.execute(
                 f"SELECT {', '.join(self._EVENT_COLUMNS)} FROM events WHERE event_id = ?",
@@ -1622,8 +1608,6 @@ class AuditDB:
                     )
 
             rows = cur.fetchall()
-        finally:
-            self._put_conn(conn)
 
         return [_row_to_event(r) for r in rows]
 
@@ -1646,8 +1630,7 @@ class AuditDB:
         where_clause = "WHERE agent_type = ?" if agent_type else ""
         params: tuple = (agent_type, limit) if agent_type else (limit,)
 
-        conn = self._get_conn()
-        try:
+        with self._connection() as conn:
             cur = conn.execute(
                 f"""
                 SELECT session_id, agent_type,
@@ -1663,8 +1646,6 @@ class AuditDB:
                 params,
             )
             rows = cur.fetchall()
-        finally:
-            self._put_conn(conn)
 
         return [dict(r) for r in rows]
 
@@ -1672,8 +1653,7 @@ class AuditDB:
 
     def get_stats(self) -> Dict[str, Any]:
         """Return aggregate statistics about stored events."""
-        conn = self._get_conn()
-        try:
+        with self._connection() as conn:
             total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
             by_agent = {
@@ -1694,8 +1674,6 @@ class AuditDB:
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()
             schema_version = ver_row[0] if ver_row and ver_row[0] is not None else 0
-        finally:
-            self._put_conn(conn)
 
         return {
             "total_events": total,

@@ -30,6 +30,7 @@ from panoptes.policy import (
     POLICY_FAILURE_MODES,
     PolicyEngine,
     PolicyResult,
+    _policy_result_context,
 )
 from panoptes.schema import (
     normalize_event,
@@ -221,14 +222,9 @@ class AuditPlugin:
         decision["context"]["decision_kind"] = "tool_authorization"
         decision["context"]["source_event_id"] = event["event_id"]
         decision["context"]["source_event_type"] = event["event_type"]
-        decision["context"]["policy"] = {
-            "action": result.action,
-            "matched_policies": result.matched_policies,
-            "violated_policies": result.violated_policies,
-            "evaluation_errors": result.evaluation_errors,
-            "snapshot_id": result.policy_snapshot_id,
-            "semantics_version": result.policy_engine_semantics_version,
-        }
+        decision["context"]["policy"] = _policy_result_context(
+            result, semantics_key="semantics_version"
+        )
         if result.action == "block":
             message = _block_message(result)
             decision["outcome"] = {"status": "blocked", "summary": message}

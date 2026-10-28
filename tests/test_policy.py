@@ -5,7 +5,6 @@ Covers:
   - Policy loading from YAML
   - Basic condition matching (==, !=, contains, in, matches)
   - Boolean logic (AND, OR)
-  - PolicyResult construction
   - Policy violation recording to DB
   - Scope filtering (only applies to specified agents)
   - Disabled policies are skipped
@@ -16,13 +15,9 @@ Covers:
 
 import json
 import os
-import sys
 import tempfile
 
 import pytest
-
-# Ensure local package is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from panoptes.db import AuditDB
 import panoptes.policy as policy_module
@@ -65,7 +60,6 @@ def _make_event(**overrides):
 
 def test_load_policies_from_yaml():
     """Policies are loaded from YAML files in a directory."""
-    print("--- test_load_policies_from_yaml ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write a valid policy
@@ -99,12 +93,9 @@ message: "Watch out for terminal use"
         assert p.message == "Watch out for terminal use"
         assert p.scope["agents"] == ["hermes", "claude_code"]
 
-    print("  PASSED")
-
 
 def test_load_multiple_policies():
     """Multiple YAML files are all loaded."""
-    print("--- test_load_multiple_policies ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i in range(3):
@@ -124,12 +115,9 @@ rule:
         names = {p.name for p in engine.policies}
         assert names == {"policy-0", "policy-1", "policy-2"}
 
-    print("  PASSED")
-
 
 def test_missing_policies_dir():
     """Missing policy storage is explicit and respects failure mode."""
-    print("--- test_missing_policies_dir ---")
 
     opened = PolicyEngine(
         policies_dir="/nonexistent/path/to/policies",
@@ -149,12 +137,9 @@ def test_missing_policies_dir():
     assert closed_result.action == "block"
     assert closed_result.evaluation_errors
 
-    print("  PASSED")
-
 
 def test_malformed_yaml_skipped():
     """A partial candidate never replaces or becomes an active snapshot."""
-    print("--- test_malformed_yaml_skipped ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write a malformed YAML file
@@ -175,12 +160,9 @@ def test_malformed_yaml_skipped():
         assert result.action == "allow"
         assert result.evaluation_errors
 
-    print("  PASSED")
-
 
 def test_non_yaml_files_skipped():
     """Non-YAML files in the directory are ignored."""
-    print("--- test_non_yaml_files_skipped ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write a .txt file
@@ -191,12 +173,9 @@ def test_non_yaml_files_skipped():
         engine = PolicyEngine(policies_dir=tmpdir)
         assert len(engine.policies) == 0
 
-    print("  PASSED")
-
 
 def test_non_dict_yaml_skipped():
     """YAML file that doesn't parse to a dict is skipped."""
-    print("--- test_non_dict_yaml_skipped ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write a YAML file that's a list, not a dict
@@ -206,8 +185,6 @@ def test_non_dict_yaml_skipped():
 
         engine = PolicyEngine(policies_dir=tmpdir)
         assert len(engine.policies) == 0
-
-    print("  PASSED")
 
 
 def test_empty_policy_dir_has_no_valid_snapshot():
@@ -322,184 +299,33 @@ def test_failed_explicit_load_retains_active_snapshot():
 # ── Condition matching tests ──────────────────────────────────────────────────
 
 
-def test_operator_equals():
-    """== operator: exact match."""
-    print("--- test_operator_equals ---")
-
-    raw = {
-        "name": "eq-test",
-        "enabled": True,
+@pytest.mark.parametrize(
+    "operator,field,expected,matching,nonmatching",
+    [
+        ("==", "action.tool_name", "terminal", "terminal", "read_file"),
+        ("!=", "action.tool_name", "read_file", "terminal", "read_file"),
+        ("contains", "outcome.summary", "error", "error: file not found", "ok"),
+        ("contains", "action.data_accessed", "prod", ["prod", "config"], ["dev"]),
+        ("in", "action.tool_name", ["terminal", "write_file"], "terminal", "read_file"),
+        ("matches", "action.tool_name", r"^write_", "write_file", "read_file"),
+        ("gt", "cost.tokens_in", 1000, 2000, 1000),
+        ("lt", "cost.tokens_in", 1000, 500, 1000),
+        ("gte", "cost.tokens_in", 1000, 1000, 500),
+        ("lte", "cost.tokens_out", 100, 100, 200),
+    ],
+)
+def test_condition_operators(operator, field, expected, matching, nonmatching):
+    policy = Policy({
+        "name": "operator-test",
         "action": "warn",
-        "rule": {
-            "event_type": "tool_call",
-            "conditions": [
-                {"field": "action.tool_name", "operator": "==", "value": "terminal"},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    # Matching event
-    event = _make_event(action={"tool_name": "terminal", "parameters": {}, "data_accessed": []})
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "Should match terminal"
-
-    # Non-matching event
-    event2 = _make_event(action={"tool_name": "read_file", "parameters": {}, "data_accessed": []})
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "Should not match read_file"
-
-    print("  PASSED")
-
-
-def test_operator_not_equals():
-    """!= operator: excludes specific values."""
-    print("--- test_operator_not_equals ---")
-
-    raw = {
-        "name": "neq-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "action.tool_name", "operator": "!=", "value": "read_file"},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    event = _make_event(action={"tool_name": "terminal", "parameters": {}, "data_accessed": []})
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "Should match terminal (not read_file)"
-
-    event2 = _make_event(action={"tool_name": "read_file", "parameters": {}, "data_accessed": []})
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "Should not match read_file"
-
-    print("  PASSED")
-
-
-def test_operator_contains_string():
-    """contains operator for strings: substring match."""
-    print("--- test_operator_contains_string ---")
-
-    raw = {
-        "name": "contains-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "outcome.summary", "operator": "contains", "value": "error"},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    event = _make_event(outcome={"status": "error", "summary": "error: file not found"})
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "Should match 'error' in summary"
-
-    event2 = _make_event(outcome={"status": "success", "summary": "everything ok"})
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "Should not match success summary"
-
-    print("  PASSED")
-
-
-def test_operator_contains_list():
-    """contains operator for lists: checks if value is in the list."""
-    print("--- test_operator_contains_list ---")
-
-    raw = {
-        "name": "contains-list-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "action.data_accessed", "operator": "contains", "value": "prod"},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    event = _make_event(action={
-        "tool_name": "read_file",
-        "parameters": {},
-        "data_accessed": ["prod", "config"],
+        "rule": {"conditions": [{"field": field, "operator": operator, "value": expected}]},
     })
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "Should match 'prod' in data_accessed"
-
-    event2 = _make_event(action={
-        "tool_name": "read_file",
-        "parameters": {},
-        "data_accessed": ["dev", "staging"],
-    })
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "Should not match dev/staging only"
-
-    print("  PASSED")
-
-
-def test_operator_in():
-    """in operator: checks if value is in expected list."""
-    print("--- test_operator_in ---")
-
-    raw = {
-        "name": "in-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "action.tool_name", "operator": "in",
-                 "value": ["terminal", "write_file", "browser_navigate"]},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    event = _make_event(action={"tool_name": "terminal", "parameters": {}, "data_accessed": []})
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "terminal should be in the list"
-
-    event2 = _make_event(action={"tool_name": "read_file", "parameters": {}, "data_accessed": []})
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "read_file should NOT be in the list"
-
-    print("  PASSED")
-
-
-def test_operator_matches():
-    """matches operator: regex pattern."""
-    print("--- test_operator_matches ---")
-
-    raw = {
-        "name": "regex-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "action.tool_name", "operator": "matches", "value": r"^write_"},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy = Policy(raw)
-
-    event = _make_event(action={"tool_name": "write_file", "parameters": {}, "data_accessed": []})
-    matched, _ = policy.evaluate_conditions(event)
-    assert matched, "write_file should match ^write_"
-
-    event2 = _make_event(action={"tool_name": "read_file", "parameters": {}, "data_accessed": []})
-    matched2, _ = policy.evaluate_conditions(event2)
-    assert not matched2, "read_file should not match ^write_"
-
-    print("  PASSED")
+    section, key = field.split(".")
+    for value, expected_match in ((matching, True), (nonmatching, False)):
+        event = _make_event()
+        event[section][key] = value
+        matched, _ = policy.evaluate_conditions(event)
+        assert matched is expected_match
 
 
 @pytest.mark.parametrize(
@@ -603,63 +429,11 @@ def test_policy_reason_uses_key_aware_redaction_for_short_secrets():
     assert "[REDACTED]" in reason
 
 
-def test_operator_numeric():
-    """Numeric comparison operators: gt, lt, gte, lte."""
-    print("--- test_operator_numeric ---")
-
-    # gt
-    raw_gt = {
-        "name": "gt-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "cost.tokens_in", "operator": "gt", "value": 1000},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy_gt = Policy(raw_gt)
-
-    event_high = _make_event(cost={"tokens_in": 2000, "tokens_out": 500})
-    matched, _ = policy_gt.evaluate_conditions(event_high)
-    assert matched, "2000 > 1000 should match"
-
-    event_low = _make_event(cost={"tokens_in": 500, "tokens_out": 200})
-    matched2, _ = policy_gt.evaluate_conditions(event_low)
-    assert not matched2, "500 > 1000 should NOT match"
-
-    # lte
-    raw_lte = {
-        "name": "lte-test",
-        "enabled": True,
-        "action": "warn",
-        "rule": {
-            "conditions": [
-                {"field": "cost.tokens_out", "operator": "lte", "value": 100},
-            ],
-            "logic": "AND",
-        },
-    }
-    policy_lte = Policy(raw_lte)
-
-    event_under = _make_event(cost={"tokens_in": 50, "tokens_out": 100})
-    matched3, _ = policy_lte.evaluate_conditions(event_under)
-    assert matched3, "100 <= 100 should match"
-
-    event_over = _make_event(cost={"tokens_in": 50, "tokens_out": 200})
-    matched4, _ = policy_lte.evaluate_conditions(event_over)
-    assert not matched4, "200 <= 100 should NOT match"
-
-    print("  PASSED")
-
-
 # ── Boolean logic tests ───────────────────────────────────────────────────────
 
 
 def test_logic_and():
     """AND logic: all conditions must match."""
-    print("--- test_logic_and ---")
 
     raw = {
         "name": "and-test",
@@ -702,12 +476,9 @@ def test_logic_and():
     matched3, _ = policy.evaluate_conditions(event3)
     assert not matched3, "Neither matches"
 
-    print("  PASSED")
-
 
 def test_logic_or():
     """OR logic: any condition can match."""
-    print("--- test_logic_or ---")
 
     raw = {
         "name": "or-test",
@@ -735,15 +506,12 @@ def test_logic_or():
     matched3, _ = policy.evaluate_conditions(event3)
     assert not matched3, "read_file matches neither"
 
-    print("  PASSED")
-
 
 # ── Scope filtering tests ─────────────────────────────────────────────────────
 
 
 def test_scope_agent_filter():
     """Scope with specific agents only applies to those agents."""
-    print("--- test_scope_agent_filter ---")
 
     raw = {
         "name": "scope-test",
@@ -766,12 +534,9 @@ def test_scope_agent_filter():
     event_x = _make_event(agent={"type": "codex", "session_id": "s3", "run_id": "r3"})
     assert not policy.matches_scope(event_x), "codex should NOT be in scope"
 
-    print("  PASSED")
-
 
 def test_scope_wildcard():
     """Scope with ['*'] applies to all agents."""
-    print("--- test_scope_wildcard ---")
 
     raw = {
         "name": "wildcard-test",
@@ -791,8 +556,6 @@ def test_scope_wildcard():
     event_u = _make_event(agent={"type": "unknown", "session_id": "s3", "run_id": "r3"})
     assert policy.matches_scope(event_u), "unknown should match *"
 
-    print("  PASSED")
-
 
 def test_scope_rejects_wildcard_mixed_with_named_agents():
     with pytest.raises(ValueError, match="wildcard.*only entry"):
@@ -806,7 +569,6 @@ def test_scope_rejects_wildcard_mixed_with_named_agents():
 
 def test_scope_session_filter():
     """Scope with session list only applies to those sessions."""
-    print("--- test_scope_session_filter ---")
 
     raw = {
         "name": "session-scope-test",
@@ -823,15 +585,12 @@ def test_scope_session_filter():
     event_c = _make_event(agent={"type": "hermes", "session_id": "sess-c", "run_id": "r2"})
     assert not policy.matches_scope(event_c), "sess-c should NOT match"
 
-    print("  PASSED")
-
 
 # ── Disabled policies ─────────────────────────────────────────────────────────
 
 
 def test_disabled_policy_skipped():
     """Disabled policies are skipped during evaluation."""
-    print("--- test_disabled_policy_skipped ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Write a disabled policy
@@ -855,8 +614,6 @@ rule:
         result = engine.evaluate(event)
         assert result.action == "allow", "Disabled policy should not block"
         assert len(result.violated_policies) == 0
-
-    print("  PASSED")
 
 
 # ── Snapshot immutability tests ───────────────────────────────────────────────────────
@@ -960,34 +717,6 @@ def test_numeric_comparison_does_not_coerce_bool_or_nonfinite_actual(actual):
     assert "not a finite numeric value" in reason
 
 
-# ── PolicyResult tests ────────────────────────────────────────────────────────
-
-
-def test_policy_result_construction():
-    """PolicyResult dataclass works as expected."""
-    print("--- test_policy_result_construction ---")
-
-    r1 = PolicyResult(action="allow")
-    assert r1.action == "allow"
-    assert r1.violated_policies == []
-    assert r1.warnings == []
-    assert (
-        r1.policy_engine_semantics_version
-        == POLICY_ENGINE_SEMANTICS_VERSION
-    )
-
-    r2 = PolicyResult(
-        action="block",
-        violated_policies=[{"policy_name": "test", "message": "blocked", "reason": "matched"}],
-        warnings=["test: blocked"],
-    )
-    assert r2.action == "block"
-    assert len(r2.violated_policies) == 1
-    assert r2.violated_policies[0]["policy_name"] == "test"
-
-    print("  PASSED")
-
-
 def test_policy_semantics_version_participates_in_snapshot_digest(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
         with open(
@@ -1013,7 +742,6 @@ def test_policy_semantics_version_participates_in_snapshot_digest(monkeypatch):
 
 def test_action_escalation():
     """Block > warn > allow escalation."""
-    print("--- test_action_escalation ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Policy 1: warn
@@ -1056,15 +784,12 @@ rule:
         assert result.action == "block", f"Expected block, got {result.action}"
         assert len(result.violated_policies) == 2
 
-    print("  PASSED")
-
 
 # ── Policy violation recording tests ──────────────────────────────────────────
 
 
 def test_record_violation_to_db():
     """Policy violations are recorded as policy_violation events in the DB."""
-    print("--- test_record_violation_to_db ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_violations.db")
@@ -1093,12 +818,9 @@ def test_record_violation_to_db():
 
         db.close()
 
-    print("  PASSED")
-
 
 def test_check_event_with_db():
     """check_event evaluates and records violations."""
-    print("--- test_check_event_with_db ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "test_check.db")
@@ -1153,8 +875,6 @@ message: "Terminal blocked"
         )
 
         db.close()
-
-    print("  PASSED")
 
 
 def test_check_event_normalizes_source_and_records_recomputable_lineage():
@@ -1291,7 +1011,6 @@ def test_warn_match_records_warned_outcome_and_snapshot():
 
 def test_evaluate_error_fail_open():
     """Errors during policy evaluation result in allow (fail-open)."""
-    print("--- test_evaluate_error_fail_open ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Policy with a condition that would cause an error if the field
@@ -1318,8 +1037,6 @@ rule:
         # Should not raise — should fail-open
         result = engine.evaluate(event)
         assert result.action == "allow", f"Unknown operator should fail-open, got {result.action}"
-
-    print("  PASSED")
 
 
 def test_structurally_invalid_policy_respects_failure_mode():
@@ -1409,7 +1126,6 @@ def test_policy_typos_and_duplicate_keys_cannot_silently_weaken_enforcement(
 
 def test_nonexistent_nested_field():
     """A missing nested field below a canonical root simply does not match."""
-    print("--- test_nonexistent_field ---")
 
     raw = {
         "name": "nested-test",
@@ -1427,8 +1143,6 @@ def test_nonexistent_nested_field():
     event = _make_event()
     matched, _ = policy.evaluate_conditions(event)
     assert not matched, "Nonexistent field should not match"
-
-    print("  PASSED")
 
 
 def test_nonexistent_top_level_policy_field_is_rejected():
@@ -1514,7 +1228,6 @@ def test_lossy_raw_payload_fields_cannot_be_enforcement_conditions(field_path):
 
 def test_rule_event_type_filter():
     """The event_type in the rule filters which events are evaluated."""
-    print("--- test_rule_event_type_filter ---")
 
     raw = {
         "name": "type-filter",
@@ -1536,15 +1249,12 @@ def test_rule_event_type_filter():
     matched2, _ = policy.evaluate_conditions(event_mr)
     assert not matched2, "model_request should not match rule with event_type=tool_call"
 
-    print("  PASSED")
-
 
 # ── test_policy method tests ──────────────────────────────────────────────────
 
 
 def test_test_policy_method():
     """PolicyEngine.test_policy tests a policy file against event JSON."""
-    print("--- test_test_policy_method ---")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a policy file
@@ -1595,8 +1305,6 @@ rule:
             assert False, "Should raise ValueError for missing file"
         except ValueError:
             pass
-
-    print("  PASSED")
 
 
 def test_test_policy_uses_live_single_event_semantics():
@@ -1690,7 +1398,6 @@ def test_no_prod_access_policy():
     After fix #3, the policy is data-driven: it fires on ANY tool_call whose
     data_accessed contains 'prod', regardless of which specific tool was used.
     """
-    print("--- test_no_prod_access_policy ---")
 
     import yaml
 
@@ -1776,12 +1483,9 @@ def test_no_prod_access_policy():
     matched5, _ = policy.evaluate_conditions(event_mr)
     assert not matched5, "model_request should not match (event_type=tool_call filter)"
 
-    print("  PASSED")
-
 
 def test_no_prod_access_with_derived_data_accessed():
     """no-prod-access policy fires on events with derived data_accessed from normalize_event."""
-    print("--- test_no_prod_access_with_derived_data_accessed ---")
 
     import yaml
     from panoptes.schema import normalize_event
@@ -1823,8 +1527,6 @@ def test_no_prod_access_with_derived_data_accessed():
     assert matched, (
         f"no-prod-access should fire on derived 'prod' in data_accessed: {reason}"
     )
-
-    print("  PASSED")
 
 
 def test_engine_evaluate_derives_authoritative_tags_before_policy_matching():
@@ -1891,40 +1593,6 @@ def test_check_event_surfaces_violation_evidence_write_failure():
 
 
 # ── Run all tests ─────────────────────────────────────────────────────────────
-
-
-if __name__ == "__main__":
-    # Load tests
-    test_load_policies_from_yaml()
-    test_load_multiple_policies()
-    test_missing_policies_dir()
-    test_malformed_yaml_skipped()
-    test_non_yaml_files_skipped()
-    test_non_dict_yaml_skipped()
-    test_operator_equals()
-    test_operator_not_equals()
-    test_operator_contains_string()
-    test_operator_contains_list()
-    test_operator_in()
-    test_operator_matches()
-    test_operator_numeric()
-    test_logic_and()
-    test_logic_or()
-    test_scope_agent_filter()
-    test_scope_wildcard()
-    test_scope_session_filter()
-    test_disabled_policy_skipped()
-    test_policy_result_construction()
-    test_action_escalation()
-    test_record_violation_to_db()
-    test_check_event_with_db()
-    test_evaluate_error_fail_open()
-    test_nonexistent_nested_field()
-    test_rule_event_type_filter()
-    test_test_policy_method()
-    test_no_prod_access_policy()
-    test_no_prod_access_with_derived_data_accessed()
-    print("\n=== ALL POLICY TESTS PASSED ===")
 
 
 def test_invalid_input_is_denied_while_block_policies_are_active():

@@ -57,7 +57,7 @@ from panoptes.credentials import (
     TokenRejected,
 )
 from panoptes.db import AuditDB
-from panoptes.policy import PolicyEngine, PolicyResult
+from panoptes.policy import PolicyEngine, PolicyResult, _policy_result_context
 from panoptes.schema import (
     ALLOWED_AGENT_TYPES,
     ValidationError,
@@ -996,20 +996,9 @@ class AuditEventWriter:
     @staticmethod
     def _attach_policy_result(event: dict, result: PolicyResult) -> None:
         """Persist the exact decision provenance alongside the checked event."""
-        event.setdefault("context", {})["policy"] = {
-            "action": result.action,
-            "matched_policies": list(getattr(result, "matched_policies", [])),
-            "violated_policies": list(result.violated_policies),
-            "evaluation_errors": list(
-                getattr(result, "evaluation_errors", [])
-            ),
-            "snapshot_id": getattr(result, "policy_snapshot_id", None),
-            "engine_semantics_version": getattr(
-                result,
-                "policy_engine_semantics_version",
-                None,
-            ),
-        }
+        event.setdefault("context", {})["policy"] = _policy_result_context(
+            result, semantics_key="engine_semantics_version"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2155,6 +2144,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     ) -> None:
         """Buffered path: forward, audit, optionally replace a blocked response."""
         writer = self.writer
+
+        def build_inspection_failure(
+            message: str,
+            *,
+            status: int,
+            headers: dict,
+            blocked: bool,
+            truncated: bool = False,
+        ) -> list[dict]:
+            events = writer.build_response_events(
+                path=path, req_body=req_body, resp_status=status,
+                resp_headers=headers, resp_body=None,
+                duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+            )
+            _mark_inspection_failure(
+                events, message, blocked=blocked, truncated=truncated
+            )
+            return events
+
         try:
             resp_status, resp_headers_raw, resp_body_bytes = self._forward_request(
                 method, scheme, host, port, path, req_headers, body,
@@ -2167,17 +2175,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 f"{exc.limit}-byte inspection limit"
             )
             if writer:
-                resp_events = writer.build_response_events(
-                    path=path,
-                    req_body=req_body,
-                    resp_status=exc.upstream_status or 502,
-                    resp_headers=exc.upstream_headers,
-                    resp_body=None,
-                    duration_ms=duration_ms,
-                    exchange_ctx=exchange_ctx,
-                )
-                _mark_inspection_failure(
-                    resp_events, message, blocked=True, truncated=True
+                resp_events = build_inspection_failure(
+                    message,
+                    status=exc.upstream_status or 502,
+                    headers=exc.upstream_headers, blocked=True, truncated=True,
                 )
                 try:
                     writer.write(
@@ -2226,19 +2227,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             message = (
                 "Upstream response denied because it could not be safely inspected"
             )
-            resp_events = writer.build_response_events(  # type: ignore[union-attr]
-                path=path,
-                req_body=req_body,
-                resp_status=resp_status,
-                resp_headers=resp_headers_raw,
-                resp_body=None,
-                duration_ms=duration_ms,
-                exchange_ctx=exchange_ctx,
-            )
-            _mark_inspection_failure(
-                resp_events,
+            resp_events = build_inspection_failure(
                 f"{message}: {inspection_error}",
-                blocked=True,
+                status=resp_status, headers=resp_headers_raw, blocked=True,
             )
             resp_status = 502
             resp_body_bytes = json.dumps({
@@ -2326,19 +2317,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 )
                 log.warning("%s: %s", message, exc)
                 try:
-                    fallback_events = writer.build_response_events(
-                        path=path,
-                        req_body=req_body,
-                        resp_status=resp_status,
-                        resp_headers=resp_headers_raw,
-                        resp_body=None,
-                        duration_ms=duration_ms,
-                        exchange_ctx=exchange_ctx,
-                    )
-                    _mark_inspection_failure(
-                        fallback_events,
+                    fallback_events = build_inspection_failure(
                         f"{message}: {exc}",
-                        blocked=True,
+                        status=resp_status, headers=resp_headers_raw, blocked=True,
                     )
                     writer.write(
                         _unpersisted_exchange_events(
@@ -2378,18 +2359,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         else None
                     )
                     try:
-                        resp_events = writer.build_response_events(
-                            path=path,
-                            req_body=req_body,
-                            resp_status=resp_status,
-                            resp_headers=resp_headers_raw,
-                            resp_body=None,
-                            duration_ms=duration_ms,
-                            exchange_ctx=exchange_ctx,
-                        )
-                        _mark_inspection_failure(
-                            resp_events,
+                        resp_events = build_inspection_failure(
                             f"Response event construction failed: {exc}",
+                            status=resp_status, headers=resp_headers_raw,
                             blocked=failure is not None,
                         )
                     except Exception:

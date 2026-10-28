@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
+from panoptes._json import _strict_json_loads
 from panoptes.schema import (
     ALLOWED_AGENT_TYPES,
     ALLOWED_EVENT_TYPES,
@@ -177,26 +178,6 @@ _UniqueKeySafeLoader.add_constructor(
 )
 
 
-def _strict_json_loads(payload: str) -> Any:
-    """Parse JSON without duplicate keys or non-finite numeric extensions."""
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict:
-        result: dict = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate JSON key {key!r}")
-            result[key] = value
-        return result
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"non-finite JSON number {value!r}")
-
-    return json.loads(
-        payload,
-        object_pairs_hook=unique_object,
-        parse_constant=reject_constant,
-    )
-
-
 # ── PolicyResult ─────────────────────────────────────────────────────────────
 
 
@@ -211,6 +192,18 @@ class PolicyResult:
     matched_policies: list[dict] = field(default_factory=list)
     policy_snapshot_id: str | None = None
     policy_engine_semantics_version: int = POLICY_ENGINE_SEMANTICS_VERSION
+
+
+def _policy_result_context(result: PolicyResult, *, semantics_key: str) -> dict:
+    """Serialize decision provenance using the adapter's established field name."""
+    return {
+        "action": result.action,
+        "matched_policies": list(getattr(result, "matched_policies", [])),
+        "violated_policies": list(result.violated_policies),
+        "evaluation_errors": list(getattr(result, "evaluation_errors", [])),
+        "snapshot_id": getattr(result, "policy_snapshot_id", None),
+        semantics_key: getattr(result, "policy_engine_semantics_version", None),
+    }
 
 
 def _sanitize_reason(reason: str) -> str:

@@ -353,6 +353,11 @@ The tests are local and network-independent. A change is ready to review when
 the full suite passes and `git diff --check` is clean. Release ownership and
 the tagged publishing flow are documented in [RELEASING.md](RELEASING.md).
 
+Focus tests on observable behavior: capture, policy decisions, credential
+handling, audit storage and integrity, and CLI flows. Use shared setup and
+parameterized cases for repeated inputs. Test helpers through those behaviors
+unless a separate test protects a distinct security or data-loss boundary.
+
 ## Contributing
 
 Bug reports, protocol fixtures, and focused adapters are welcome. The most
