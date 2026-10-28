@@ -306,3 +306,174 @@ def test_policy_add_refuses_a_file_that_breaks_the_policy_set(tmp_path, capsys):
     assert exc.value.code == 1
     assert "--force" in capsys.readouterr().out
     main(["policy", "add", str(good), "--policies-dir", str(policies), "--force"])
+
+
+@pytest.fixture
+def doctor_policies(tmp_path):
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    (policies / "block.yaml").write_text(
+        "name: block-bash\naction: block\nrule:\n  conditions:\n"
+        "    - field: action.tool_name\n      operator: ==\n      value: bash\n",
+        encoding="utf-8",
+    )
+    return policies
+
+
+def test_doctor_checks_setup_without_writes_or_exposing_keys(
+    tmp_path, doctor_policies, monkeypatch, capsys,
+):
+    from panoptes.credentials import PROVIDER_KEY_ENV
+
+    db_path = tmp_path / "audit.db"
+    _write_events(db_path, "recent-event")
+    before = db_path.read_bytes()
+    mode = db_path.stat().st_mode
+    for variable in PROVIDER_KEY_ENV.values():
+        monkeypatch.delenv(variable, raising=False)
+    key = "sk-proj-fake-doctor-provider-key-0123456789"
+    monkeypatch.setenv("PANOPTES_OPENAI_API_KEY", key)
+    monkeypatch.setattr(AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events"))
+
+    main([
+        "doctor", "--db-path", str(db_path), "--policies-dir", str(doctor_policies),
+        "--inject-credentials", "--policy-failure-mode", "fail_closed",
+    ])
+
+    captured = capsys.readouterr()
+    assert "[OK] Database: schema 4, 1 events" in captured.out
+    assert "Last audit event: 2026-07-17" in captured.out
+    assert "[OK] Policies: 1 loaded; snapshot" in captured.out
+    assert "model-API policy gate" in captured.out
+    assert "buffered before delivery" in captured.out
+    assert "[OK] Credentials: configured for openai" in captured.out
+    assert "client routing, and direct egress are not verified" in captured.out
+    assert key not in captured.out + captured.err
+    assert db_path.read_bytes() == before
+    assert db_path.stat().st_mode == mode
+
+
+def test_doctor_reports_all_setup_failures_without_creating_paths(tmp_path, monkeypatch, capsys):
+    from panoptes.credentials import PROVIDER_KEY_ENV
+
+    for variable in PROVIDER_KEY_ENV.values():
+        monkeypatch.delenv(variable, raising=False)
+    db_path = tmp_path / "missing.db"
+    policies = tmp_path / "missing-policies"
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "doctor", "--db-path", str(db_path), "--policies-dir", str(policies),
+            "--inject-credentials",
+        ])
+    assert exc.value.code == 2
+    output = capsys.readouterr().out
+    assert "[ERROR] Database" in output
+    assert "[ERROR] Policies" in output
+    assert "[ERROR] Credentials" in output
+    assert "policy configuration invalid; fail_open" in output
+    assert not db_path.exists()
+    assert not policies.exists()
+
+
+def test_doctor_observation_mode_and_unsafe_credentials_file(tmp_path, capsys):
+    db_path = tmp_path / "audit.db"
+    AuditDB(str(db_path)).close()
+    policies = tmp_path / "policies"
+    policies.mkdir()
+    (policies / "allow.yaml").write_text("name: observe\naction: allow\nrule:\n  conditions: []\n")
+    argv = ["doctor", "--db-path", str(db_path), "--policies-dir", str(policies)]
+    main(argv)
+    output = capsys.readouterr().out
+    assert "model-API observation" in output
+    assert "[WARN] Capture: no recorded activity" in output
+    assert "Credential injection disabled" in output
+
+    credentials = tmp_path / "credentials.yaml"
+    credentials.write_text("openai: sk-proj-fake-doctor-provider-key-0123456789\n")
+    credentials.chmod(0o644)
+    before = credentials.read_bytes()
+    with pytest.raises(SystemExit) as exc:
+        main([*argv, "--inject-credentials", "--credentials-file", str(credentials)])
+    assert exc.value.code == 2
+    output = capsys.readouterr().out
+    assert "[ERROR] Credentials:" in output
+    assert "chmod 600" in output
+    assert "sk-proj-" not in output
+    assert credentials.read_bytes() == before
+    assert credentials.stat().st_mode & 0o777 == 0o644
+
+
+def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys):
+    from panoptes.capture import PROXY_CAPABILITIES
+
+    db_path = tmp_path / "audit.db"
+    db = AuditDB(str(db_path))
+    events = []
+    for event_id, kind, status in (
+        ("request", "model_request", "success"),
+        ("proposal", "tool_call", "pending"),
+        ("decision", "decision_point", "blocked"),
+        ("result", "tool_result", "error"),
+    ):
+        event = _event(event_id)
+        event["event_type"] = kind
+        event["action"] = {
+            "tool_name": "bash", "call_id": "call-1",
+            "parameters": {"command": "echo hello"},
+        }
+        event["outcome"] = {"status": status, "summary": "Run bash\n\x1b[31m sk-proj-fake-secret-01234567890123456789"}
+        event["context"] = {"capture": PROXY_CAPABILITIES.as_context()}
+        if kind == "model_request":
+            event["context"]["policy"] = "adapter-defined extension"
+        if kind == "tool_call":
+            event["action"]["execution_scope"] = {}
+        if kind == "decision_point":
+            event["context"].update({
+                "decision_kind": "tool_authorization", "source_event_id": "proposal",
+                "policy": {"action": "block", "matched_policies": [{"policy_name": "no-bash"}]},
+            })
+        if kind == "tool_result":
+            event["action"]["duration_ms"] = 123
+            event["context"]["capture"]["inspection_status"] = "incomplete"
+        events.append(event)
+    db.insert_events(events)
+    db.close()
+    before = db_path.read_bytes()
+
+    main(["session", "s1", "--db-path", str(db_path)])
+    output = capsys.readouterr().out
+    assert "4 of 4 events" in output
+    assert output.index("id=request") < output.index("id=proposal") < output.index("id=decision") < output.index("id=result")
+    assert "authorization bash  BLOCKED" in output
+    assert "execution=not observed" in output
+    assert "execution=client-reported" in output
+    assert "(123 ms)" in output
+    assert "event policy=block [no-bash]" in output
+    assert "command=echo hello" in output
+    assert "call=call-1" in output and "source=proposal" in output and "run=r1" in output
+    assert "inspection=incomplete" in output
+    assert "\x1b" not in output
+    assert "sk-proj-fake-secret" not in output
+    assert db_path.read_bytes() == before
+
+
+def test_session_partial_selection_json_and_empty_session(tmp_path, capsys):
+    db_path = tmp_path / "audit.db"
+    _write_events(db_path, "one", "two", "three")
+    argv = ["session", "s1", "--db-path", str(db_path), "--limit", "2"]
+    main(argv)
+    output = capsys.readouterr().out
+    assert "2 of 3 events; showing the newest 2; partial timeline" in output
+    assert "id=one" not in output
+    assert output.index("id=two") < output.index("id=three")
+
+    main([*argv, "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["selected_count"] == 2 and data["matching_count"] == 3
+    assert data["partial"] is True
+    assert [event["event_id"] for event in data["events"]] == ["two", "three"]
+
+    main(["session", "missing", "--db-path", str(db_path), "--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["events"] == [] and data["matching_count"] == 0
+    assert data["partial"] is False

@@ -7,6 +7,13 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ### Added
 
+- `panoptes doctor` checks local database access, policy configuration, optional
+  credential injection setup, and recent audit activity without modifying audit
+  data or contacting providers. Reports requested settings separately from
+  unverified running-proxy and client-routing state.
+- `panoptes session` displays a chronological CLI timeline with policy decisions,
+  execution provenance, durations, and correlation IDs. `--limit` bounds the
+  newest selection; `--json` returns full events and selection counts.
 - Credential injection for the reverse proxy. With `--inject-credentials`,
   provider API keys load from `PANOPTES_<PROVIDER>_API_KEY` or an owner-only
   `--credentials-file` and never reach the agent. Agents present a Panoptes

@@ -148,6 +148,8 @@ cannot be stored is denied.
 panoptes query --agent hermes --event-type agent_step --limit 50
 panoptes query --agent hermes --event-type decision_point --limit 50
 panoptes session <session-id>
+panoptes session <session-id> --limit 50
+panoptes session <session-id> --json
 panoptes evidence <event-id>
 
 # Verify local hash links and export a checkpoint for separate storage
@@ -161,6 +163,38 @@ panoptes verify --checkpoint checkpoint.json
 Read-only database commands require an existing initialized audit database. A
 missing, mistyped, or empty `--db-path` exits with status 2 instead of creating
 a new database.
+
+`session` shows a chronological timeline with event status, tool or model,
+available duration, policy decisions, and event/run/call IDs. Model proposals
+and authorizations remain distinct from reported execution outcomes. Policy
+labels describe each event separately: a blocked tool proposal can withhold its
+containing model response even when that response event matched no block. By default
+it selects up to 10,000 newest events; `--limit` selects fewer. Partial timelines
+state the selected and matching counts. `--json` returns full stored events
+with those counts and a `partial` flag.
+
+### Check your setup
+
+```bash
+panoptes doctor
+
+# Check the configuration you intend to use with the proxy
+panoptes doctor --policies-dir ~/.panoptes/policies \
+  --policy-failure-mode fail_closed --inject-credentials \
+  --credentials-file ~/.panoptes/credentials.yaml
+```
+
+Doctor checks an existing database and schema, policy validity, and provider-key
+configuration when credential injection is requested. It reports the latest
+audit timestamp and warns when history is empty or older than 24 hours.
+Credential values stay hidden. It opens the database read-only, does not repair
+files or attempt audit writes, and makes no provider requests. Exit status is
+0 when checks pass (warnings may remain), or 2 when a check fails.
+
+The reported proxy mode describes the supplied flags and current policy files.
+Doctor does not discover a running proxy's settings, prove client routing or
+credential isolation, or verify the hash chain; use `panoptes verify` for the
+chain check. A valid configuration alone does not establish enforcement.
 
 ## Architecture
 
@@ -305,8 +339,9 @@ they are supported.
 panoptes proxy          Start the loopback-only model-API reverse proxy
 panoptes --version      Show the installed Panoptes version
 panoptes status         Show event statistics
+panoptes doctor         Check local setup and requested proxy configuration
 panoptes query          Query events by agent, type, tool, or time
-panoptes session <id>   Show up to 10,000 newest session events
+panoptes session <id>   Show a chronological timeline (--limit N, --json)
 panoptes evidence <id>  Reconstruct a related decision path
 panoptes verify         Verify the local chain or a separately stored checkpoint
 panoptes checkpoint     Print the current chain checkpoint

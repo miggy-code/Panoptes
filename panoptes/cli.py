@@ -1,6 +1,7 @@
 """Panoptes CLI for adapter observations, local audit trails, and policy gates."""
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import time
 from panoptes import __version__
 from panoptes.db import AuditDB
 from panoptes.policy import DEFAULT_POLICIES_DIR, PolicyEngine
+from panoptes.schema import redact_secrets
 
 
 def _open_existing_db(db_path: str, *, read_only: bool = True) -> AuditDB:
@@ -58,6 +60,82 @@ def _open_existing_db(db_path: str, *, read_only: bool = True) -> AuditDB:
     except (sqlite3.Error, RuntimeError) as exc:
         print(f"Cannot open audit database {expanded}: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
+
+
+def _display_text(value, limit=180):
+    """Keep untrusted audit text redacted, bounded, and on one terminal line."""
+    text = str(redact_secrets(value))
+    text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def cmd_doctor(args):
+    """Inspect local setup without changing audit data or contacting a provider."""
+    from panoptes.credentials import CredentialConfigError, load_provider_keys
+
+    failed = False
+    print("Panoptes doctor — requested configuration (read-only)")
+    print("Running proxy settings, client routing, and direct egress are not verified.\n")
+    db = None
+    try:
+        db = _open_existing_db(args.db_path)
+        stats = db.get_stats()
+        print(f"[OK] Database: schema {stats['schema_version']}, {stats['total_events']} events")
+        latest = db.query(limit=1)
+        if latest:
+            event = latest[0]
+            timestamp = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+            stale = (datetime.now(timezone.utc) - timestamp).total_seconds() > 86400
+            status = "WARN" if stale else "INFO"
+            age = "; older than 24 hours" if stale else ""
+            print(f"[{status}] Last audit event: {_display_text(event['timestamp'])} ({_display_text(event['event_type'])}{age})")
+        else:
+            print("[WARN] Capture: no recorded activity; run a client through Panoptes first")
+        if not (os.access(os.path.expanduser(args.db_path), os.W_OK)
+                and os.access(Path(os.path.expanduser(args.db_path)).parent, os.W_OK)):
+            print("[WARN] Database write permissions unavailable; capture needs write access")
+        print("[INFO] No database write attempted; use 'panoptes verify' to check chain integrity")
+    except SystemExit as exc:
+        if exc.code != 2:
+            raise
+        print("[ERROR] Database unavailable; check --db-path or start the proxy to initialize it")
+        failed = True
+    except (sqlite3.Error, RuntimeError, ValueError) as exc:
+        print(f"[ERROR] Database: {_display_text(str(exc), limit=1200)}")
+        failed = True
+    finally:
+        if db is not None:
+            db.close()
+
+    engine = PolicyEngine(args.policies_dir, failure_mode=args.policy_failure_mode)
+    if engine.policy_snapshot_id is None:
+        print("[ERROR] Policies: no valid policy snapshot")
+        for error in engine.load_errors:
+            print(f"        {_display_text(error, limit=1200)}")
+        failed = True
+        mode = f"policy configuration invalid; {args.policy_failure_mode} applies to policy failures"
+    else:
+        print(f"[OK] Policies: {len(engine.policies)} loaded; snapshot {engine.policy_snapshot_id}")
+        mode = (
+            "model-API policy gate; streaming responses buffered before delivery"
+            if engine.has_blocking_policies or args.policy_failure_mode == "fail_closed"
+            else "model-API observation; streaming responses are audit-only"
+        )
+    print(f"[INFO] Requested proxy mode: {mode} ({args.policy_failure_mode})")
+    print("[INFO] Local tool blocking requires a host pre-tool authorizer that honors denials")
+
+    if args.inject_credentials:
+        try:
+            keys = load_provider_keys(args.credentials_file)
+            print(f"[OK] Credentials: configured for {', '.join(sorted(keys))}; values hidden")
+            print("[INFO] Agents must present Panoptes session tokens when injection is enabled")
+        except (CredentialConfigError, UnicodeError) as exc:
+            print(f"[ERROR] Credentials: {_display_text(str(exc), limit=1200)}")
+            failed = True
+    else:
+        print("[WARN] Credential injection disabled; client-held provider keys permit bypass")
+    if failed:
+        raise SystemExit(2)
 
 
 def cmd_query(args):
@@ -107,28 +185,107 @@ def cmd_status(args):
 
 
 def cmd_session(args):
-    """Show a bounded session timeline selection."""
+    """Show a bounded chronological timeline, or full events as JSON."""
     db = _open_existing_db(args.db_path)
-    events = db.get_session(args.session_id)
-    total_rows = db.aggregate(
-        group_by=[],
-        metrics=["count"],
-        session_id=args.session_id,
-    )
-    matching_total = int(total_rows[0]["count"]) if total_rows else 0
+    try:
+        events = db.query(session_id=args.session_id, limit=args.limit)
+        events.reverse()
+        total_rows = db.aggregate(
+            group_by=[], metrics=["count"], session_id=args.session_id,
+        )
+        matching_total = int(total_rows[0]["count"]) if total_rows else 0
+    finally:
+        db.close()
 
+    if args.json:
+        print(json.dumps({
+            "session_id": args.session_id,
+            "selected_count": len(events),
+            "matching_count": matching_total,
+            "partial": len(events) < matching_total,
+            "events": events,
+        }, indent=2))
+        return
     if not events:
-        print(f"No events found for session: {args.session_id}")
+        print(f"No events found for session: {_display_text(args.session_id)}")
         return
 
     selection = f"{len(events)} of {matching_total} events"
     if len(events) < matching_total:
-        selection += "; showing the newest 10,000"
-    print(f"Session: {args.session_id} ({selection})\n")
-    for i, e in enumerate(events, 1):
-        print(f"--- Event {i} ---")
-        print(json.dumps(e, indent=2, default=str))
-        print()
+        selection += f"; showing the newest {args.limit}; partial timeline"
+    print(f"Session: {_display_text(args.session_id)} ({selection})")
+    print("Chronological order; tool proposals and authorizations do not prove execution.")
+    print("Policy labels are per event; a blocked tool proposal can withhold its containing response.\n")
+    for event in events:
+        _print_timeline_event(event)
+
+
+def _print_timeline_event(event):
+    action = event.get("action") or {}
+    outcome = event.get("outcome") or {}
+    context = event.get("context") or {}
+    capture = context.get("capture") or {}
+    policy = context.get("policy")
+    if not isinstance(policy, dict):
+        policy = {}
+    kind = event["event_type"]
+    label = action.get("tool_name") or action.get("model") or ""
+    if kind == "decision_point":
+        label = f"authorization {label}" if context.get("decision_kind") == "tool_authorization" else label
+    duration = action.get("duration_ms")
+    timing = f" ({_display_text(duration)} ms)" if duration is not None else ""
+    print(
+        f"{_display_text(event['timestamp'])}  {_display_text(kind)}  "
+        f"{_display_text(label)}  "
+        f"{_display_text(outcome.get('status', 'unknown').upper())}{timing}"
+    )
+
+    refs = [f"id={event['event_id']}", f"run={event['agent'].get('run_id', '-')}"]
+    for name, value in (("call", action.get("call_id")), ("source", context.get("source_event_id"))):
+        if value:
+            refs.append(f"{name}={value}")
+    print("  " + _display_text("  ".join(refs), limit=1200))
+    details = []
+    parameters = action.get("parameters") or {}
+    for field in ("command", "file_path", "path"):
+        if isinstance(parameters.get(field), str):
+            details.append(_display_text(f"{field}={parameters[field]}"))
+    if action.get("target") and action["target"] != action.get("call_id"):
+        details.append(_display_text(f"target={action['target']}"))
+    if outcome.get("summary"):
+        details.append(_display_text(outcome["summary"]))
+    if policy.get("action"):
+        matches = policy.get("matched_policies")
+        names = ", ".join(
+            _display_text(match.get("policy_name", "unknown"))
+            for match in (matches if isinstance(matches, list) else [])
+            if isinstance(match, dict)
+        )
+        details.append(_display_text(f"event policy={policy['action']}" + (f" [{names}]" if names else "")))
+    elif context.get("policy_name"):
+        details.append(_display_text(f"event policy={context.get('policy_action', 'unknown')} [{context['policy_name']}]"))
+    if policy.get("evaluation_errors"):
+        details.append(_display_text(f"policy errors={policy['evaluation_errors']}"))
+    if capture.get("adapter"):
+        details.append(_display_text(f"via={capture['adapter']}"))
+    if kind in {"tool_call", "tool_result", "agent_step"}:
+        if action.get("execution_scope") in ("provider", "server"):
+            details.append("execution=provider-reported")
+        elif capture.get("adapter") == "http_proxy":
+            details.append("execution=client-reported" if kind == "tool_result" else "execution=not observed")
+        elif capture.get("adapter") == "hermes_authorizer":
+            details.append("execution=not observed")
+        elif capture.get("adapter") == "hermes_plugin":
+            details.append("execution=host-reported")
+        else:
+            details.append("execution=not verified")
+    if capture.get("inspection_status"):
+        details.append(_display_text(f"inspection={capture['inspection_status']}"))
+    if any(capture.get(key) for key in ("audit_body_truncated", "raw_request_truncated", "raw_response_truncated")):
+        details.append("capture=truncated")
+    if details:
+        print("  " + " | ".join(details))
+    print()
 
 
 def cmd_evidence(args):
@@ -451,6 +608,30 @@ def main(argv=None):
         help="Path to policy definitions directory",
     )
 
+    gate_opts = argparse.ArgumentParser(add_help=False)
+    gate_opts.add_argument(
+        "--policy-failure-mode",
+        choices=["fail_open", "fail_closed"],
+        default="fail_open",
+        help=(
+            "Allow or deny traffic when policy loading/evaluation fails "
+            "(default: fail_open)"
+        ),
+    )
+    gate_opts.add_argument(
+        "--inject-credentials",
+        action="store_true",
+        help=(
+            "Hold provider API keys in Panoptes and require a Panoptes session "
+            "token from agents (keys from PANOPTES_<PROVIDER>_API_KEY or "
+            "--credentials-file)"
+        ),
+    )
+    gate_opts.add_argument(
+        "--credentials-file",
+        help="Owner-only (0600) YAML mapping of provider name to API key",
+    )
+
     parser = argparse.ArgumentParser(
         prog="panoptes",
         description="Panoptes — adapter-based agent observability, local audit trails, and policy gates.",
@@ -464,7 +645,7 @@ def main(argv=None):
 
     # --- proxy ---
     proxy_parser = subparsers.add_parser(
-        "proxy", help="Start the model-API reverse proxy", parents=[db_opts, policy_opts]
+        "proxy", help="Start the model-API reverse proxy", parents=[db_opts, policy_opts, gate_opts]
     )
     proxy_parser.add_argument("--port", default=8081, type=int, help="Proxy listen port")
     proxy_parser.add_argument(
@@ -476,15 +657,7 @@ def main(argv=None):
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)",
     )
-    proxy_parser.add_argument(
-        "--policy-failure-mode",
-        choices=["fail_open", "fail_closed"],
-        default="fail_open",
-        help=(
-            "Allow or deny traffic when policy loading/evaluation fails "
-            "(default: fail_open)"
-        ),
-    )
+
     proxy_parser.add_argument(
         "--client-timeout",
         type=float,
@@ -497,18 +670,10 @@ def main(argv=None):
         default=64,
         help="Maximum simultaneous proxy requests (default: 64)",
     )
-    proxy_parser.add_argument(
-        "--inject-credentials",
-        action="store_true",
-        help=(
-            "Hold provider API keys in Panoptes and require a Panoptes session "
-            "token from agents (keys from PANOPTES_<PROVIDER>_API_KEY or "
-            "--credentials-file)"
-        ),
-    )
-    proxy_parser.add_argument(
-        "--credentials-file",
-        help="Owner-only (0600) YAML mapping of provider name to API key",
+
+    subparsers.add_parser(
+        "doctor", help="Check local setup and requested proxy configuration (read-only)",
+        parents=[db_opts, policy_opts, gate_opts],
     )
 
     # --- query ---
@@ -533,6 +698,8 @@ def main(argv=None):
         "session", help="Show up to 10,000 newest session events", parents=[db_opts]
     )
     session_parser.add_argument("session_id", help="Session ID to inspect")
+    session_parser.add_argument("--limit", type=int, default=10000, help="Newest events to show (1–10000; default: 10000)")
+    session_parser.add_argument("--json", action="store_true", help="Print full events and selection counts as JSON")
 
     # --- evidence ---
     evidence_parser = subparsers.add_parser(
@@ -620,6 +787,11 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
+    if args.command == "session" and not 1 <= args.limit <= 10000:
+        parser.error("--limit must be between 1 and 10000")
+    if args.command in {"proxy", "doctor"} and args.credentials_file and not args.inject_credentials:
+        parser.error("--credentials-file requires --inject-credentials")
+
     # Resolve policies_dir defaults where needed
     if hasattr(args, "policies_dir") and not args.policies_dir:
         args.policies_dir = DEFAULT_POLICIES_DIR
@@ -628,8 +800,6 @@ def main(argv=None):
         from panoptes.proxy import start_proxy
 
         provider_keys = None
-        if args.credentials_file and not args.inject_credentials:
-            parser.error("--credentials-file requires --inject-credentials")
         if args.inject_credentials:
             from panoptes.credentials import CredentialConfigError, load_provider_keys
 
@@ -675,6 +845,7 @@ def main(argv=None):
             policy_parser.print_help()
     else:
         commands = {
+            "doctor": cmd_doctor,
             "query": cmd_query,
             "status": cmd_status,
             "session": cmd_session,
