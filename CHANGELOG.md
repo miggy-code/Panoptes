@@ -42,8 +42,8 @@ All notable changes to Panoptes are recorded here. Releases follow
 - An event that fails normalization or validation is denied in both failure
   modes while any enabled block policy is active, so a caller cannot shape its
   input around a block. Without a block policy the failure mode still applies.
-- `verify`, `checkpoint`, `query`, `status`, `session`, `evidence`, and
-  `policy check` open the database read-only.
+- `verify`, `checkpoint`, `query`, `status`, `session`, `evidence`,
+  `policy check`, and `token list` open the database read-only.
 - `verify` reports a database whose events have no hash-chain metadata as
   invalid, and opening a schema v4 database whose chain metadata is missing
   raises `ChainIntegrityError` instead of starting a new chain.

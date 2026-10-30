@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import threading
 
 import httpx
@@ -493,6 +494,27 @@ def test_token_cli_issue_list_and_revoke(tmp_path, capsys):
 def test_proxy_cli_requires_flag_for_credentials_file(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["proxy", "--credentials-file", str(tmp_path / "keys.yaml")])
+
+
+@pytest.mark.parametrize("issued", [False, True])
+@pytest.mark.parametrize("mode", [0o444, 0o644])
+def test_token_list_does_not_write_or_change_permissions(tmp_path, capsys, issued, mode):
+    db_path = tmp_path / "audit.db"
+    db = AuditDB(str(db_path))
+    if issued:
+        SessionTokenStore(db).issue("claude_code", "read-only-session")
+    db.close()
+    db_path.chmod(mode)
+    before = db_path.read_bytes()
+
+    try:
+        cli.main(["token", "list", "--db-path", str(db_path)])
+        output = capsys.readouterr().out
+        assert ("read-only-session" if issued else "No tokens issued.") in output
+        assert stat.S_IMODE(db_path.stat().st_mode) == mode
+        assert db_path.read_bytes() == before
+    finally:
+        db_path.chmod(0o600)
 
 
 @pytest.mark.parametrize(

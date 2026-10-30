@@ -381,8 +381,11 @@ def cmd_token_list(args):
     """List Panoptes session tokens without their values."""
     from panoptes.credentials import SessionTokenStore
 
-    store = SessionTokenStore(_open_existing_db(args.db_path, read_only=False))
-    tokens = store.list_tokens()
+    db = _open_existing_db(args.db_path)
+    try:
+        tokens = SessionTokenStore(db).list_tokens()
+    finally:
+        db.close()
     if not tokens:
         print("No tokens issued.")
         return

@@ -182,6 +182,8 @@ class SessionTokenStore:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        if getattr(db, "_read_only", False):
+            return
         conn = db._get_conn()
         try:
             conn.execute(CREATE_SESSION_TOKENS)
@@ -252,6 +254,11 @@ class SessionTokenStore:
         """Return token metadata, newest first. Hashes are not included."""
         conn = self._db._get_conn()
         try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'session_tokens'"
+            ).fetchone() is None:
+                return []
             rows = conn.execute(
                 "SELECT token_id, agent_type, session_id, issued_at, expires_at, "
                 "revoked_at FROM session_tokens ORDER BY issued_at DESC, token_id"
