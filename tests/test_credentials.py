@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import threading
 
 import httpx
@@ -27,9 +28,11 @@ from panoptes.proxy import ProxyServer, _strip_query_credentials
 from panoptes.schema import ValidationError
 
 
-ANTHROPIC_KEY = "sk-ant-real-provider-key-0123456789abcdef"
-OPENAI_KEY = "sk-proj-real-openai-key-0123456789abcdef"
-GEMINI_KEY = "AIzaRealGeminiProviderKey0123456789abcd"
+# Fake provider keys. They only need the right shape for the injection and redaction
+# checks; no real provider accepts them.
+FAKE_ANTHROPIC_KEY = "sk-ant-fake-provider-key-0123456789abcdef"
+FAKE_OPENAI_KEY = "sk-proj-fake-openai-key-0123456789abcdef"
+FAKE_GEMINI_KEY = "AIzaFakeGeminiProviderKey0123456789abcd"
 
 _RESPONSES = {
     "/v1/messages": {
@@ -113,7 +116,7 @@ def _start(tmp_path, provider_keys):
 def injecting_proxy(tmp_path, upstream):
     server, client = _start(
         tmp_path,
-        {"anthropic": ANTHROPIC_KEY, "openai": OPENAI_KEY, "gemini": GEMINI_KEY},
+        {"anthropic": FAKE_ANTHROPIC_KEY, "openai": FAKE_OPENAI_KEY, "gemini": FAKE_GEMINI_KEY},
     )
     yield server, client
     client.close()
@@ -147,7 +150,7 @@ def test_valid_token_is_swapped_for_the_provider_key(injecting_proxy, upstream):
     assert response.status_code == 200
     assert len(upstream) == 1
     sent = upstream[0]
-    assert sent["headers"]["x-api-key"] == ANTHROPIC_KEY
+    assert sent["headers"]["x-api-key"] == FAKE_ANTHROPIC_KEY
     assert "authorization" not in sent["headers"]
     assert token not in json.dumps(sent["headers"]) + sent["path"]
     assert token.encode() not in sent["body"]
@@ -173,7 +176,7 @@ def test_openai_bearer_token_is_swapped(injecting_proxy, upstream):
     )
 
     assert response.status_code == 200
-    assert upstream[0]["headers"]["authorization"] == f"Bearer {OPENAI_KEY}"
+    assert upstream[0]["headers"]["authorization"] == f"Bearer {FAKE_OPENAI_KEY}"
     assert token not in json.dumps(upstream[0]["headers"])
     assert server.events[0]["agent"]["session_id"] == "sess-oa"
 
@@ -192,7 +195,7 @@ def test_gemini_query_key_token_never_reaches_upstream_or_audit(
     assert response.status_code == 200
     sent = upstream[0]
     assert sent["path"] == "/v1beta/models/gemini-test:generateContent?alt=json"
-    assert sent["headers"]["x-goog-api-key"] == GEMINI_KEY
+    assert sent["headers"]["x-goog-api-key"] == FAKE_GEMINI_KEY
     request_event = next(
         e for e in server.events if e["event_type"] == "model_request"
     )
@@ -213,7 +216,7 @@ def test_streaming_requests_also_get_the_provider_key(injecting_proxy, upstream)
     )
 
     assert response.status_code == 200
-    assert upstream[0]["headers"]["x-api-key"] == ANTHROPIC_KEY
+    assert upstream[0]["headers"]["x-api-key"] == FAKE_ANTHROPIC_KEY
     assert token not in json.dumps(upstream[0]["headers"])
 
 
@@ -228,7 +231,7 @@ def test_injected_key_survives_connection_header_nomination(injecting_proxy, ups
     )
 
     assert response.status_code == 200
-    assert upstream[0]["headers"]["x-api-key"] == ANTHROPIC_KEY
+    assert upstream[0]["headers"]["x-api-key"] == FAKE_ANTHROPIC_KEY
 
 
 def _issue_rejected(server, case, monkeypatch):
@@ -239,8 +242,8 @@ def _issue_rejected(server, case, monkeypatch):
     if case == "wrong":
         return {"x-api-key": "pnpt_not-a-token-panoptes-issued"}
     if case == "provider_key":
-        # A real provider key is not a Panoptes token either.
-        return {"x-api-key": ANTHROPIC_KEY}
+        # A provider key is not a Panoptes token either.
+        return {"x-api-key": FAKE_ANTHROPIC_KEY}
     token, record = store.issue("claude_code", "sess-victim", ttl_seconds=60)
     if case == "expired":
         real_time = credentials_module.time.time
@@ -295,7 +298,7 @@ def test_invalid_tokens_get_401_and_a_blocked_event(
 
 
 def test_valid_token_without_a_configured_provider_key_is_denied(tmp_path, upstream):
-    server, client = _start(tmp_path, {"anthropic": ANTHROPIC_KEY})
+    server, client = _start(tmp_path, {"anthropic": FAKE_ANTHROPIC_KEY})
     try:
         token, _ = server.token_store.issue("codex", "sess-nokey")
         response = client.post(
@@ -349,7 +352,7 @@ def test_neither_token_nor_key_is_stored_logged_or_returned(
     returned = b"".join(r.content for r in responses) + json.dumps(
         [dict(r.headers) for r in responses]
     ).encode()
-    for secret in (token, revoked, ANTHROPIC_KEY, OPENAI_KEY, GEMINI_KEY):
+    for secret in (token, revoked, FAKE_ANTHROPIC_KEY, FAKE_OPENAI_KEY, FAKE_GEMINI_KEY):
         assert secret.encode() not in stored
         assert secret.encode() not in returned
         assert secret not in panoptes_logs
@@ -434,27 +437,27 @@ def test_token_issue_validates_inputs(tmp_path, agent, session, ttl):
 
 def test_provider_keys_load_from_environment():
     keys = load_provider_keys(environ={
-        "PANOPTES_ANTHROPIC_API_KEY": ANTHROPIC_KEY,
+        "PANOPTES_ANTHROPIC_API_KEY": FAKE_ANTHROPIC_KEY,
         "PANOPTES_GEMINI_API_KEY": "",
         "ANTHROPIC_API_KEY": "ignored",
     })
-    assert keys == {"anthropic": ANTHROPIC_KEY}
+    assert keys == {"anthropic": FAKE_ANTHROPIC_KEY}
     with pytest.raises(CredentialConfigError):
         load_provider_keys(environ={})
 
 
 def test_credentials_file_must_be_owner_only(tmp_path):
     path = tmp_path / "keys.yaml"
-    path.write_text(f"anthropic: {ANTHROPIC_KEY}\nopenai: {OPENAI_KEY}\n")
+    path.write_text(f"anthropic: {FAKE_ANTHROPIC_KEY}\nopenai: {FAKE_OPENAI_KEY}\n")
     os.chmod(path, 0o644)
     with pytest.raises(CredentialConfigError, match="chmod 600") as exc:
         load_provider_keys(str(path))
-    assert ANTHROPIC_KEY not in str(exc.value)
+    assert FAKE_ANTHROPIC_KEY not in str(exc.value)
 
     os.chmod(path, 0o600)
     assert load_provider_keys(str(path)) == {
-        "anthropic": ANTHROPIC_KEY,
-        "openai": OPENAI_KEY,
+        "anthropic": FAKE_ANTHROPIC_KEY,
+        "openai": FAKE_OPENAI_KEY,
     }
 
     path.write_text("mistral: abc\n")
@@ -491,3 +494,84 @@ def test_token_cli_issue_list_and_revoke(tmp_path, capsys):
 def test_proxy_cli_requires_flag_for_credentials_file(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["proxy", "--credentials-file", str(tmp_path / "keys.yaml")])
+
+
+@pytest.mark.parametrize("issued", [False, True])
+@pytest.mark.parametrize("mode", [0o444, 0o644])
+def test_token_list_does_not_write_or_change_permissions(tmp_path, capsys, issued, mode):
+    db_path = tmp_path / "audit.db"
+    db = AuditDB(str(db_path))
+    if issued:
+        SessionTokenStore(db).issue("claude_code", "read-only-session")
+    db.close()
+    db_path.chmod(mode)
+    before = db_path.read_bytes()
+
+    try:
+        cli.main(["token", "list", "--db-path", str(db_path)])
+        output = capsys.readouterr().out
+        assert ("read-only-session" if issued else "No tokens issued.") in output
+        assert stat.S_IMODE(db_path.stat().st_mode) == mode
+        assert db_path.read_bytes() == before
+    finally:
+        db_path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("POST", "/v1/messages/batches"),
+        ("GET", "/v1/messages/batches/msgbatch_1/results"),
+        ("GET", "/v1/files?x=/models"),
+        ("POST", "/v1/fine_tuning/jobs?route=/chat/completions"),
+        ("POST", "/v1beta/openai/chat/completions"),
+        ("GET", "/v1beta/cachedContents"),
+    ],
+)
+def test_only_inspectable_model_routes_receive_an_injected_key(
+    injecting_proxy, upstream, method, path
+):
+    """Routes are matched exactly on the path, never by substring or query.
+
+    Other provider endpoints would get the real key and return responses
+    the parsers cannot inspect, which then read as "no tool calls".
+    """
+    server, client = injecting_proxy
+    token, _ = server.token_store.issue("claude_code", "sess-route")
+    response = client.request(
+        method, path, headers={"x-api-key": token, "Authorization": f"Bearer {token}"},
+        json={} if method == "POST" else None,
+    )
+    assert response.status_code == 502
+    assert "No supported provider route" in response.json()["error"]
+    assert upstream == []
+
+
+def test_unauthenticated_denial_records_no_client_identity_or_content(
+    injecting_proxy, upstream
+):
+    server, client = injecting_proxy
+    response = client.post(
+        "/v1/messages",
+        json={**ANTHROPIC_BODY, "messages": [{"role": "user", "content": "attacker text"}]},
+        headers={"x-api-key": "pnpt_not-a-token-panoptes-issued", "User-Agent": "claude-code/2.0"},
+    )
+    assert response.status_code == 401
+    [event] = server.events
+    assert event["agent"]["type"] == "unknown"
+    assert "attacker text" not in json.dumps(event)
+
+
+def test_credentials_file_that_is_a_fifo_fails_fast(tmp_path):
+    path = tmp_path / "keys.yaml"
+    os.mkfifo(path)
+    with pytest.raises(CredentialConfigError, match="regular file"):
+        load_provider_keys(str(path))
+
+
+def test_bare_session_tokens_are_redacted(injecting_proxy):
+    from panoptes.schema import redact_secrets
+
+    server, _ = injecting_proxy
+    token, _ = server.token_store.issue("claude_code", "sess-redact")
+    assert token not in redact_secrets(f"echo {token}")

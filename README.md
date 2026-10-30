@@ -91,6 +91,9 @@ panoptes proxy \
   --policy-failure-mode fail_closed
 ```
 
+The installed Hermes plugin reads its failure mode from
+`PANOPTES_POLICY_FAILURE_MODE` (`fail_open` or `fail_closed`).
+
 The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
 and the server accepts at most 64 concurrent requests by default; tune these
 with `--client-timeout` and `--max-concurrent-requests`.
@@ -145,6 +148,8 @@ cannot be stored is denied.
 panoptes query --agent hermes --event-type agent_step --limit 50
 panoptes query --agent hermes --event-type decision_point --limit 50
 panoptes session <session-id>
+panoptes session <session-id> --limit 50
+panoptes session <session-id> --json
 panoptes evidence <event-id>
 
 # Verify local hash links and export a checkpoint for separate storage
@@ -158,6 +163,38 @@ panoptes verify --checkpoint checkpoint.json
 Read-only database commands require an existing initialized audit database. A
 missing, mistyped, or empty `--db-path` exits with status 2 instead of creating
 a new database.
+
+`session` shows a chronological timeline with event status, tool or model,
+available duration, policy decisions, and event/run/call IDs. Model proposals
+and authorizations remain distinct from reported execution outcomes. Policy
+labels describe each event separately: a blocked tool proposal can withhold its
+containing model response even when that response event matched no block. By default
+it selects up to 10,000 newest events; `--limit` selects fewer. Partial timelines
+state the selected and matching counts. `--json` returns full stored events
+with those counts and a `partial` flag.
+
+### Check your setup
+
+```bash
+panoptes doctor
+
+# Check the configuration you intend to use with the proxy
+panoptes doctor --policies-dir ~/.panoptes/policies \
+  --policy-failure-mode fail_closed --inject-credentials \
+  --credentials-file ~/.panoptes/credentials.yaml
+```
+
+Doctor checks an existing database and schema, policy validity, and provider-key
+configuration when credential injection is requested. It reports the latest
+audit timestamp and warns when history is empty or older than 24 hours.
+Credential values stay hidden. It opens the database read-only, does not repair
+files or attempt audit writes, and makes no provider requests. Exit status is
+0 when checks pass (warnings may remain), or 2 when a check fails.
+
+The reported proxy mode describes the supplied flags and current policy files.
+Doctor does not discover a running proxy's settings, prove client routing or
+credential isolation, or verify the hash chain; use `panoptes verify` for the
+chain check. A valid configuration alone does not establish enforcement.
 
 ## Architecture
 
@@ -302,8 +339,9 @@ they are supported.
 panoptes proxy          Start the loopback-only model-API reverse proxy
 panoptes --version      Show the installed Panoptes version
 panoptes status         Show event statistics
+panoptes doctor         Check local setup and requested proxy configuration
 panoptes query          Query events by agent, type, tool, or time
-panoptes session <id>   Show up to 10,000 newest session events
+panoptes session <id>   Show a chronological timeline (--limit N, --json)
 panoptes evidence <id>  Reconstruct a related decision path
 panoptes verify         Verify the local chain or a separately stored checkpoint
 panoptes checkpoint     Print the current chain checkpoint
@@ -350,6 +388,11 @@ The tests are local and network-independent. A change is ready to review when
 the full suite passes and `git diff --check` is clean. Release ownership and
 the tagged publishing flow are documented in [RELEASING.md](RELEASING.md).
 
+Focus tests on observable behavior: capture, policy decisions, credential
+handling, audit storage and integrity, and CLI flows. Use shared setup and
+parameterized cases for repeated inputs. Test helpers through those behaviors
+unless a separate test protects a distinct security or data-loss boundary.
+
 ## Contributing
 
 Bug reports, protocol fixtures, and focused adapters are welcome. The most
@@ -361,3 +404,19 @@ reporting path in [SECURITY.md](SECURITY.md).
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+### Provider usage breakdowns
+
+Model response events retain `cost.tokens_in` and `cost.tokens_out` as totals.
+When reported by the provider, `cost.reasoning_tokens` records Gemini thought
+tokens, OpenAI reasoning tokens, or Anthropic thinking tokens; these are
+subsets of output tokens. `cost.cached_input_tokens` records cache reads, and
+Anthropic and OpenAI may also report `cost.cache_creation_input_tokens`. Gemini may
+also report `cost.tool_prompt_tokens`, separate from its prompt token count.
+A missing breakdown means unavailable, not zero. Anthropic's thinking count
+is an estimate from re-tokenization, and providers' token counts and caching
+semantics are not necessarily directly comparable.
+
+`AuditDB.aggregate` supports these breakdown names and their corresponding
+`_reported` counts. Sums are null when no events reported the metric; use the
+counts to assess coverage before comparing runs. Existing events are unchanged.

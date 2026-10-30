@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,9 +11,19 @@ from .base import (
     Provider,
     SSEParseError,
     _parse_sse_events,
+    _route_matches,
+    _usage_count,
+    _optional_usage_counts,
     _strict_json_loads,
 )
 
+
+_ROUTES = (
+    re.compile(r"/v1/chat/completions"),
+    re.compile(r"/v1/completions"),
+    re.compile(r"/v1/responses(?:/[^/]+)?"),
+    re.compile(r"/v1/models(?:/[^/]+)?"),
+)
 
 _CLIENT_ACTION_OUTPUT_TYPES = frozenset({
     "function_call",
@@ -222,7 +233,7 @@ class OpenAIProvider(Provider):
     name = "openai"
 
     def matches_path(self, path: str) -> bool:
-        return any(pat in path for pat in ("/chat/completions", "/responses", "/completions", "/models"))
+        return _route_matches(path, _ROUTES)
 
     def matches_body(self, body: dict | None) -> bool:
         if not isinstance(body, dict):
@@ -588,14 +599,19 @@ class OpenAIProvider(Provider):
 
     def extract_usage(self, resp_body: dict) -> dict:
         usage = resp_body.get("usage", {})
-        if "input_tokens" in usage or "output_tokens" in usage:
-            return {
-                "tokens_in": usage.get("input_tokens", 0),
-                "tokens_out": usage.get("output_tokens", 0),
-            }
+        if not isinstance(usage, dict):
+            usage = {}
+        responses = "input_tokens" in usage or "output_tokens" in usage
+        input_details = usage.get("input_tokens_details" if responses else "prompt_tokens_details")
+        output_details = usage.get("output_tokens_details" if responses else "completion_tokens_details")
         return {
-            "tokens_in": usage.get("prompt_tokens", 0),
-            "tokens_out": usage.get("completion_tokens", 0),
+            "tokens_in": _usage_count(usage, "input_tokens" if responses else "prompt_tokens"),
+            "tokens_out": _usage_count(usage, "output_tokens" if responses else "completion_tokens"),
+            **_optional_usage_counts(input_details, {
+                "cached_tokens": "cached_input_tokens",
+                "cache_write_tokens": "cache_creation_input_tokens",
+            }),
+            **_optional_usage_counts(output_details, {"reasoning_tokens": "reasoning_tokens"}),
         }
 
     def reassemble_sse(

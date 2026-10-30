@@ -46,6 +46,12 @@ inference.
   an empty parse as safe. `fail_closed` also denies non-empty
   `action.unknown_tool_types` even when no user policy explicitly matches it;
   `fail_open` records a warning.
+- An event that fails validation is denied in both modes while any enabled
+  block policy is active. Fail-open covers Panoptes' own failures, not input a
+  caller can shape to skip a block.
+- The proxy forwards only an exact allowlist of model-API paths per provider.
+  Other provider endpoints (batches, files, fine-tuning, OpenAI-compatible
+  shims) are refused, because their responses cannot be inspected.
 - Request parsing and buffered response inspection reject duplicate JSON object
   keys. Audit-only pass-through streams are delivered before post-hoc
   inspection and therefore cannot be retroactively denied.

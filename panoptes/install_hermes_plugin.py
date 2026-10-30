@@ -6,20 +6,31 @@ Usage:
 """
 
 import argparse
+import json
 import os
-import shutil
 import sys
 import tempfile
 from pathlib import Path
 
+from panoptes import __version__
 
-MANIFEST_JSON = """{
-    "name": "panoptes",
-    "version": "0.1.0",
-    "description": "Panoptes Hermes lifecycle observation and host-callable tool authorization",
-    "hooks": ["agent:start", "agent:step", "agent:end"],
-    "entrypoint": "plugin.py"
-}"""
+
+MANIFEST_JSON = json.dumps(
+    {
+        "name": "panoptes",
+        "version": __version__,
+        "description": (
+            "Panoptes Hermes lifecycle observation and host-callable tool "
+            "authorization"
+        ),
+        "hooks": ["agent:start", "agent:step", "agent:end"],
+        "entrypoint": "plugin.py",
+    },
+    indent=4,
+)
+
+# Only the files install() writes; uninstall() never removes anything else.
+_PLUGIN_FILES = ("manifest.json", "plugin.py")
 
 # The generated plugin.py is a thin entrypoint shim: the implementation lives
 # in panoptes.hermes_plugin (the panoptes package must be importable in the
@@ -141,11 +152,31 @@ def uninstall(dry_run: bool = False) -> bool:
         raise RuntimeError(f"Refusing to uninstall through symlink: {plugin_dir}")
 
     if dry_run:
-        print(f"[DRY RUN] Would remove: {plugin_dir}/")
+        for name in _PLUGIN_FILES:
+            print(f"[DRY RUN] Would remove: {plugin_dir / name}")
+        print(f"[DRY RUN] Would remove {plugin_dir}/ if nothing else is in it")
         return True
 
-    shutil.rmtree(plugin_dir)
-    print(f"Removed: {plugin_dir}/")
+    for name in _PLUGIN_FILES:
+        path = plugin_dir / name
+        if path.is_symlink() or path.exists():
+            path.unlink()
+            print(f"Removed: {path}")
+    # Python caches the imported entrypoint beside it.
+    cache_dir = plugin_dir / "__pycache__"
+    if cache_dir.is_dir() and not cache_dir.is_symlink():
+        for cached in cache_dir.glob("plugin.*.pyc"):
+            cached.unlink()
+        try:
+            cache_dir.rmdir()
+        except OSError:
+            pass
+    try:
+        plugin_dir.rmdir()
+    except OSError:
+        print(f"Kept {plugin_dir}/ because it holds files Panoptes did not write.")
+    else:
+        print(f"Removed: {plugin_dir}/")
     print("✅ panoptes Hermes plugin uninstalled.")
     return True
 

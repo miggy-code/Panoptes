@@ -361,7 +361,6 @@ def test_shared_run_id():
     assert len(events) >= 3, f"Expected at least 3 events, got {len(events)}"
     run_ids = {e["agent"]["run_id"] for e in events}
     assert len(run_ids) == 1, f"Expected 1 run_id across all events, got {run_ids}"
-    print(f"Shared run_id test passed: {len(events)} events all share run_id={run_ids.pop()[:8]}…")
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +396,6 @@ def test_turn_number_in_context():
     assert ctx["turn_number"] == 2, f"Expected turn_number=2, got {ctx['turn_number']}"
     for e in req_events:
         assert e["context"]["turn_number"] == 2
-    print("turn_number test passed")
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +443,6 @@ def test_call_id_on_tool_events():
     assert tool_calls[0]["action"]["call_id"] == "call_new"
     assert tool_calls[0]["outcome"]["status"] == "pending"
     assert "execution was not observed" in tool_calls[0]["outcome"]["summary"]
-    print("call_id test passed")
 
 
 def test_proxy_redacts_tool_result_before_summary_truncation():
@@ -707,8 +704,6 @@ def test_reverse_proxy_routing():
     with pytest.raises(ValueError, match="Absolute-form"):
         h._parse_target()
 
-    print("Reverse-proxy routing test passed")
-
 
 def test_reverse_proxy_no_upstream_raises():
     """Unmatched provider paths are rejected."""
@@ -830,7 +825,6 @@ def test_sse_parsing_anthropic_text():
     assert result["content"][0]["text"] == "Hello world!"
     assert result["usage"]["input_tokens"] == 25
     assert result["usage"]["output_tokens"] == 10
-    print("Anthropic SSE text test passed")
 
 
 def test_sse_parsing_anthropic_tool_use():
@@ -856,7 +850,6 @@ def test_sse_parsing_anthropic_tool_use():
     assert block["input"] == {"expr": "2+2"}, f"Got {block['input']}"
     assert result["usage"]["input_tokens"] == 100
     assert result["usage"]["output_tokens"] == 50
-    print("Anthropic SSE tool_use test passed")
 
 
 def test_sse_parsing_anthropic_via_parse_sse_response():
@@ -873,7 +866,6 @@ def test_sse_parsing_anthropic_via_parse_sse_response():
     assert result is not None
     assert result["content"][0]["text"] == "Hi"
     assert result["usage"]["output_tokens"] == 3
-    print("_parse_sse_response (anthropic) test passed")
 
 
 @pytest.mark.parametrize(
@@ -971,7 +963,6 @@ def test_sse_parsing_openai_text():
     assert result["choices"][0]["finish_reason"] == "stop"
     assert result["usage"]["prompt_tokens"] == 10
     assert result["usage"]["completion_tokens"] == 5
-    print("OpenAI SSE text test passed")
 
 
 def test_sse_parsing_openai_tool_calls():
@@ -995,7 +986,6 @@ def test_sse_parsing_openai_tool_calls():
     assert tc["function"]["name"] == "calculator"
     parsed_args = json.loads(tc["function"]["arguments"])
     assert parsed_args == {"expr": "2+2"}, f"Got {parsed_args}"
-    print("OpenAI SSE tool_calls test passed")
 
 
 def test_sse_parsing_openai_via_parse_sse_response():
@@ -1008,7 +998,6 @@ def test_sse_parsing_openai_via_parse_sse_response():
     result = _parse_sse_response(sse, "openai")
     assert result is not None
     assert result["choices"][0]["message"]["content"] == "Hi"
-    print("_parse_sse_response (openai) test passed")
 
 
 def _responses_sse(*events: dict) -> bytes:
@@ -1809,14 +1798,7 @@ def test_preflight_block_prevents_forward():
     # Stub policy engine that always blocks
     class _BlockingEngine:
         def check_event(self, event):
-            try:
-                from panoptes.policy import PolicyResult
-            except ImportError:
-                # Fallback dataclass-like object
-                class PolicyResult:
-                    def __init__(self, **kw):
-                        for k, v in kw.items():
-                            setattr(self, k, v)
+            from panoptes.policy import PolicyResult
             return PolicyResult(
                 action="block",
                 violated_policies=[{"policy_name": "test_block", "message": "Blocked for testing"}],
@@ -1860,7 +1842,6 @@ def test_preflight_block_prevents_forward():
     assert all(e["event_type"] != "model_response" for e in stored), (
         "model_response event should not be written on pre-flight block"
     )
-    print("Pre-flight blocking test passed")
 
 
 def test_preflight_block_records_request_as_not_forwarded():
@@ -2049,25 +2030,114 @@ def test_preflight_allow_writes_all_events():
     run_ids = {e["agent"]["run_id"] for e in stored}
     assert len(run_ids) == 1
     assert run_ids.pop() == run_id
-    print("Pre-flight allow + full event write test passed")
 
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    test_shared_run_id()
-    test_turn_number_in_context()
-    test_call_id_on_tool_events()
-    test_reverse_proxy_routing()
-    test_reverse_proxy_no_upstream_raises()
-    test_sse_parsing_anthropic_text()
-    test_sse_parsing_anthropic_tool_use()
-    test_sse_parsing_anthropic_via_parse_sse_response()
-    test_sse_parsing_openai_text()
-    test_sse_parsing_openai_tool_calls()
-    test_sse_parsing_openai_via_parse_sse_response()
-    test_preflight_block_prevents_forward()
-    test_preflight_allow_writes_all_events()
-    print("\nAll tests passed!")
+
+def test_upstream_client_never_stores_cookies():
+    """One client serves every session, so it must not replay Set-Cookie."""
+    import httpx
+
+    from panoptes.proxy import _upstream_client
+
+    client = _upstream_client(5.0)
+    try:
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(
+            200, headers={"set-cookie": "sess=SECRET; Path=/"}, request=request
+        )
+        client.cookies.extract_cookies(response)
+        assert len(client.cookies.jar) == 0
+    finally:
+        client.close()
+
+
+def test_forwarded_accept_encoding_is_replaced_case_insensitively():
+    fwd = ProxyHandler._build_fwd_headers(
+        None, {"accept-encoding": "gzip, br", "content-type": "application/json"}
+    )
+    assert [k for k in fwd if k.lower() == "accept-encoding"] == ["Accept-Encoding"]
+    assert fwd["Accept-Encoding"] == "identity"
+
+
+def test_undecodable_upstream_content_encoding_is_refused():
+    from panoptes.proxy import ResponseInspectionError, _check_content_encoding
+
+    _check_content_encoding({"Content-Encoding": "gzip"})
+    _check_content_encoding({})
+    for coding in ("br", "zstd", "gzip, br"):
+        with pytest.raises(ResponseInspectionError):
+            _check_content_encoding({"Content-Encoding": coding})
+
+
+def test_repeated_request_headers_are_combined():
+    from panoptes.proxy import _merged_headers
+
+    merged = _merged_headers([
+        ("anthropic-beta", "beta-one"),
+        ("Anthropic-Beta", "beta-two"),
+        ("Cookie", "a=1"),
+        ("cookie", "b=2"),
+    ])
+    assert merged == {"anthropic-beta": "beta-one, beta-two", "Cookie": "a=1; b=2"}
+
+
+def test_usage_counts_cached_and_thinking_tokens():
+    from panoptes.providers.gemini import GeminiProvider
+
+    usage = AnthropicProvider().extract_usage({"usage": {
+        "input_tokens": 3,
+        "cache_read_input_tokens": 90_000,
+        "cache_creation_input_tokens": 5_000,
+        "output_tokens": 7,
+    }})
+    assert usage == {"tokens_in": 95_003, "tokens_out": 7,
+                     "cached_input_tokens": 90_000, "cache_creation_input_tokens": 5_000}
+
+    stream = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"id":"m",'
+        b'"model":"claude-x","usage":{"input_tokens":3,"cache_read_input_tokens":10,'
+        b'"output_tokens":1}}}\n\n'
+        b'event: message_delta\ndata: {"type":"message_delta","delta":'
+        b'{"stop_reason":"end_turn"},"usage":{"output_tokens":9,'
+        b'"cache_read_input_tokens":20}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    message = _reassemble_anthropic_sse(_parse_sse_events(stream))
+    assert AnthropicProvider().extract_usage(message) == {
+        "tokens_in": 23, "tokens_out": 9, "cached_input_tokens": 20,
+    }
+
+    gemini = GeminiProvider()
+    assert gemini.extract_usage({"usageMetadata": {
+        "promptTokenCount": 3, "candidatesTokenCount": 1, "thoughtsTokenCount": 500,
+    }}) == {"tokens_in": 3, "tokens_out": 501, "reasoning_tokens": 500}
+    assert gemini.extract_request_info(
+        {"contents": []},
+        path="/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+    )["model"] == "gemini-2.5-pro"
+
+
+def test_optional_provider_usage_breakdowns_and_streaming():
+    from panoptes.providers.anthropic import AnthropicProvider, _reassemble_anthropic_sse
+    from panoptes.providers.openai import OpenAIProvider
+    from panoptes.providers.gemini import GeminiProvider
+    from panoptes.providers.base import _parse_sse_events
+
+    assert OpenAIProvider().extract_usage({"usage": {
+        "input_tokens": 10, "output_tokens": 8,
+        "input_tokens_details": {"cached_tokens": 4},
+        "output_tokens_details": {"reasoning_tokens": 5},
+    }}) == {"tokens_in": 10, "tokens_out": 8, "cached_input_tokens": 4, "reasoning_tokens": 5}
+    assert OpenAIProvider().extract_usage({"usage": {
+        "prompt_tokens": 10, "completion_tokens": 8,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }})["reasoning_tokens"] == 0
+    assert "reasoning_tokens" not in GeminiProvider().extract_usage({"usageMetadata": {"thoughtsTokenCount": True}})
+    stream = (b'event: message_start\ndata: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+              b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":6}}}\n\n'
+              b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    assert AnthropicProvider().extract_usage(_reassemble_anthropic_sse(_parse_sse_events(stream)))["reasoning_tokens"] == 6

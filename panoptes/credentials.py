@@ -93,7 +93,13 @@ def _validate_provider_key(provider: str, value: Any) -> str:
 def _read_credentials_file(path: str) -> dict[str, Any]:
     """Read an owner-only YAML mapping of provider name to API key."""
     expanded = os.path.expanduser(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NONBLOCK keeps a FIFO in place of the file from hanging startup inside
+    # open() before the regular-file check; it does not affect regular files.
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     try:
         fd = os.open(expanded, flags)
     except OSError as exc:
@@ -176,6 +182,8 @@ class SessionTokenStore:
 
     def __init__(self, db: Any) -> None:
         self._db = db
+        if getattr(db, "_read_only", False):
+            return
         conn = db._get_conn()
         try:
             conn.execute(CREATE_SESSION_TOKENS)
@@ -246,6 +254,11 @@ class SessionTokenStore:
         """Return token metadata, newest first. Hashes are not included."""
         conn = self._db._get_conn()
         try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'session_tokens'"
+            ).fetchone() is None:
+                return []
             rows = conn.execute(
                 "SELECT token_id, agent_type, session_id, issued_at, expires_at, "
                 "revoked_at FROM session_tokens ORDER BY issued_at DESC, token_id"
