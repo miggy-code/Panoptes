@@ -131,6 +131,15 @@ def _usage_count(usage: Any, field: str) -> int:
     return value
 
 
+def _optional_usage_counts(usage: Any, fields: dict[str, str]) -> dict:
+    """Preserve valid reported counts, leaving unavailable metrics absent."""
+    if not isinstance(usage, dict):
+        return {}
+    return {name: value for source, name in fields.items()
+            if isinstance((value := usage.get(source)), int)
+            and not isinstance(value, bool) and value >= 0}
+
+
 def _empty_request_info() -> dict[str, Any]:
     """Request info returned when there is no parseable request body."""
     return {"model": "unknown", "messages_count": 0, "tools_count": 0, "stream": False}

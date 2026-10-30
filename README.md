@@ -404,3 +404,19 @@ reporting path in [SECURITY.md](SECURITY.md).
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+### Provider usage breakdowns
+
+Model response events retain `cost.tokens_in` and `cost.tokens_out` as totals.
+When reported by the provider, `cost.reasoning_tokens` records Gemini thought
+tokens, OpenAI reasoning tokens, or Anthropic thinking tokens; these are
+subsets of output tokens. `cost.cached_input_tokens` records cache reads, and
+Anthropic and OpenAI may also report `cost.cache_creation_input_tokens`. Gemini may
+also report `cost.tool_prompt_tokens`, separate from its prompt token count.
+A missing breakdown means unavailable, not zero. Anthropic's thinking count
+is an estimate from re-tokenization, and providers' token counts and caching
+semantics are not necessarily directly comparable.
+
+`AuditDB.aggregate` supports these breakdown names and their corresponding
+`_reported` counts. Sums are null when no events reported the metric; use the
+counts to assess coverage before comparing runs. Existing events are unchanged.

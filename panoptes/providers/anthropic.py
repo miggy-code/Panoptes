@@ -13,6 +13,7 @@ from .base import (
     _route_matches,
     _strict_json_loads,
     _usage_count,
+    _optional_usage_counts,
 )
 
 _ROUTES = (
@@ -25,7 +26,7 @@ _INPUT_USAGE_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
-_USAGE_FIELDS = _INPUT_USAGE_FIELDS + ("output_tokens",)
+_USAGE_FIELDS = _INPUT_USAGE_FIELDS + ("output_tokens", "output_tokens_details")
 
 
 _SERVER_RESULT_TYPES = frozenset({
@@ -280,6 +281,13 @@ class AnthropicProvider(Provider):
                 _usage_count(usage, field) for field in _INPUT_USAGE_FIELDS
             ),
             "tokens_out": _usage_count(usage, "output_tokens"),
+            **_optional_usage_counts(usage, {
+                "cache_read_input_tokens": "cached_input_tokens",
+                "cache_creation_input_tokens": "cache_creation_input_tokens",
+            }),
+            **_optional_usage_counts(usage.get("output_tokens_details") if isinstance(usage, dict) else None, {
+                "thinking_tokens": "reasoning_tokens",
+            }),
         }
 
     def reassemble_sse(

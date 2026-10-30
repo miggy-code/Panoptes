@@ -2142,3 +2142,19 @@ def test_read_only_audit_db_never_writes():
         with pytest.raises(sqlite3.Error):
             AuditDB(missing, read_only=True)
         assert not os.path.exists(missing)
+
+
+def test_usage_breakdown_storage_and_aggregation(tmp_path):
+    db = AuditDB(str(tmp_path / "usage.db"))
+    for i, cost in enumerate(({"reasoning_tokens": 0}, {"reasoning_tokens": 12}, {})):
+        db.insert_event({
+            "agent": {"type": "hermes", "session_id": "usage", "run_id": str(i)},
+            "event_type": "model_response", "action": {},
+            "outcome": {"status": "success"}, "context": {}, "cost": cost,
+        })
+    rows = db.aggregate(group_by=[], metrics=[
+        "reasoning_tokens", "reasoning_tokens_reported",
+        "cached_input_tokens", "cached_input_tokens_reported",
+    ])
+    assert rows == [{"reasoning_tokens": 12, "reasoning_tokens_reported": 2,
+                     "cached_input_tokens": None, "cached_input_tokens_reported": 0}]

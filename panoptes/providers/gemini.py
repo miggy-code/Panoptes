@@ -14,6 +14,7 @@ from .base import (
     _route_matches,
     _strict_json_loads,
     _usage_count,
+    _optional_usage_counts,
 )
 
 # Gemini's OpenAI-compatible routes (/v1beta/openai/...) are deliberately
@@ -478,6 +479,11 @@ class GeminiProvider(Provider):
         usage = resp_body.get("usageMetadata", {})
         return {
             "tokens_in": _usage_count(usage, "promptTokenCount"),
+            **_optional_usage_counts(usage, {
+                "thoughtsTokenCount": "reasoning_tokens",
+                "cachedContentTokenCount": "cached_input_tokens",
+                "toolUsePromptTokenCount": "tool_prompt_tokens",
+            }),
             # Thinking tokens are billed as output but counted separately.
             "tokens_out": (
                 _usage_count(usage, "candidatesTokenCount")

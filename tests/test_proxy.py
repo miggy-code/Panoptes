@@ -2094,7 +2094,8 @@ def test_usage_counts_cached_and_thinking_tokens():
         "cache_creation_input_tokens": 5_000,
         "output_tokens": 7,
     }})
-    assert usage == {"tokens_in": 95_003, "tokens_out": 7}
+    assert usage == {"tokens_in": 95_003, "tokens_out": 7,
+                     "cached_input_tokens": 90_000, "cache_creation_input_tokens": 5_000}
 
     stream = (
         b'event: message_start\ndata: {"type":"message_start","message":{"id":"m",'
@@ -2107,14 +2108,36 @@ def test_usage_counts_cached_and_thinking_tokens():
     )
     message = _reassemble_anthropic_sse(_parse_sse_events(stream))
     assert AnthropicProvider().extract_usage(message) == {
-        "tokens_in": 23, "tokens_out": 9,
+        "tokens_in": 23, "tokens_out": 9, "cached_input_tokens": 20,
     }
 
     gemini = GeminiProvider()
     assert gemini.extract_usage({"usageMetadata": {
         "promptTokenCount": 3, "candidatesTokenCount": 1, "thoughtsTokenCount": 500,
-    }}) == {"tokens_in": 3, "tokens_out": 501}
+    }}) == {"tokens_in": 3, "tokens_out": 501, "reasoning_tokens": 500}
     assert gemini.extract_request_info(
         {"contents": []},
         path="/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
     )["model"] == "gemini-2.5-pro"
+
+
+def test_optional_provider_usage_breakdowns_and_streaming():
+    from panoptes.providers.anthropic import AnthropicProvider, _reassemble_anthropic_sse
+    from panoptes.providers.openai import OpenAIProvider
+    from panoptes.providers.gemini import GeminiProvider
+    from panoptes.providers.base import _parse_sse_events
+
+    assert OpenAIProvider().extract_usage({"usage": {
+        "input_tokens": 10, "output_tokens": 8,
+        "input_tokens_details": {"cached_tokens": 4},
+        "output_tokens_details": {"reasoning_tokens": 5},
+    }}) == {"tokens_in": 10, "tokens_out": 8, "cached_input_tokens": 4, "reasoning_tokens": 5}
+    assert OpenAIProvider().extract_usage({"usage": {
+        "prompt_tokens": 10, "completion_tokens": 8,
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }})["reasoning_tokens"] == 0
+    assert "reasoning_tokens" not in GeminiProvider().extract_usage({"usageMetadata": {"thoughtsTokenCount": True}})
+    stream = (b'event: message_start\ndata: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+              b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":6}}}\n\n'
+              b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    assert AnthropicProvider().extract_usage(_reassemble_anthropic_sse(_parse_sse_events(stream)))["reasoning_tokens"] == 6
