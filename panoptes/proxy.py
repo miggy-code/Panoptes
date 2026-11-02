@@ -473,7 +473,7 @@ class AuditEventWriter:
             # A client assertion for joining this exchange to an external journal;
             # it never changes agent type, session, or identity assurance.
             capture["client_correlation_id"] = correlation_id
-        return {
+        event = {
             "event_id": uuid.uuid4().hex,
             "timestamp": utcnow_iso(),
             "agent": {"type": agent_type, "session_id": session_id, "run_id": run_id},
@@ -486,6 +486,11 @@ class AuditEventWriter:
             },
             "cost": {},
         }
+        if correlation_id is not None:
+            # First-class since schema v5. The capture copy above is kept for
+            # readers of earlier events.
+            event["correlation_id"] = correlation_id
+        return event
 
     def build_request_events(
         self,

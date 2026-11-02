@@ -652,6 +652,8 @@ def test_correlation_id_joins_exchanges_without_changing_identity(injecting_prox
         assert event["agent"]["session_id"] == "trial-9"
         capture = event["context"]["capture"]
         assert capture["identity_assurance"] == "panoptes_session_token"
+        # Promoted to a first-class field in schema v5; the capture copy remains.
+        assert event["correlation_id"] == capture["client_correlation_id"]
         by_attempt.setdefault(capture["client_correlation_id"], []).append(event["agent"]["run_id"])
     assert set(by_attempt) == {"attempt-a", "attempt-b"}
     assert all(len(set(run_ids)) == 1 and len(run_ids) == 2 for run_ids in by_attempt.values())
