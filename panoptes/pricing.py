@@ -1,0 +1,105 @@
+"""Versioned model rate tables used to price audited responses.
+
+Panoptes never guesses a price. A response is priced only when the operator supplied a
+rate table that names the model and the provider reported the token counts the formula
+needs. Everything else is reported as unpriced, and a dollar-capped token is charged its
+full per-request reservation for it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from typing import Any
+
+MICROS_PER_USD = 1_000_000
+RATE_FIELDS = ("input_per_million", "cached_input_per_million", "output_per_million")
+
+
+class PricingError(ValueError):
+    """The rate table is missing, malformed, or unversioned."""
+
+
+def usd_to_micros(value: Any) -> int:
+    """Convert a USD amount to whole micro-dollars, rounding up (never under-count)."""
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise PricingError("dollar amount must be a number") from None
+    if not amount.is_finite() or amount <= 0:
+        raise PricingError("dollar amount must be positive and finite")
+    return int((amount * MICROS_PER_USD).to_integral_value(rounding=ROUND_CEILING))
+
+
+def _count(cost: dict, field: str) -> int | None:
+    value = cost.get(field)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+@dataclass(frozen=True)
+class PricingTable:
+    version: str
+    source: str
+    models: dict[str, dict[str, Decimal]]
+
+    @classmethod
+    def load(cls, path: str) -> "PricingTable":
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PricingError(f"cannot read pricing file: {type(exc).__name__}") from None
+        return cls.from_dict(raw)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "PricingTable":
+        if not isinstance(raw, dict) or raw.get("currency") != "USD":
+            raise PricingError("pricing table must be a USD object")
+        version, source = raw.get("version"), raw.get("source")
+        if not isinstance(version, str) or not version or not isinstance(source, str) or not source:
+            raise PricingError("pricing table needs a version and a source")
+        models: dict[str, dict[str, Decimal]] = {}
+        for name, rate in (raw.get("models") or {}).items():
+            if not isinstance(rate, dict):
+                raise PricingError(f"rate for {name} must be an object")
+            parsed = {}
+            for field in RATE_FIELDS:
+                try:
+                    value = Decimal(str(rate[field]))
+                except (KeyError, InvalidOperation):
+                    raise PricingError(f"rate for {name} lacks a valid {field}") from None
+                if not value.is_finite() or value < 0:
+                    raise PricingError(f"rate for {name} has an invalid {field}")
+                parsed[field] = value
+            models[str(name)] = parsed
+        if not models:
+            raise PricingError("pricing table names no models")
+        return cls(version=version, source=source, models=models)
+
+    def cost_micros(self, model: str | None, cost: dict) -> int | None:
+        """Price one response in micro-dollars, or None when it cannot be priced exactly.
+
+        Input is billed as ``tokens_in - cached + tool_prompt`` at the input rate, cached
+        tokens at the cached rate, and output (which already includes reasoning) at the
+        output rate. Absent optional counts are zero, which never under-counts.
+        """
+        rate = self.models.get(model or "")
+        tokens_in, tokens_out = cost.get("tokens_in"), cost.get("tokens_out")
+        if rate is None or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (tokens_in, tokens_out)):
+            return None
+        cached, tool_prompt = _count(cost, "cached_input_tokens"), _count(cost, "tool_prompt_tokens")
+        if cached is None or tool_prompt is None or cached > tokens_in:
+            return None
+        billed_in = tokens_in - cached + tool_prompt
+        usd = (
+            Decimal(billed_in) * rate["input_per_million"]
+            + Decimal(cached) * rate["cached_input_per_million"]
+            + Decimal(tokens_out) * rate["output_per_million"]
+        ) / Decimal(MICROS_PER_USD)
+        return int((usd * MICROS_PER_USD).to_integral_value(rounding=ROUND_CEILING))

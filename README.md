@@ -125,7 +125,12 @@ writes a token or a provider key to the audit log or its own logs.
 
 The token also fixes the event identity: its agent type and session id replace
 the `X-Panoptes-Agent` and `X-Panoptes-Session` headers, and those events carry
-`context.capture.identity_assurance: "panoptes_session_token"`. Revoke a token
+`context.capture.identity_assurance: "panoptes_session_token"`. Add
+`--max-requests N` to `token issue` to cap how many requests that token may
+authorize; further requests get HTTP 429 and a blocked audit event. For a dollar cap
+start the proxy with `--pricing rates.json` and issue the token with
+`--max-usd 2 --reserve-usd 0.05` (the reservation is the most one request may cost;
+unpriced responses are charged the whole reservation). Revoke a token
 with `panoptes token revoke <id>`; `panoptes token list` shows ids and status.
 Run Panoptes as a separate OS user or container and block direct provider
 egress, or the agent can still read the keys. See [SECURITY.md](SECURITY.md).

@@ -575,3 +575,95 @@ def test_bare_session_tokens_are_redacted(injecting_proxy):
     server, _ = injecting_proxy
     token, _ = server.token_store.issue("claude_code", "sess-redact")
     assert token not in redact_secrets(f"echo {token}")
+
+
+# ---------------------------------------------------------------------------
+# Per-token request budgets
+# ---------------------------------------------------------------------------
+
+
+def test_request_budget_is_enforced_atomically_and_audited(injecting_proxy, upstream):
+    server, client = injecting_proxy
+    token, record = server.token_store.issue("antigravity", "trial-1", max_requests=2)
+
+    statuses = [
+        client.post("/v1/messages", json=ANTHROPIC_BODY, headers={"x-api-key": token}).status_code
+        for _ in range(3)
+    ]
+
+    assert statuses == [200, 200, 429]
+    assert len(upstream) == 2
+    denied = [e for e in server.events if e["outcome"]["status"] == "blocked"]
+    assert len(denied) == 1
+    assert denied[0]["context"]["capture"]["identity_check"] == "budget_exhausted"
+    assert denied[0]["agent"]["session_id"] == "trial-1"
+    assert denied[0]["context"]["capture"]["upstream_forwarded"] is False
+    (listed,) = [t for t in server.token_store.list_tokens() if t["token_id"] == record["token_id"]]
+    assert (listed["requests_used"], listed["max_requests"]) == (2, 2)
+
+
+def test_unbudgeted_tokens_stay_unlimited_and_resolve_does_not_consume(tmp_path):
+    store = SessionTokenStore(AuditDB(str(tmp_path / "audit.db")))
+    token, _ = store.issue("codex", "s")
+    for _ in range(5):
+        store.resolve(token, consume=True)
+    store.resolve(token)
+    (listed,) = store.list_tokens()
+    assert (listed["requests_used"], listed["max_requests"]) == (5, None)
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 1.5, 10**9])
+def test_token_issue_rejects_invalid_request_budgets(tmp_path, budget):
+    store = SessionTokenStore(AuditDB(str(tmp_path / "audit.db")))
+    with pytest.raises(ValidationError):
+        store.issue("codex", "s", max_requests=budget)
+
+
+def test_budget_columns_are_added_to_older_token_tables(tmp_path):
+    path = str(tmp_path / "audit.db")
+    AuditDB(path).close()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE session_tokens (token_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, "
+            "agent_type TEXT NOT NULL, session_id TEXT NOT NULL, issued_at INTEGER NOT NULL, "
+            "expires_at INTEGER NOT NULL, revoked_at INTEGER)"
+        )
+    store = SessionTokenStore(AuditDB(path))
+    token, _ = store.issue("codex", "s", max_requests=1)
+    store.resolve(token, consume=True)
+    with pytest.raises(TokenRejected) as rejected:
+        store.resolve(token, consume=True)
+    assert rejected.value.reason == "budget_exhausted"
+
+
+def test_correlation_id_joins_exchanges_without_changing_identity(injecting_proxy, upstream):
+    server, client = injecting_proxy
+    token, _ = server.token_store.issue("antigravity", "trial-9")
+
+    for attempt in ("attempt-a", "attempt-b"):
+        response = client.post(
+            "/v1/messages", json=ANTHROPIC_BODY,
+            headers={"x-api-key": token, "X-Panoptes-Correlation-Id": attempt},
+        )
+        assert response.status_code == 200
+
+    by_attempt = {}
+    for event in server.events:
+        assert event["agent"]["session_id"] == "trial-9"
+        capture = event["context"]["capture"]
+        assert capture["identity_assurance"] == "panoptes_session_token"
+        by_attempt.setdefault(capture["client_correlation_id"], []).append(event["agent"]["run_id"])
+    assert set(by_attempt) == {"attempt-a", "attempt-b"}
+    assert all(len(set(run_ids)) == 1 and len(run_ids) == 2 for run_ids in by_attempt.values())
+    assert all("correlation" not in key.lower() for sent in upstream for key in sent["headers"])
+
+
+def test_invalid_correlation_id_is_rejected_before_forwarding(injecting_proxy, upstream):
+    server, client = injecting_proxy
+    token, _ = server.token_store.issue("antigravity", "trial-9")
+    response = client.post(
+        "/v1/messages", json=ANTHROPIC_BODY,
+        headers={"x-api-key": token, "X-Panoptes-Correlation-Id": "x" * 300},
+    )
+    assert response.status_code == 400
+    assert upstream == []

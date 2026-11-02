@@ -7,6 +7,29 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ### Added
 
+- `panoptes token issue --max-requests N` caps how many proxied requests a token
+  may authorize. Each request presenting a live token spends one unit atomically,
+  including requests the provider later rejects. Once spent, the proxy answers
+  HTTP 429, never forwards upstream, and records a blocked event attributed to the
+  token's session (`identity_check: budget_exhausted`). `token list` shows
+  used/maximum. Older token tables gain the columns on first write access.
+- `panoptes proxy --pricing FILE` loads a versioned JSON rate table (`version`,
+  `source`, `currency: USD`, per-model `input_per_million`,
+  `cached_input_per_million`, `output_per_million`). Priced responses record
+  `cost.estimated_usd` and `cost.pricing_version`. A response is never priced from
+  a guessed rate: unknown models or missing token counts stay unpriced.
+- `panoptes token issue --max-usd CAP --reserve-usd HOLD` gives a token a dollar cap.
+  Admission holds the reservation atomically, so concurrent requests cannot jointly
+  pass the cap; settlement replaces the hold with the priced cost, or charges the
+  whole reservation when the response cannot be priced (provider errors are not
+  billed). Once the cap cannot fit another reservation the proxy answers HTTP 429
+  and records `identity_check: usd_budget_exhausted`. The cap is hard while no single
+  response costs more than the reservation. `token list` shows spend.
+- `X-Panoptes-Correlation-Id` request header: a validated, client-asserted ID
+  recorded as `context.capture.client_correlation_id` on every event of the
+  exchange so an external journal can be joined to Panoptes events one-to-one.
+  It is stripped before forwarding and never changes agent type, session, or
+  identity assurance. Invalid values get HTTP 400.
 - `panoptes doctor` checks local database access, policy configuration, optional
   credential injection setup, and recent audit activity without modifying audit
   data or contacting providers. Reports requested settings separately from

@@ -353,7 +353,10 @@ def cmd_token_issue(args):
 
     store = SessionTokenStore(AuditDB(args.db_path))
     try:
-        token, record = store.issue(args.agent, args.session, args.ttl)
+        token, record = store.issue(
+            args.agent, args.session, args.ttl, args.max_requests,
+            max_usd=args.max_usd, reserve_usd=args.reserve_usd,
+        )
     except ValidationError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(2)
@@ -399,7 +402,13 @@ def cmd_token_list(args):
             state = "live"
         print(
             f"{t['token_id']} | {t['agent_type']} | {t['session_id']} | "
-            f"expires {_format_epoch(t['expires_at'])} | {state}"
+            f"expires {_format_epoch(t['expires_at'])} | {state} | "
+            f"requests {t['requests_used']}/{t['max_requests'] if t['max_requests'] is not None else 'unlimited'}"
+            + (
+                f" | usd {t['usd_used_micros'] / 1e6:.6f}/{t['max_usd_micros'] / 1e6:.6f}"
+                if t["max_usd_micros"] is not None
+                else ""
+            )
         )
 
 
@@ -631,6 +640,10 @@ def main(argv=None):
         ),
     )
     gate_opts.add_argument(
+        "--pricing",
+        help="Versioned JSON rate table; prices responses and settles dollar-capped tokens",
+    )
+    gate_opts.add_argument(
         "--credentials-file",
         help="Owner-only (0600) YAML mapping of provider name to API key",
     )
@@ -742,6 +755,22 @@ def main(argv=None):
         default=8 * 60 * 60,
         help="Lifetime in seconds (default: 28800)",
     )
+    token_issue.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Cap on proxied requests this token may authorize (default: unlimited)",
+    )
+    token_issue.add_argument(
+        "--max-usd",
+        default=None,
+        help="Dollar cap for this token; needs --reserve-usd and a proxy started with --pricing",
+    )
+    token_issue.add_argument(
+        "--reserve-usd",
+        default=None,
+        help="Most one request may cost; held at admission, replaced by the priced cost",
+    )
     token_revoke = token_subs.add_parser(
         "revoke", help="Revoke a session token", parents=[db_opts]
     )
@@ -802,6 +831,15 @@ def main(argv=None):
     if args.command == "proxy":
         from panoptes.proxy import start_proxy
 
+        pricing = None
+        if getattr(args, "pricing", None):
+            from panoptes.pricing import PricingError, PricingTable
+
+            try:
+                pricing = PricingTable.load(args.pricing)
+            except PricingError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                raise SystemExit(2)
         provider_keys = None
         if args.inject_credentials:
             from panoptes.credentials import CredentialConfigError, load_provider_keys
@@ -822,6 +860,7 @@ def main(argv=None):
             client_socket_timeout_seconds=args.client_timeout,
             max_concurrent_requests=args.max_concurrent_requests,
             provider_keys=provider_keys,
+            pricing=pricing,
         )
     elif args.command == "token":
         token_commands = {

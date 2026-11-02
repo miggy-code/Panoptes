@@ -65,6 +65,7 @@ from panoptes.schema import (
     redact_secrets,
     utcnow_iso,
     validate_event,
+    validate_identifier,
 )
 
 import panoptes.providers as _providers
@@ -394,10 +395,12 @@ class AuditEventWriter:
         policies_dir: str | None = None,
         policy_failure_mode: str = "fail_open",
         max_tool_events_per_exchange: int = DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE,
+        pricing: Any = None,
     ) -> None:
         if max_tool_events_per_exchange <= 0:
             raise ValueError("max_tool_events_per_exchange must be positive")
         self.db = db
+        self.pricing = pricing
         self._session_id: str | None = None
         self.policy_engine: Any = None
         self.policy_failure_mode = policy_failure_mode
@@ -463,7 +466,13 @@ class AuditEventWriter:
         turn_number: int,
         streaming: bool,
         token_identity: bool = False,
+        correlation_id: str | None = None,
     ) -> dict:
+        capture = self._capture_metadata(streaming, token_identity)
+        if correlation_id is not None:
+            # A client assertion for joining this exchange to an external journal;
+            # it never changes agent type, session, or identity assurance.
+            capture["client_correlation_id"] = correlation_id
         return {
             "event_id": uuid.uuid4().hex,
             "timestamp": utcnow_iso(),
@@ -473,7 +482,7 @@ class AuditEventWriter:
             "outcome": {},
             "context": {
                 "turn_number": turn_number,
-                "capture": self._capture_metadata(streaming, token_identity),
+                "capture": capture,
             },
             "cost": {},
         }
@@ -543,6 +552,9 @@ class AuditEventWriter:
             or run_id
         )
         token_identity = identity is not None
+        correlation_id = _lower_keys(req_headers).get("x-panoptes-correlation-id")
+        if correlation_id is not None:
+            validate_identifier(correlation_id, "correlation_id")
 
         exchange_ctx = {
             "run_id": run_id,
@@ -553,6 +565,7 @@ class AuditEventWriter:
             "req_info": req_info,
             "turn_number": turn_number,
             "token_identity": token_identity,
+            "correlation_id": correlation_id,
         }
 
         def _base(event_type: str) -> dict:
@@ -560,6 +573,7 @@ class AuditEventWriter:
                 event_type, run_id=run_id, session_id=session_id,
                 agent_type=agent_type, turn_number=turn_number,
                 streaming=req_info["stream"], token_identity=token_identity,
+                correlation_id=correlation_id,
             )
 
         events: list[dict] = []
@@ -662,6 +676,7 @@ class AuditEventWriter:
                 agent_type=agent_type, turn_number=turn_number,
                 streaming=bool(req_info.get("stream", False)),
                 token_identity=bool(exchange_ctx.get("token_identity")),
+                correlation_id=exchange_ctx.get("correlation_id"),
             )
 
         events: list[dict] = []
@@ -682,6 +697,15 @@ class AuditEventWriter:
 
         if isinstance(resp_body, dict):
             resp_event["cost"] = provider.extract_usage(resp_body)
+        if resp_status >= 400:
+            # An error response from the provider is not billed.
+            exchange_ctx["cost_micros"] = 0
+        elif self.pricing is not None:
+            micros = self.pricing.cost_micros(req_info["model"], resp_event["cost"])
+            if micros is not None:
+                resp_event["cost"]["estimated_usd"] = micros / 1_000_000
+                resp_event["cost"]["pricing_version"] = self.pricing.version
+                exchange_ctx["cost_micros"] = micros
 
         resp_event["raw_response"] = _cap_raw(resp_body)
         if (
@@ -1109,6 +1133,7 @@ HOP_BY_HOP = frozenset({
 PANOPTES_INTERNAL_HEADERS = frozenset({
     "x-panoptes-agent",
     "x-panoptes-session",
+    "x-panoptes-correlation-id",
 })
 
 # Credential injection: every client credential is stripped, and only the
@@ -1752,6 +1777,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # Main request handler
     # ------------------------------------------------------------------
 
+    def _serve_request(self, method: str) -> None:
+        """Run one proxied request and settle its dollar hold however it ends."""
+        self._usd_hold: SessionIdentity | None = None
+        self._exchange_ctx: dict = {}
+        try:
+            self._handle_request(method)
+        finally:
+            hold = self._usd_hold
+            if hold is not None and hold.reserved_usd_micros > 0:
+                try:
+                    # Unpriced or unfinished exchanges are charged their full reservation.
+                    self.token_store.settle(hold, self._exchange_ctx.get("cost_micros"))
+                except Exception:
+                    log.exception("Could not settle a dollar hold")
+
     def _handle_request(self, method: str) -> None:
         """Handle a proxied request: parse → pre-flight → forward → post-flight → respond."""
         t0 = time.monotonic()
@@ -1788,14 +1828,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if token_store is None:
                     raise TokenRejected("unknown")
                 identity = token_store.resolve(
-                    _presented_token(provider, self.headers, query_credentials)
+                    _presented_token(provider, self.headers, query_credentials),
+                    consume=True,
                 )
+                self._usd_hold = identity
             except TokenRejected as exc:
+                budget_spent = exc.reason in ("budget_exhausted", "usd_budget_exhausted")
                 self._deny_before_upstream(
                     method, path, req_headers, body,
-                    status=401,
-                    message="A valid Panoptes session token is required",
+                    status=429 if budget_spent else 401,
+                    message=(
+                        "The Panoptes session token's "
+                        + ("dollar" if exc.reason == "usd_budget_exhausted" else "request")
+                        + " budget is exhausted"
+                        if budget_spent
+                        else "A valid Panoptes session token is required"
+                    ),
                     reason=exc.reason,
+                    identity=exc.identity,
                 )
                 return
             provider_key = provider_keys.get(provider)
@@ -1839,6 +1889,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     path=path, method=method, req_headers=req_headers,
                     req_body=req_body, identity=identity,
                 )
+                self._exchange_ctx = exchange_ctx
             except (ValidationError, SSEParseError, ValueError) as exc:
                 log.warning("Rejected invalid proxy audit context: %s", exc)
                 self._send_json_error(
@@ -2416,10 +2467,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(resp_body_bytes)
 
     def do_GET(self) -> None:
-        self._handle_request("GET")
+        self._serve_request("GET")
 
     def do_POST(self) -> None:
-        self._handle_request("POST")
+        self._serve_request("POST")
 
 # ---------------------------------------------------------------------------
 # ProxyServer
@@ -2493,6 +2544,7 @@ class ProxyServer:
         client_socket_timeout_seconds: float = DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS,
         max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
         provider_keys: dict[str, str] | None = None,
+        pricing: Any = None,
     ) -> None:
         if not _is_loopback_bind_host(host):
             raise ValueError(
@@ -2520,6 +2572,7 @@ class ProxyServer:
         self.client_socket_timeout_seconds = client_socket_timeout_seconds
         self.max_concurrent_requests = max_concurrent_requests
         self.provider_keys = dict(provider_keys) if provider_keys is not None else None
+        self.pricing = pricing
         self.token_store: SessionTokenStore | None = None
         self._server: http.server.HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -2549,6 +2602,7 @@ class ProxyServer:
                 policies_dir=self.policies_dir,
                 policy_failure_mode=self.policy_failure_mode,
                 max_tool_events_per_exchange=self.max_tool_events_per_exchange,
+                pricing=self.pricing,
             )
             if self.provider_keys is not None:
                 self.token_store = SessionTokenStore(self._db)
@@ -2658,6 +2712,7 @@ def start_proxy(
     client_socket_timeout_seconds: float = DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS,
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
     provider_keys: dict[str, str] | None = None,
+    pricing: Any = None,
 ) -> None:
     """Start the audit proxy server (called from panoptes.cli)."""
     logging.basicConfig(
@@ -2681,6 +2736,7 @@ def start_proxy(
         client_socket_timeout_seconds=client_socket_timeout_seconds,
         max_concurrent_requests=max_concurrent_requests,
         provider_keys=provider_keys,
+        pricing=pricing,
     )
     actual_port = server.start()
 
