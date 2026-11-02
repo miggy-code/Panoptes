@@ -16,6 +16,7 @@ from .schema import (
     SCHEMA_VERSION,
     ValidationError,
     _redact_capture_metadata,
+    check_strict_identifiers,
     extract_index_fields,
     normalize_event,
     redact_secrets,
@@ -898,10 +899,24 @@ class AuditDB:
 
     # ── Insert ────────────────────────────────────────────────────────────
 
-    def insert_events(self, events: List[Dict[str, Any]]) -> List[str]:
+    def insert_events(
+        self,
+        events: List[Dict[str, Any]],
+        *,
+        strict: bool = False,
+        strict_paths: Tuple[str, ...] = (),
+    ) -> List[str]:
         """Validate, normalize, and insert a batch of events in one transaction.
 
         Returns a list of event_ids in the same order as *events*.
+
+        ``strict=True`` raises ``IdentifierRewriteError`` (a ``ValidationError``)
+        instead of storing an event whose identifier fields redaction would
+        alter; free text is still redacted. The identifier fields are
+        ``schema.STRICT_IDENTIFIER_PATHS`` plus any dotted *strict_paths* the
+        caller names (``attributes.rule_ids[]`` for every list element).
+        Naming ``strict_paths`` implies strict. The check runs before any
+        write, so a refused event leaves the batch and the chain untouched.
 
         Idempotency is intentionally limited to an identical canonical payload
         with the same stable event_id. Raw inputs changed by redaction cannot be
@@ -934,6 +949,8 @@ class AuditDB:
                     event.get("event_id"), warnings,
                 )
             normalized = normalize_event(event)
+            if strict or strict_paths:
+                check_strict_identifiers(event, normalized, tuple(strict_paths))
             # Normalization is part of the trust boundary too. Revalidate its
             # output so a classifier/defaulting regression cannot smuggle a
             # non-schema or non-JSON value into the immutable audit trail.
@@ -1013,16 +1030,24 @@ class AuditDB:
                 conn.rollback()
                 raise
 
-    def insert_event(self, event: Dict[str, Any]) -> str:
+    def insert_event(
+        self,
+        event: Dict[str, Any],
+        *,
+        strict: bool = False,
+        strict_paths: Tuple[str, ...] = (),
+    ) -> str:
         """Validate, normalize, and insert a single event. Returns the event_id.
 
         Delegates to insert_events for a single-element batch so that both
         methods share the same code path (validation, normalization, conflict,
-        rollback on error).
+        rollback on error). See ``insert_events`` for ``strict``.
 
         Raises ValidationError if required fields are missing or invalid.
         """
-        return self.insert_events([event])[0]
+        return self.insert_events(
+            [event], strict=strict, strict_paths=strict_paths
+        )[0]
 
     # ── Tamper-evidence hash chain ────────────────────────────────────────
 

@@ -1211,6 +1211,80 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+# ── Strict ingest ─────────────────────────────────────────────────────────────
+
+class IdentifierRewriteError(ValidationError):
+    """Raised by strict ingest when redaction would alter an identifier field."""
+
+
+# Fields that name something and so must be stored exactly as given. Most are
+# already refused outright when they look secret-bearing; ``action.target``
+# and ``agent.version`` are not, and are otherwise redacted in place. A path
+# ending in ``[]`` applies to every element of a list.
+STRICT_IDENTIFIER_PATHS = (
+    "event_id",
+    "correlation_id",
+    "agent.type",
+    "agent.version",
+    "agent.session_id",
+    "agent.run_id",
+    "agent.parent_run_id",
+    "user.id",
+    "user.auth_method",
+    "action.tool_name",
+    "action.call_id",
+    "action.target",
+    "action.tool_names[]",
+)
+
+_MISSING = object()
+
+
+def _values_at(root: Any, path: str) -> List[Any]:
+    """Every value *path* reaches in *root*; absent keys reach nothing."""
+    nodes = [root]
+    for part in path.split("."):
+        each = part.endswith("[]")
+        key = part[:-2] if each else part
+        reached: List[Any] = []
+        for node in nodes:
+            value = node.get(key, _MISSING) if isinstance(node, dict) else _MISSING
+            if value is _MISSING:
+                continue
+            if each:
+                if isinstance(value, list):
+                    reached.extend(value)
+            else:
+                reached.append(value)
+        nodes = reached
+    return nodes
+
+
+def check_strict_identifiers(
+    raw_event: Dict[str, Any],
+    normalized: Dict[str, Any],
+    extra_paths: Tuple[str, ...] = (),
+) -> None:
+    """Refuse an event whose identifier fields normalization changed.
+
+    Redaction is right for free text and wrong for an identifier: a rewritten
+    id silently names a different thing, and two distinct secret-shaped ids
+    would collapse into one. Only *changes* are refused, so an absent field,
+    or a default Panoptes fills in, is not an error. The error names the field
+    and never its value.
+    """
+    for path in STRICT_IDENTIFIER_PATHS + tuple(extra_paths):
+        before = _values_at(raw_event, path)
+        if not before:
+            continue
+        after = _values_at(normalized, path)
+        if before != after:
+            raise IdentifierRewriteError(
+                f"strict ingest: redaction would rewrite identifier {path}; "
+                "the event was not stored"
+            )
+
+
 # ── Helper: extract flattened fields for SQLite indexing ──────────────────────
 
 def extract_index_fields(event: Dict[str, Any]) -> Dict[str, Any]:
