@@ -165,6 +165,12 @@ _CHAIN_META_KEYS = frozenset({
 })
 
 
+# Recorded in chain_meta when a database was deliberately created without a
+# hash chain. Without it, a v4+ database that has no chain metadata is treated
+# as one whose chain was stripped, and refused.
+_CHAIN_OFF_KEY = "chain_disabled"
+
+
 class EventConflictError(ValueError):
     """Raised when an event_id is reused for a different canonical event."""
 
@@ -412,8 +418,10 @@ def _initialize_chain(conn: sqlite3.Connection) -> Dict[str, Any]:
     return _checkpoint_from_meta(values)
 
 
-def _load_chain_for_append(conn: sqlite3.Connection) -> Dict[str, Any]:
+def _load_chain_for_append(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     """Load and minimally validate the chain head while holding a write lock.
+
+    Returns ``None`` for a database deliberately created without a chain.
 
     Appends are on the ingestion hot path.  Full-table count/link validation
     belongs to ``verify_chain()``; doing it before every insert makes capture
@@ -423,6 +431,8 @@ def _load_chain_for_append(conn: sqlite3.Connection) -> Dict[str, Any]:
     that the indexed last event still anchors the recorded head.
     """
     meta = _read_chain_meta(conn)
+    if not meta and _chain_disabled(conn):
+        return None
     checkpoint = _checkpoint_from_meta(meta) if meta else _initialize_chain(conn)
     if (
         checkpoint["format_version"] != _CHAIN_FORMAT_VERSION
@@ -591,6 +601,108 @@ def _build_filter_clause(
     return where_clause, params
 
 
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _chain_disabled(conn: sqlite3.Connection) -> bool:
+    """Whether this database was deliberately created without a hash chain."""
+    return conn.execute(
+        "SELECT 1 FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,)
+    ).fetchone() is not None
+
+
+def _unchained_checkpoint(legacy_events: int) -> Dict[str, Any]:
+    """The checkpoint of a database that carries no hash chain."""
+    return {
+        "chain": "absent",
+        "initialized": False,
+        "format_version": _CHAIN_FORMAT_VERSION,
+        "algorithm": _CHAIN_ALGORITHM,
+        "anchor": None,
+        "head": None,
+        "event_count": 0,
+        "legacy_event_count": legacy_events,
+        "started_at": None,
+        "first_event_id": None,
+        "last_event_id": None,
+        "coverage": "none",
+        "checkpoint_scope": "database_internal",
+        "external_anchor_required": True,
+    }
+
+
+def _absent_chain_report(legacy_events: int, error: str) -> Dict[str, Any]:
+    """The verification result for a database that carries no hash chain.
+
+    ``valid`` is never true: nothing was verified, and an empty or unchained
+    log must not read as one whose integrity was checked.
+    """
+    return {
+        **_unchained_checkpoint(legacy_events),
+        "valid": False,
+        "checked_events": 0,
+        "broken_event_id": None,
+        "error": error,
+    }
+
+
+def _settle_chain_mode(
+    conn: sqlite3.Connection, chain: Optional[bool], schema_version: int
+) -> None:
+    """Decide, once per open and inside the schema transaction, chained or not.
+
+    ``chain=None`` follows the database: an existing one keeps its mode and a
+    new one is chained. ``True`` requires a chain (starting one at this
+    boundary on an unchained database, with the existing rows explicitly
+    outside it). ``False`` creates an unchained database, and is refused on a
+    chained one: a chain is never dropped by opening a file differently.
+    """
+    meta = _read_chain_meta(conn)
+    disabled = _chain_disabled(conn)
+    if meta and disabled:
+        raise ChainIntegrityError(
+            "Database records both a hash chain and a disabled chain"
+        )
+    if meta:
+        _checkpoint_from_meta(meta)
+        if chain is False:
+            raise ChainIntegrityError(
+                "Refusing to open a chained database with chain=False; "
+                "a hash chain cannot be dropped by reopening the file"
+            )
+        return
+    if disabled:
+        if conn.execute(
+            "SELECT 1 FROM events WHERE prev_hash IS NOT NULL "
+            "OR event_hash IS NOT NULL LIMIT 1"
+        ).fetchone():
+            raise ChainIntegrityError(
+                "Database is marked unchained but holds hash-chained events"
+            )
+        if chain is True:
+            conn.execute("DELETE FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,))
+            _initialize_chain(conn)
+        return
+    if schema_version >= 4:
+        # Every released Panoptes (schema v4) recorded its boundary in the
+        # transaction that created or migrated it, and a deliberate opt-out
+        # leaves a marker. Re-anchoring now would demote the whole history to
+        # unverified legacy rows.
+        raise ChainIntegrityError(
+            "Hash-chain metadata is missing from a chained database"
+        )
+    if chain is False:
+        conn.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?, ?)",
+            (_CHAIN_OFF_KEY, "1"),
+        )
+    else:
+        _initialize_chain(conn)
+
+
 _RANGE_FILTER_FIELDS = ("since", "until", "data_accessed")
 _QUERY_FILTER_NAMES = frozenset(
     _FILTER_FIELDS + _RANGE_FILTER_FIELDS + ("limit", "offset")
@@ -619,7 +731,7 @@ def _aliased_columns(columns: Tuple[str, ...], existing: frozenset) -> str:
     )
 
 
-def _ensure_schema(db: "AuditDB") -> None:
+def _ensure_schema(db: "AuditDB", chain: Optional[bool] = None) -> None:
     """Create tables and indices if they don't exist; migrate if needed.
 
     Migration path:
@@ -719,18 +831,7 @@ def _ensure_schema(db: "AuditDB") -> None:
 
         # Establish the boundary at migration/open time, not at some later
         # first insert. Existing rows remain explicitly outside chain coverage.
-        chain_meta = _read_chain_meta(conn)
-        if chain_meta:
-            _checkpoint_from_meta(chain_meta)
-        elif current >= 4:
-            # Every released Panoptes (schema v4) recorded its boundary in the
-            # transaction that created or migrated it. Re-anchoring now would
-            # demote the whole history to unverified legacy rows.
-            raise ChainIntegrityError(
-                "Hash-chain metadata is missing from a chained database"
-            )
-        else:
-            _initialize_chain(conn)
+        _settle_chain_mode(conn, chain, current)
 
         if current < SCHEMA_VERSION:
             conn.execute(
@@ -790,9 +891,21 @@ class AuditDB:
     ]
 
     def __init__(
-        self, db_path: str = "~/.panoptes/audit.db", *, read_only: bool = False
+        self,
+        db_path: str = "~/.panoptes/audit.db",
+        *,
+        read_only: bool = False,
+        chain: Optional[bool] = None,
     ):
         """Open (creating and migrating) an audit database.
+
+        ``chain`` selects the local tamper-evidence hash chain. ``None``
+        (default) follows the database: an existing one keeps its mode and a
+        new one is chained. ``True`` requires a chain, starting one on an
+        unchained database at this boundary. ``False`` creates an unchained
+        database; it is refused (``ChainIntegrityError``) on a chained one,
+        because a chain must never be dropped silently. An unchained database
+        verifies as ``chain: "absent"``, never as valid.
 
         ``read_only=True`` opens an existing, current-version database over
         SQLite ``mode=ro`` connections: it never creates, migrates, re-anchors,
@@ -801,6 +914,11 @@ class AuditDB:
         self._db_path = os.path.expanduser(db_path)
         self._is_memory = self._db_path == ":memory:"
         self._read_only = read_only
+        if chain is not None and not isinstance(chain, bool):
+            raise ValueError("chain must be True, False or None")
+        if read_only and chain is not None:
+            raise ValueError("A read-only audit database cannot select a chain")
+        self._chain = chain
         if read_only and self._is_memory:
             raise ValueError("A read-only audit database needs a file path")
         if read_only:
@@ -854,7 +972,7 @@ class AuditDB:
                 _restrict_database_files(self._db_path)
 
             # Run migrations / create tables
-            _ensure_schema(self)
+            _ensure_schema(self, chain)
             self._refresh_columns()
         except Exception:
             self.close()
@@ -1026,6 +1144,7 @@ class AuditDB:
                 conn.execute("BEGIN IMMEDIATE")
                 event_ids: List[str] = []
                 checkpoint: Optional[Dict[str, Any]] = None
+                chain_loaded = False
                 payload_columns = ", ".join(_ALL_PAYLOAD_COLUMNS)
 
                 for normalized, flat, input_requires_redaction in prepared:
@@ -1064,8 +1183,15 @@ class AuditDB:
                         event_ids.append(existing["event_id"])
                         continue
 
-                    if checkpoint is None:
+                    if not chain_loaded:
                         checkpoint = _load_chain_for_append(conn)
+                        chain_loaded = True
+
+                    if checkpoint is None:
+                        # Deliberately unchained database: no hash, no head.
+                        conn.execute(_INSERT_SQL, values + (None, None))
+                        event_ids.append(event_id)
+                        continue
 
                     prev_hash = checkpoint["head"]
                     digest = _event_hash(prev_hash, payload)
@@ -1120,6 +1246,11 @@ class AuditDB:
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN")
+                if not self._chain_storage_present(conn):
+                    # A file that predates the chain has no columns to count.
+                    total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                    conn.commit()
+                    return _unchained_checkpoint(total)
                 meta = _read_chain_meta(conn)
                 if meta:
                     checkpoint = _checkpoint_from_meta(meta)
@@ -1136,26 +1267,19 @@ class AuditDB:
                         raise ChainIntegrityError(
                             "Hashed events exist but hash-chain metadata is missing"
                         )
-                    checkpoint = {
-                        "initialized": False,
-                        "format_version": _CHAIN_FORMAT_VERSION,
-                        "algorithm": _CHAIN_ALGORITHM,
-                        "anchor": None,
-                        "head": None,
-                        "event_count": 0,
-                        "legacy_event_count": legacy_count,
-                        "started_at": None,
-                        "first_event_id": None,
-                        "last_event_id": None,
-                        "coverage": "none",
-                        "checkpoint_scope": "database_internal",
-                        "external_anchor_required": True,
-                    }
+                    checkpoint = _unchained_checkpoint(legacy_count)
                 conn.commit()
                 return checkpoint
             except Exception:
                 conn.rollback()
                 raise
+
+    def _chain_storage_present(self, conn: sqlite3.Connection) -> bool:
+        """Whether this file has the columns and table a hash chain lives in."""
+        return (
+            {"prev_hash", "event_hash"} <= self._existing_columns
+            and _has_table(conn, "chain_meta")
+        )
 
     def verify_chain(self) -> Dict[str, Any]:
         """Verify links, canonical event hashes, head, count, and boundary.
@@ -1163,12 +1287,29 @@ class AuditDB:
         Returns a structured result instead of raising for detected tampering,
         so callers can report the first broken event. Operational SQLite errors
         still propagate.
+
+        ``result["chain"]`` is ``"intact"`` (verified, ``valid`` is true),
+        ``"broken"`` (tampering or corruption found, ``valid`` is false) or
+        ``"absent"`` (the database carries no hash chain, so nothing was
+        verified; ``valid`` is false). An unchained or empty-chain log is
+        never reported valid.
         """
+        result = self._verify_chain()
+        result.setdefault("chain", "intact" if result.get("valid") else "broken")
+        return result
+
+    def _verify_chain(self) -> Dict[str, Any]:
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN")
-                meta = _read_chain_meta(conn)
                 total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                if not self._chain_storage_present(conn):
+                    conn.commit()
+                    return _absent_chain_report(
+                        total,
+                        "No hash chain: this database predates the hash chain",
+                    )
+                meta = _read_chain_meta(conn)
                 partial_count = conn.execute(
                     """
                     SELECT COUNT(*) FROM events
@@ -1183,32 +1324,24 @@ class AuditDB:
                 legacy_count = total - chained_count - partial_count
 
                 if not meta:
-                    result = {
-                        "valid": total == 0,
-                        "initialized": False,
-                        "format_version": _CHAIN_FORMAT_VERSION,
-                        "algorithm": _CHAIN_ALGORITHM,
-                        "anchor": None,
-                        "head": None,
-                        "event_count": 0,
-                        "legacy_event_count": legacy_count,
-                        "started_at": None,
-                        "first_event_id": None,
-                        "last_event_id": None,
-                        "coverage": "none",
-                        "checkpoint_scope": "database_internal",
-                        "external_anchor_required": True,
-                        "checked_events": 0,
-                        "broken_event_id": None,
-                        "error": (
-                            "Hashed events exist without hash-chain metadata"
-                            if partial_count or chained_count
-                            else "Events exist but the hash chain is not initialized"
-                            if total else None
-                        ),
-                    }
+                    if partial_count or chained_count:
+                        # Hashes without metadata: the chain was stripped.
+                        error = "Hashed events exist without hash-chain metadata"
+                        report = {**_absent_chain_report(legacy_count, error),
+                                  "chain": "broken"}
+                    elif _chain_disabled(conn):
+                        report = _absent_chain_report(
+                            legacy_count,
+                            "No hash chain: this database was created unchained",
+                        )
+                    else:
+                        report = _absent_chain_report(
+                            legacy_count,
+                            "Events exist but the hash chain is not initialized"
+                            if total else "No hash chain has been started",
+                        )
                     conn.commit()
-                    return result
+                    return report
 
                 try:
                     checkpoint = _checkpoint_from_meta(meta)
