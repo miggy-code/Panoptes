@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS events (
     raw_request     TEXT,
     raw_response    TEXT,
 
+    -- v5: correlation and lineage, plus the open attributes object
+    correlation_id  TEXT,
+    parent_run_id   TEXT,
+    attributes      TEXT,
+
     -- Tamper-evidence hash chain (v3; populated atomically on every insert)
     prev_hash       TEXT,
     event_hash      TEXT
@@ -85,6 +90,14 @@ CREATE_INDICES = [
     # idx_events_call_id is created after ensuring the call_id column exists.
 ]
 
+# v5 index columns are added by migration on older databases, so these are
+# created only after the columns are known to exist.
+CREATE_V5_INDICES = [
+    "CREATE INDEX IF NOT EXISTS idx_events_correlation_id ON events(correlation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_parent_run_id  ON events(parent_run_id)",
+]
+_V5_COLUMNS = ("correlation_id", "parent_run_id", "attributes")
+
 CREATE_CALL_ID_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_events_call_id ON events(call_id)"
 )
@@ -104,12 +117,16 @@ INSERT INTO events (
     event_id, timestamp, agent_type, session_id, run_id,
     event_type, tool_name, data_accessed, call_id,
     agent, user_info, action, outcome, context, cost,
-    raw_request, raw_response, prev_hash, event_hash
+    raw_request, raw_response,
+    correlation_id, parent_run_id, attributes,
+    prev_hash, event_hash
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?
+    ?, ?,
+    ?, ?, ?,
+    ?, ?
 )
 """
 
@@ -121,9 +138,16 @@ _EVENT_PAYLOAD_COLUMNS = (
     "agent", "user_info", "action", "outcome", "context", "cost",
     "raw_request", "raw_response",
 )
+# Columns added by schema v5. They enter the hashed payload only when set, so
+# a row without them hashes exactly as it did under v4 and every pre-v5 chain
+# keeps verifying, while altering, adding or stripping a v5 field still breaks
+# the hash.
+_V5_PAYLOAD_COLUMNS = _V5_COLUMNS
+_ALL_PAYLOAD_COLUMNS = _EVENT_PAYLOAD_COLUMNS + _V5_PAYLOAD_COLUMNS
 _EVENT_JSON_COLUMNS = frozenset({
     "agent", "user_info", "action", "outcome", "context", "cost",
 })
+_OPTIONAL_JSON_COLUMNS = frozenset({"attributes"})
 
 _CHAIN_FORMAT_VERSION = "1"
 _CHAIN_ALGORITHM = "sha256"
@@ -209,6 +233,8 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
         "cost": _deserialize(row["cost"]),
         "raw_request": row["raw_request"],
         "raw_response": row["raw_response"],
+        "correlation_id": row["correlation_id"],
+        "attributes": _deserialize(row["attributes"]) or {},
     }
 
 
@@ -244,20 +270,32 @@ def _build_params(normalized: Dict[str, Any], flat: Dict[str, Any]) -> tuple:
         _serialize(normalized["cost"]),
         _raw_payload_text(normalized.get("raw_request")),
         _raw_payload_text(normalized.get("raw_response")),
+        _as_sql_text(flat.get("correlation_id")),
+        _as_sql_text(flat.get("parent_run_id")),
+        _serialize(normalized["attributes"]) if normalized.get("attributes") else None,
     )
 
 
 def _canonical_payload_from_values(values: tuple) -> Dict[str, Any]:
-    """Build the canonical event payload from values destined for SQLite."""
-    payload: Dict[str, Any] = dict(zip(_EVENT_PAYLOAD_COLUMNS, values))
+    """Build the canonical event payload from values destined for SQLite.
+
+    v5 columns that are unset are left out entirely, which is what makes a
+    v5 writer's hash of a field-less event identical to v4's.
+    """
+    payload: Dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values))
     for column in _EVENT_JSON_COLUMNS:
         payload[column] = json.loads(payload[column])
+    for column in _V5_PAYLOAD_COLUMNS:
+        if payload[column] is None:
+            del payload[column]
+        elif column in _OPTIONAL_JSON_COLUMNS:
+            payload[column] = json.loads(payload[column])
     return payload
 
 
 def _canonical_payload_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     """Build the canonical event payload from a stored SQLite row."""
-    values = tuple(row[column] for column in _EVENT_PAYLOAD_COLUMNS)
+    values = tuple(row[column] for column in _ALL_PAYLOAD_COLUMNS)
     return _canonical_payload_from_values(values)
 
 
@@ -269,9 +307,11 @@ def _rewritten_json_column(row: sqlite3.Row) -> Optional[str]:
     where Python keeps the last) reads a different value in queries and
     aggregates. Each JSON column must be byte-identical to its serialization.
     """
-    for column in _EVENT_PAYLOAD_COLUMNS:
-        if column in _EVENT_JSON_COLUMNS:
+    for column in _EVENT_PAYLOAD_COLUMNS + ("attributes",):
+        if column in _EVENT_JSON_COLUMNS or column in _OPTIONAL_JSON_COLUMNS:
             raw = row[column]
+            if raw is None:
+                continue
             if raw != _serialize(json.loads(raw)):
                 return column
     return None
@@ -489,7 +529,10 @@ def _restrict_database_files(path: str) -> None:
         _restrict_file_permissions(candidate)
 
 
-_FILTER_FIELDS = ("agent_type", "session_id", "run_id", "event_type", "tool_name")
+_FILTER_FIELDS = (
+    "agent_type", "session_id", "run_id", "parent_run_id", "correlation_id",
+    "event_type", "tool_name",
+)
 MAX_QUERY_LIMIT = 10_000
 MAX_QUERY_OFFSET = 10_000_000
 
@@ -508,7 +551,9 @@ def _validate_page_value(
     return value
 
 
-def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
+def _build_filter_clause(
+    filters: Dict[str, Any], existing: Optional[frozenset] = None
+) -> Tuple[str, List[Any]]:
     """Build a WHERE clause + params from the shared filter semantics.
 
     Supports equality filters (_FILTER_FIELDS), since/until timestamp
@@ -520,6 +565,10 @@ def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
 
     for field in _FILTER_FIELDS:
         if filters.get(field) is not None:
+            if existing is not None and field not in existing:
+                # An older file has no such column, so nothing can match.
+                conditions.append("0")
+                continue
             conditions.append(f"{field} = ?")
             params.append(filters[field])
 
@@ -537,6 +586,18 @@ def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
     return where_clause, params
 
 
+def _aliased_columns(columns: Tuple[str, ...], existing: frozenset) -> str:
+    """A SELECT list that yields NULL for a column an older database lacks.
+
+    A read-only open never migrates, so a v4 file has no v5 columns. Selecting
+    them as NULL lets every reader treat all schema versions uniformly.
+    """
+    return ", ".join(
+        column if column in existing else f"NULL AS {column}"
+        for column in columns
+    )
+
+
 def _ensure_schema(db: "AuditDB") -> None:
     """Create tables and indices if they don't exist; migrate if needed.
 
@@ -550,6 +611,9 @@ def _ensure_schema(db: "AuditDB") -> None:
                            retroactively), plus chain_meta.
       v3 → v4: drop the legacy call_id uniqueness constraint. call_id is a
                            correlation key; every distinct event is retained.
+      v4 → v5: add the nullable correlation_id, parent_run_id and attributes
+                           columns. Existing rows keep NULL there, which hashes
+                           exactly as before, so their chain still verifies.
     """
     with db._connection() as conn:
         # Schema changes and the chain boundary must be observed atomically by
@@ -600,6 +664,14 @@ def _ensure_schema(db: "AuditDB") -> None:
                 conn.execute("ALTER TABLE events ADD COLUMN prev_hash TEXT")
             if "event_hash" not in col_names:
                 conn.execute("ALTER TABLE events ADD COLUMN event_hash TEXT")
+
+        # v4 → v5: nullable columns only; no row is rewritten.
+        col_names = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        for column in _V5_COLUMNS:
+            if column not in col_names:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
+        for idx_sql in CREATE_V5_INDICES:
+            conn.execute(idx_sql)
 
         # Remove the obsolete uniqueness constraint before correcting legacy
         # call IDs: multiple target-derived keys can legitimately converge on
@@ -657,10 +729,14 @@ def _check_read_only_schema(db: "AuditDB") -> None:
                 "Database has no Panoptes schema version; it is not initialized"
             ) from exc
         current = row[0] if row and row[0] is not None else 0
-        if current != SCHEMA_VERSION:
+        if current == 0:
             raise UnsupportedSchemaVersionError(
-                f"Database schema version {current} differs from supported "
-                f"version {SCHEMA_VERSION}; open it with a writer to migrate"
+                "Database has no Panoptes schema version; it is not initialized"
+            )
+        if current > SCHEMA_VERSION:
+            raise UnsupportedSchemaVersionError(
+                f"Database schema version {current} is newer than supported "
+                f"version {SCHEMA_VERSION}; upgrade Panoptes to read it"
             )
 
 
@@ -675,6 +751,7 @@ class AuditDB:
         "event_type", "tool_name", "data_accessed", "call_id",
         "agent", "user_info", "action", "outcome", "context", "cost",
         "raw_request", "raw_response",
+        "correlation_id", "parent_run_id", "attributes",
     ]
 
     def __init__(
@@ -704,6 +781,7 @@ class AuditDB:
             self._keeper_conn: Optional[sqlite3.Connection] = None
             try:
                 _check_read_only_schema(self)
+                self._refresh_columns()
             except Exception:
                 self.close()
                 raise
@@ -742,9 +820,23 @@ class AuditDB:
 
             # Run migrations / create tables
             _ensure_schema(self)
+            self._refresh_columns()
         except Exception:
             self.close()
             raise
+
+    def _refresh_columns(self) -> None:
+        """Record which event columns this file has and build SELECT lists."""
+        with self._connection() as conn:
+            self._existing_columns = frozenset(
+                row[1] for row in conn.execute("PRAGMA table_info(events)")
+            )
+        self._select_cols = _aliased_columns(
+            tuple(self._EVENT_COLUMNS), self._existing_columns
+        )
+        self._payload_select = _aliased_columns(
+            _ALL_PAYLOAD_COLUMNS, self._existing_columns
+        )
 
     # ── Thread-safe connection management ─────────────────────────────────
 
@@ -860,7 +952,7 @@ class AuditDB:
                 conn.execute("BEGIN IMMEDIATE")
                 event_ids: List[str] = []
                 checkpoint: Optional[Dict[str, Any]] = None
-                payload_columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                payload_columns = ", ".join(_ALL_PAYLOAD_COLUMNS)
 
                 for normalized, flat, input_requires_redaction in prepared:
                     # Defense in depth while schema adapters transition away from
@@ -1077,7 +1169,7 @@ class AuditDB:
                     conn.commit()
                     return fail("Unchained event count changed after chain start")
 
-                columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                columns = self._payload_select
                 rows = conn.execute(
                     f"SELECT {columns}, prev_hash, event_hash FROM events "
                     "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
@@ -1369,7 +1461,7 @@ class AuditDB:
             since, until (ISO8601 timestamps), data_accessed (partial match),
             limit (default 100), offset (default 0)
         """
-        where_clause, params = _build_filter_clause(filters)
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
 
         # Pagination
         limit = _validate_page_value(
@@ -1385,7 +1477,7 @@ class AuditDB:
             maximum=MAX_QUERY_OFFSET,
         )
 
-        columns_str = ", ".join(self._EVENT_COLUMNS)
+        columns_str = self._select_cols
         # rowid is the transactional ingestion order for this append-only table
         # and makes pagination deterministic when events share a timestamp.
         sql = (
@@ -1408,6 +1500,8 @@ class AuditDB:
         "agent_type": "agent_type",
         "session_id": "session_id",
         "run_id": "run_id",
+        "parent_run_id": "parent_run_id",
+        "correlation_id": "correlation_id",
         "event_type": "event_type",
         "tool_name": "tool_name",
         "data_accessed": "data_accessed",
@@ -1489,16 +1583,20 @@ class AuditDB:
                 f"dimensions or metrics: {list(group_by) + metrics}"
             )
 
+        def dimension_sql(name: str) -> str:
+            expr = self._AGG_DIMENSIONS[name]
+            return expr if expr in self._existing_columns or not expr.isidentifier() else "NULL"
+
         select_parts = [
-            f'{self._AGG_DIMENSIONS[d]} AS "{d}"' for d in group_by
+            f'{dimension_sql(d)} AS "{d}"' for d in group_by
         ] + [
             f'{self._AGG_METRICS[m]} AS "{m}"' for m in metrics
         ]
 
         # WHERE clause — same filter semantics as query()
-        where_clause, params = _build_filter_clause(filters)
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
         group_clause = (
-            "GROUP BY " + ", ".join(self._AGG_DIMENSIONS[d] for d in group_by)
+            "GROUP BY " + ", ".join(dimension_sql(d) for d in group_by)
             if group_by else ""
         )
         direction = "DESC" if descending else "ASC"
@@ -1544,7 +1642,7 @@ class AuditDB:
         with self._connection() as conn:
             # 1. Get the anchor event
             cur = conn.execute(
-                f"SELECT {', '.join(self._EVENT_COLUMNS)} FROM events WHERE event_id = ?",
+                f"SELECT {self._select_cols} FROM events WHERE event_id = ?",
                 (event_id,),
             )
             row = cur.fetchone()
@@ -1564,7 +1662,7 @@ class AuditDB:
                 if run_id:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND (call_id = ? OR run_id = ?)
@@ -1575,7 +1673,7 @@ class AuditDB:
                 else:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND call_id = ?
@@ -1591,7 +1689,7 @@ class AuditDB:
                     turn_high = turn + 1
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND json_extract(context, '$.turn_number') IS NOT NULL
@@ -1604,7 +1702,7 @@ class AuditDB:
                 else:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND julianday(timestamp)

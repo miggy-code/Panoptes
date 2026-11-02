@@ -954,7 +954,8 @@ def test_unknown_user_authentication_claim_is_rejected():
         "event_type": "model_request",
         "action": {},
         "outcome": {"status": "success"},
-        "context": {},
+        # v1-v4 events keep their closed auth-method list; v5 opened it.
+        "context": {"schema_version": 4},
     }
     with pytest.raises(ValidationError, match="Unknown auth_method"):
         normalize_event(event)

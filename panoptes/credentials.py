@@ -23,7 +23,7 @@ from typing import Any, Mapping
 import yaml
 
 from .pricing import PricingError, usd_to_micros
-from .schema import ALLOWED_AGENT_TYPES, ValidationError, validate_identifier
+from .schema import KNOWN_AGENT_TYPES, ValidationError, validate_identifier
 
 
 PROVIDER_KEY_ENV: dict[str, str] = {
@@ -239,9 +239,9 @@ class SessionTokenStore:
         holds plus its own reservation would pass the cap, so the cap stays hard as long
         as no single response costs more than ``reserve_usd``.
         """
-        if agent_type not in ALLOWED_AGENT_TYPES or agent_type == "unknown":
+        if agent_type not in KNOWN_AGENT_TYPES or agent_type == "unknown":
             raise ValidationError(
-                f"agent type must be one of {sorted(ALLOWED_AGENT_TYPES - {'unknown'})}"
+                f"agent type must be one of {sorted(KNOWN_AGENT_TYPES - {'unknown'})}"
             )
         validate_identifier(session_id, "session_id")
         if (

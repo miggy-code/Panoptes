@@ -59,7 +59,7 @@ from panoptes.credentials import (
 from panoptes.db import AuditDB
 from panoptes.policy import PolicyEngine, PolicyResult, _policy_result_context
 from panoptes.schema import (
-    ALLOWED_AGENT_TYPES,
+    KNOWN_AGENT_TYPES,
     ValidationError,
     normalize_event,
     redact_secrets,
@@ -150,7 +150,7 @@ def detect_agent_type(
 ) -> str:
     lowered_headers = _lower_keys(headers)
     declared_agent = lowered_headers.get("x-panoptes-agent", "")
-    if declared_agent in ALLOWED_AGENT_TYPES:
+    if declared_agent in KNOWN_AGENT_TYPES:
         return declared_agent
 
     user_agent = lowered_headers.get("user-agent", "")

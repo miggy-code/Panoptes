@@ -25,7 +25,7 @@ import yaml
 
 from panoptes._json import _strict_json_loads
 from panoptes.schema import (
-    ALLOWED_AGENT_TYPES,
+    KNOWN_AGENT_TYPES,
     ALLOWED_EVENT_TYPES,
     normalize_event,
     redact_secrets,
@@ -551,7 +551,7 @@ class Policy:
                     f"policy.scope.{key} must contain non-empty strings"
                 )
         invalid_agents = set(scope.get("agents", [])) - (
-            set(ALLOWED_AGENT_TYPES) | {"*"}
+            set(KNOWN_AGENT_TYPES) | {"*"}
         )
         if invalid_agents:
             raise ValueError(
