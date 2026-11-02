@@ -591,6 +591,22 @@ def _build_filter_clause(
     return where_clause, params
 
 
+_RANGE_FILTER_FIELDS = ("since", "until", "data_accessed")
+_QUERY_FILTER_NAMES = frozenset(
+    _FILTER_FIELDS + _RANGE_FILTER_FIELDS + ("limit", "offset")
+)
+_AGGREGATE_FILTER_NAMES = frozenset(_FILTER_FIELDS + _RANGE_FILTER_FIELDS)
+
+
+def _reject_unknown_filters(filters: Dict[str, Any], allowed: frozenset) -> None:
+    """A misspelled filter must fail, not silently match every event."""
+    unknown = sorted(set(filters) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unknown filter(s) {unknown}. Allowed: {sorted(allowed)}"
+        )
+
+
 def _aliased_columns(columns: Tuple[str, ...], existing: frozenset) -> str:
     """A SELECT list that yields NULL for a column an older database lacks.
 
@@ -1523,10 +1539,15 @@ class AuditDB:
         """Query events with optional filters.
 
         Supported filters:
-            agent_type, session_id, run_id, event_type, tool_name,
-            since, until (ISO8601 timestamps), data_accessed (partial match),
-            limit (default 100), offset (default 0)
+            agent_type, session_id, run_id, parent_run_id, correlation_id,
+            event_type, tool_name, since, until (ISO8601 timestamps),
+            data_accessed (partial match), limit (default 100), offset
+            (default 0). An unknown filter name raises ValueError.
+
+        Returns newest first. Use ``iter_events`` to stream a whole log in
+        write order.
         """
+        _reject_unknown_filters(filters, _QUERY_FILTER_NAMES)
         where_clause, params = _build_filter_clause(filters, self._existing_columns)
 
         # Pagination
@@ -1557,6 +1578,89 @@ class AuditDB:
             rows = cur.fetchall()
 
         return [_row_to_event(r) for r in rows]
+
+    _ITER_ORDERS = {
+        # name: (sort columns, descending)
+        "rowid": (("rowid",), False),
+        "-rowid": (("rowid",), True),
+        "timestamp": (("timestamp", "rowid"), False),
+        "-timestamp": (("timestamp", "rowid"), True),
+    }
+
+    def iter_events(
+        self,
+        *,
+        agent_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        data_accessed: Optional[str] = None,
+        order: str = "rowid",
+        batch_size: int = 500,
+    ) -> Iterator[Dict[str, Any]]:
+        """Stream matching events, with no row cap, as canonical event dicts.
+
+        ``order`` is ``"rowid"`` (the order events were written, which is the
+        order the hash chain follows), ``"timestamp"``, or either with a
+        leading ``"-"`` for newest first. Filters match ``query()``.
+
+        Events are fetched in keyset-paginated batches, each in its own
+        short read, so a long iteration holds no transaction open and cannot
+        block a writer. Events appended while iterating in ascending order
+        are included; an event is never yielded twice. Nothing is yielded
+        for a filter on a column an older read-only file lacks.
+        """
+        if order not in self._ITER_ORDERS:
+            raise ValueError(
+                f"Unknown order {order!r}. Allowed: {sorted(self._ITER_ORDERS)}"
+            )
+        batch_size = _validate_page_value(
+            batch_size, "batch_size", minimum=1, maximum=MAX_QUERY_LIMIT
+        )
+        filters = {
+            name: value for name, value in (
+                ("agent_type", agent_type), ("event_type", event_type),
+                ("session_id", session_id), ("run_id", run_id),
+                ("parent_run_id", parent_run_id),
+                ("correlation_id", correlation_id), ("tool_name", tool_name),
+                ("since", since), ("until", until),
+                ("data_accessed", data_accessed),
+            ) if value is not None
+        }
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
+        columns, descending = self._ITER_ORDERS[order]
+        direction = "DESC" if descending else "ASC"
+        compare = "<" if descending else ">"
+        sort_by = ", ".join(f"{column} {direction}" for column in columns)
+        cursor_columns = ", ".join(columns)
+        if columns == ("rowid",):
+            cursor: Tuple[Any, ...] = (2**63 - 1,) if descending else (-1,)
+        else:
+            cursor = ("\U0010ffff", 2**63 - 1) if descending else ("", -1)
+        placeholders = ", ".join("?" for _ in columns)
+        join = " AND " if where_clause else "WHERE "
+        sql = (
+            f"SELECT rowid AS _rowid, {self._select_cols} FROM events "
+            f"{where_clause}{join}({cursor_columns}) {compare} ({placeholders}) "
+            f"ORDER BY {sort_by} LIMIT ?"
+        )
+        while True:
+            with self._connection() as conn:
+                rows = conn.execute(sql, [*params, *cursor, batch_size]).fetchall()
+            for row in rows:
+                yield _row_to_event(row)
+            if len(rows) < batch_size:
+                return
+            last = rows[-1]
+            cursor = (
+                (last["_rowid"],) if columns == ("rowid",)
+                else (last["timestamp"], last["_rowid"])
+            )
 
     # ── Aggregation ───────────────────────────────────────────────────────
 
@@ -1615,12 +1719,14 @@ class AuditDB:
             metrics:  metric names (see _AGG_METRICS). Defaults to ["count"].
             order_by: a selected dimension or metric name to sort on.
                       Defaults to the first metric.
-            filters:  agent_type, session_id, run_id, event_type, tool_name,
-                      since, until, data_accessed — same semantics as query().
+            filters:  agent_type, session_id, run_id, parent_run_id,
+                      correlation_id, event_type, tool_name, since, until,
+                      data_accessed — same semantics as query().
 
         Returns one dict per group with dimension and metric names as keys.
         Raises ValueError for unknown dimension/metric/order_by names.
         """
+        _reject_unknown_filters(filters, _AGGREGATE_FILTER_NAMES)
         metrics = metrics or ["count"]
         limit = _validate_page_value(
             limit,
