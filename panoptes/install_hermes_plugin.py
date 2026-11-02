@@ -30,7 +30,7 @@ MANIFEST_JSON = json.dumps(
 )
 
 # Only the files install() writes; uninstall() never removes anything else.
-_PLUGIN_FILES = ("manifest.json", "plugin.py")
+_PLUGIN_FILES = ("manifest.json", "plugin.py", "plugin.yaml", "__init__.py", "hermes_hooks.py")
 
 # The generated plugin.py is a thin entrypoint shim: the implementation lives
 # in panoptes.hermes_plugin (the panoptes package must be importable in the
@@ -57,9 +57,17 @@ authorize_tool_call = plugin.authorize_tool_call
 '''
 
 
+PLUGIN_YAML = f"""name: panoptes
+version: "{__version__}"
+description: Panoptes Hermes lifecycle observation
+provides_hooks: [on_session_start, post_tool_call, on_session_end, on_session_finalize, subagent_start, subagent_stop, pre_api_request]
+"""
+PLUGIN_INIT = "from .hermes_hooks import register\n"
+
+
 def get_plugin_dir() -> Path:
     """Return the target plugin directory."""
-    return Path.home() / ".hermes" / "plugins" / "panoptes"
+    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser() / "plugins" / "panoptes"
 
 
 def _atomic_private_write(path: Path, contents: str) -> None:
@@ -103,8 +111,8 @@ def install(dry_run: bool = False) -> bool:
 
     if dry_run:
         print(f"[DRY RUN] Would create: {plugin_dir}/")
-        print(f"[DRY RUN] Would write: {plugin_dir}/manifest.json")
-        print(f"[DRY RUN] Would write: {plugin_dir}/plugin.py")
+        for name in _PLUGIN_FILES:
+            print(f"[DRY RUN] Would write: {plugin_dir / name}")
         return True
 
     if plugin_dir.is_symlink():
@@ -119,7 +127,7 @@ def install(dry_run: bool = False) -> bool:
 
     manifest_path = plugin_dir / "manifest.json"
     plugin_path = plugin_dir / "plugin.py"
-    for candidate in (manifest_path, plugin_path):
+    for candidate in (plugin_dir / name for name in _PLUGIN_FILES):
         if candidate.is_symlink():
             raise RuntimeError(
                 f"Refusing to replace symlink plugin file: {candidate}"
@@ -133,9 +141,14 @@ def install(dry_run: bool = False) -> bool:
     _atomic_private_write(plugin_path, PLUGIN_PY)
     print(f"Wrote: {plugin_path}")
 
+    for name, content in (("plugin.yaml", PLUGIN_YAML), ("__init__.py", PLUGIN_INIT),
+                          ("hermes_hooks.py", Path(__file__).with_name("hermes_hooks.py").read_text(encoding="utf-8"))):
+        _atomic_private_write(plugin_dir / name, content)
+        print(f"Wrote: {plugin_dir / name}")
+
     print("\n✅ panoptes Hermes plugin installed successfully!")
     print(f"   Location: {plugin_dir}")
-    print("\n   The plugin will activate on next Hermes agent start.")
+    print("\n   Enable panoptes in Hermes plugins.enabled, then restart Hermes.")
     print("   Audit events will be written to: ~/.panoptes/audit.db")
 
     return True
@@ -165,8 +178,9 @@ def uninstall(dry_run: bool = False) -> bool:
     # Python caches the imported entrypoint beside it.
     cache_dir = plugin_dir / "__pycache__"
     if cache_dir.is_dir() and not cache_dir.is_symlink():
-        for cached in cache_dir.glob("plugin.*.pyc"):
-            cached.unlink()
+        for stem in ("plugin", "__init__", "hermes_hooks"):
+            for cached in cache_dir.glob(stem + ".*.pyc"):
+                cached.unlink()
         try:
             cache_dir.rmdir()
         except OSError:

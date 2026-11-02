@@ -141,11 +141,30 @@ egress, or the agent can still read the keys. See [SECURITY.md](SECURITY.md).
 python -m panoptes.install_hermes_plugin
 ```
 
-The installer adds lifecycle hooks for `agent:start`, `agent:step`, and
-`agent:end`. Those hooks observe; they do not block. Local tool enforcement
+The installer supplies the current Hermes `plugin.yaml` and `register(ctx)`
+interface, plus legacy entrypoints. Add `panoptes` to Hermes `plugins.enabled`;
+the Panoptes package must be importable in the Hermes environment for local
+capture. Current Hermes `on_session_start`, `post_tool_call`, and `on_session_end`
+observations become Panoptes lifecycle events; `on_session_finalize` ends a
+session. Those hooks observe; they do not block. Local tool enforcement
 requires the Hermes host to call `authorize_tool_call()` synchronously and
 honor `allowed=False`. In `fail_closed` mode, an authorization whose evidence
-cannot be stored is denied.
+cannot be stored is denied. For isolated agents, `PANOPTES_HERMES_SINK` can
+direct observations to a separately protected Panoptes listener; this does not
+authenticate the host or prove tool execution.
+For example, start a sink on a protected local network with:
+
+```python
+from panoptes.hermes_ingest import make_server
+
+make_server(("127.0.0.1", 8083), "/private/audit.sqlite",
+            "/private/hermes-events.jsonl").serve_forever()
+```
+
+Set `PANOPTES_HERMES_SINK=http://127.0.0.1:8083/lifecycle` in Hermes. In a
+container, bind the listener only to the isolated network. Lifecycle events
+are written to the Panoptes audit database; the optional JSONL journal holds
+host-reported child links and request fingerprints for reconciliation.
 
 ### Query and verify
 

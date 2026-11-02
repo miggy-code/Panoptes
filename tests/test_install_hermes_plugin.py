@@ -78,3 +78,26 @@ def test_uninstall_removes_only_installed_files(tmp_path, monkeypatch):
     assert installer.install()
     assert installer.uninstall()
     assert not plugin_dir.exists()
+
+
+def test_installer_writes_current_hermes_plugin_files(tmp_path, monkeypatch):
+    plugin_dir = tmp_path / "hermes-home" / "plugins" / "panoptes"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    assert installer.get_plugin_dir() == plugin_dir
+    assert installer.install()
+    assert "on_session_start" in (plugin_dir / "plugin.yaml").read_text()
+    assert "from .hermes_hooks import register" in (plugin_dir / "__init__.py").read_text()
+    for name in ("plugin.yaml", "__init__.py", "hermes_hooks.py"):
+        assert stat.S_IMODE((plugin_dir / name).stat().st_mode) == 0o600
+
+
+def test_installer_rejects_modern_entrypoint_symlink(tmp_path, monkeypatch):
+    plugin_dir = tmp_path / "panoptes"
+    plugin_dir.mkdir()
+    target = tmp_path / "outside"
+    target.write_text("unchanged")
+    (plugin_dir / "__init__.py").symlink_to(target)
+    monkeypatch.setattr(installer, "get_plugin_dir", lambda: plugin_dir)
+    with pytest.raises(RuntimeError, match="symlink"):
+        installer.install()
+    assert target.read_text() == "unchanged"
