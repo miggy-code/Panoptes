@@ -177,6 +177,10 @@ class UnsupportedSchemaVersionError(RuntimeError):
     """Raised when a database was created by a newer Panoptes schema."""
 
 
+class NotAnAuditDatabaseError(ValueError):
+    """Raised when a path is not an initialized Panoptes audit database."""
+
+
 def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -721,18 +725,32 @@ def _ensure_schema(db: "AuditDB") -> None:
 
 
 def _check_read_only_schema(db: "AuditDB") -> None:
-    """Refuse a read-only open of a database that would need migrating."""
+    """Refuse a read-only open of a file that is not a readable audit log.
+
+    Any schema version up to the current one is readable without migrating:
+    columns a file lacks read as NULL. Only a newer file, or one that is not a
+    Panoptes log at all, is refused.
+    """
     with db._connection() as conn:
         try:
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if not {"events", "schema_version"} <= tables:
+                raise NotAnAuditDatabaseError(
+                    f"Not an initialized Panoptes audit database: {db._db_path}"
+                )
             row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        except sqlite3.OperationalError as exc:
-            raise UnsupportedSchemaVersionError(
-                "Database has no Panoptes schema version; it is not initialized"
+        except sqlite3.DatabaseError as exc:
+            raise NotAnAuditDatabaseError(
+                f"Not a Panoptes audit database: {db._db_path} ({exc})"
             ) from exc
         current = row[0] if row and row[0] is not None else 0
         if current == 0:
-            raise UnsupportedSchemaVersionError(
-                "Database has no Panoptes schema version; it is not initialized"
+            raise NotAnAuditDatabaseError(
+                f"Panoptes audit database has no schema version: {db._db_path}"
             )
         if current > SCHEMA_VERSION:
             raise UnsupportedSchemaVersionError(
@@ -838,6 +856,29 @@ class AuditDB:
         self._payload_select = _aliased_columns(
             _ALL_PAYLOAD_COLUMNS, self._existing_columns
         )
+
+    @classmethod
+    def open_readonly(cls, db_path: str) -> "AuditDB":
+        """Open an existing audit database for reading, changing nothing.
+
+        No file is created, no schema is migrated, no hash chain is started or
+        re-anchored, no file mode changes and nothing is written, so inspecting
+        evidence cannot alter it. Every schema version up to the current one
+        is readable as it stands; columns an older file lacks read as empty.
+        ``verify_chain()`` and ``verify_checkpoint()`` work on the result;
+        inserting raises ``sqlite3.OperationalError``.
+
+        Raises ``FileNotFoundError`` for a missing path,
+        ``NotAnAuditDatabaseError`` (a ``ValueError``) for a file that is not
+        an initialized Panoptes log, and ``UnsupportedSchemaVersionError`` for
+        a log from a newer Panoptes.
+        """
+        path = os.path.expanduser(db_path)
+        if path == ":memory:":
+            raise ValueError("A read-only audit database needs a file path")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"audit database not found: {path}")
+        return cls(path, read_only=True)
 
     # ── Thread-safe connection management ─────────────────────────────────
 
