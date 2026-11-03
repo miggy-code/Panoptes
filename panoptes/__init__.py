@@ -10,9 +10,7 @@ execution.
 from importlib.metadata import PackageNotFoundError, version
 
 from .capture import (
-    AuthorizationDecision,
     CaptureCapabilities,
-    HERMES_AUTHORIZER_CAPABILITIES,
     HERMES_CAPABILITIES,
     PROXY_CAPABILITIES,
 )
@@ -65,11 +63,9 @@ except PackageNotFoundError:
 
 __all__ = [
     "AuditDB",
-    "AuthorizationDecision",
     "CaptureCapabilities",
     "ChainIntegrityError",
     "EventConflictError",
-    "HERMES_AUTHORIZER_CAPABILITIES",
     "HERMES_CAPABILITIES",
     "IdentifierRewriteError",
     "KNOWN_AGENT_TYPES",

@@ -156,34 +156,5 @@ HERMES_CAPABILITIES = CaptureCapabilities(
     execution_observed=False,
     enforcement_mandatory=False,
     observed_events=("agent_start", "agent_step", "agent_end"),
-    enforcement_points=("optional_pre_execution_authorizer",),
-    notes=(
-        "The installed lifecycle hooks are observational. A host integration must call "
-        "AuditPlugin.authorize_tool_call() before execution to enforce a policy."
-    ),
+    notes="The installed lifecycle hooks are observational and never block.",
 )
-
-HERMES_AUTHORIZER_CAPABILITIES = CaptureCapabilities(
-    adapter="hermes_authorizer",
-    fidelity="host_pre_execution_authorization",
-    observation_boundary="hermes_host_authorizer",
-    identity_assurance="host_asserted",
-    execution_observed=False,
-    enforcement_mandatory=False,
-    observed_events=("tool_call", "decision_point"),
-    enforcement_points=("synchronous_pre_execution_authorizer",),
-    notes=(
-        "Records a host-supplied tool request before execution. Enforcement is "
-        "effective only when the host calls the authorizer synchronously and honors "
-        "allowed=False for the exact requested action."
-    ),
-)
-
-
-@dataclass(frozen=True)
-class AuthorizationDecision:
-    """The result a host receives from a pre-execution authorization check."""
-
-    allowed: bool
-    action: str
-    message: str | None = None

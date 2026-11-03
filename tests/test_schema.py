@@ -14,7 +14,7 @@ import tempfile
 
 import pytest
 
-from panoptes.capture import HERMES_AUTHORIZER_CAPABILITIES
+from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import AuditDB
 from panoptes.schema import (
     DATA_ACCESS_CLASSIFIERS,
@@ -814,7 +814,7 @@ def test_event_schema_version_enforces_the_versioned_contract():
 
 def test_capture_metadata_is_key_aware_but_preserves_safe_authorization_label():
     secret = "Bearer abcdefghijklmnopqrstuvwxyz"
-    capture = HERMES_AUTHORIZER_CAPABILITIES.as_context(
+    capture = HERMES_CAPABILITIES.as_context(
         authorization_check="pre_execution",
         token=secret,
         diagnostics={"api_key": "sk-proj-fakefakefakefakefakefake012345"},
@@ -837,7 +837,7 @@ def test_capture_metadata_is_key_aware_but_preserves_safe_authorization_label():
 
 
 def test_capture_core_field_types_and_event_names_are_validated():
-    capture = HERMES_AUTHORIZER_CAPABILITIES.as_context(
+    capture = HERMES_CAPABILITIES.as_context(
         authorization_check="pre_execution",
     )
     invalid_captures = [

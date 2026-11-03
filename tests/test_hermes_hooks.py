@@ -49,7 +49,7 @@ def test_current_hermes_hooks_record_through_protected_sink(tmp_path, monkeypatc
 
 def test_current_hermes_hooks_support_direct_local_capture(tmp_path, monkeypatch):
     from panoptes.hermes_plugin import AuditPlugin
-    plugin = AuditPlugin(db_path=str(tmp_path / 'local.sqlite'), policies_dir=None)
+    plugin = AuditPlugin(db_path=str(tmp_path / 'local.sqlite'))
     monkeypatch.delenv('PANOPTES_HERMES_SINK', raising=False)
     monkeypatch.setattr('panoptes.hermes_plugin.get_plugin', lambda: plugin)
     ctx = CurrentContext()
@@ -65,7 +65,7 @@ def test_current_hermes_hooks_support_direct_local_capture(tmp_path, monkeypatch
 
 def test_multiple_turns_preserve_same_lifecycle_run(tmp_path, monkeypatch):
     from panoptes.hermes_plugin import AuditPlugin
-    plugin = AuditPlugin(db_path=str(tmp_path / 'multi.sqlite'), policies_dir=None)
+    plugin = AuditPlugin(db_path=str(tmp_path / 'multi.sqlite'))
     monkeypatch.delenv('PANOPTES_HERMES_SINK', raising=False)
     monkeypatch.setattr('panoptes.hermes_plugin.get_plugin', lambda: plugin)
     ctx = CurrentContext()
@@ -85,7 +85,7 @@ def test_multiple_turns_preserve_same_lifecycle_run(tmp_path, monkeypatch):
 
 def test_local_capture_records_child_links_and_request_fingerprints(tmp_path, monkeypatch):
     from panoptes.hermes_plugin import AuditPlugin
-    plugin = AuditPlugin(db_path=str(tmp_path / 'details.sqlite'), policies_dir=None)
+    plugin = AuditPlugin(db_path=str(tmp_path / 'details.sqlite'))
     monkeypatch.delenv('PANOPTES_HERMES_SINK', raising=False)
     monkeypatch.setattr('panoptes.hermes_plugin.get_plugin', lambda: plugin)
     ctx = CurrentContext()
@@ -118,3 +118,11 @@ def test_sink_rejects_duplicate_json_keys(tmp_path):
         assert error.value.code == 400
     finally:
         server.shutdown(); thread.join(); server.server_close()
+
+
+def test_plugin_only_observes_and_offers_no_authorizer(tmp_path):
+    from panoptes.hermes_plugin import AuditPlugin
+
+    plugin = AuditPlugin(db_path=str(tmp_path / 'observe.sqlite'))
+    assert not hasattr(plugin, 'authorize_tool_call')
+    assert not hasattr(plugin, 'policy_engine')

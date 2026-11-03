@@ -13,7 +13,7 @@ from ._server import BoundedThreadingHTTPServer
 
 
 def make_server(address, db_path, journal_path=None):
-    plugin = AuditPlugin(db_path=str(db_path), policies_dir=None)
+    plugin = AuditPlugin(db_path=str(db_path))
     hooks = LegacyHooks()
     plugin.register(hooks)
     journal = Path(journal_path) if journal_path else None

@@ -13,20 +13,12 @@ Plugin structure (written by install_hermes_plugin.py):
   └── plugin.py        — hook handlers registering with Hermes context
 """
 
-import copy
 import logging
 import os
 import threading
 import uuid
-from typing import TYPE_CHECKING
 
-from panoptes.capture import (
-    DEFAULT_POLICIES_DIR,
-    POLICY_FAILURE_MODES,
-    AuthorizationDecision,
-    HERMES_AUTHORIZER_CAPABILITIES,
-    HERMES_CAPABILITIES,
-)
+from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import AuditDB
 from panoptes.schema import (
     normalize_event,
@@ -38,43 +30,8 @@ from panoptes.schema import (
 
 DB_PATH = os.path.expanduser("~/.panoptes/audit.db")
 DEFAULT_MAX_ACTIVE_SESSIONS = 1024
-POLICY_FAILURE_MODE_ENV = "PANOPTES_POLICY_FAILURE_MODE"
-if TYPE_CHECKING:
-    from panoptes.policy import PolicyResult
 
 log = logging.getLogger("panoptes.hermes")
-
-
-def _policy():
-    """The policy engine module, loaded only when authorization needs it.
-
-    Lifecycle observation (and the ingest server) never touches it, so they run
-    without PyYAML.
-    """
-    from panoptes import policy
-
-    return policy
-
-
-def _block_message(result: "PolicyResult") -> str:
-    blocking_items = [
-        item
-        for item in result.violated_policies
-        if item.get("action") == "block"
-    ]
-    if not blocking_items and result.action == "block":
-        # Compatibility with host-supplied PolicyResult objects that predate
-        # per-match action metadata. Never use explicit warn entries here.
-        blocking_items = [
-            item
-            for item in result.violated_policies
-            if item.get("action") in (None, "block")
-        ]
-    messages = [
-        item.get("message", "Tool call blocked by policy")
-        for item in blocking_items
-    ]
-    return "; ".join(messages) or "Tool call blocked by policy"
 
 
 def _safe_identifier(value, fallback: str) -> str:
@@ -99,13 +56,8 @@ class AuditPlugin:
     def __init__(
         self,
         db_path: str = None,
-        policies_dir: str = DEFAULT_POLICIES_DIR,
-        policy_failure_mode: str = "fail_open",
         max_active_sessions: int = DEFAULT_MAX_ACTIVE_SESSIONS,
     ):
-        if policy_failure_mode not in POLICY_FAILURE_MODES:
-            allowed = ", ".join(sorted(POLICY_FAILURE_MODES))
-            raise ValueError(f"policy_failure_mode must be one of: {allowed}")
         if (
             isinstance(max_active_sessions, bool)
             or not isinstance(max_active_sessions, int)
@@ -116,16 +68,6 @@ class AuditPlugin:
         self._sessions: dict[str, dict] = {}
         self._sessions_lock = threading.RLock()
         self.max_active_sessions = max_active_sessions
-        self.policy_failure_mode = policy_failure_mode
-        self.policy_engine = (
-            _policy().PolicyEngine(
-                policies_dir=policies_dir,
-                db=self.db,
-                failure_mode=policy_failure_mode,
-            )
-            if policies_dir
-            else None
-        )
 
     def _store_session_locked(self, state: dict) -> dict:
         """Track a session while enforcing a strict upper memory bound."""
@@ -222,228 +164,6 @@ class AuditPlugin:
         except Exception:
             log.exception("Failed to persist Hermes lifecycle event")
             return False
-
-    def _persist_decision(self, event: dict, result: "PolicyResult") -> bool:
-        """Persist an authorization decision and report whether evidence was durable."""
-        decision = copy.deepcopy(event)
-        decision["event_id"] = uuid.uuid4().hex
-        decision["timestamp"] = _utcnow_iso()
-        decision["event_type"] = "decision_point"
-        decision["context"]["decision_kind"] = "tool_authorization"
-        decision["context"]["source_event_id"] = event["event_id"]
-        decision["context"]["source_event_type"] = event["event_type"]
-        decision["context"]["policy"] = _policy()._policy_result_context(
-            result, semantics_key="semantics_version"
-        )
-        if result.action == "block":
-            message = _block_message(result)
-            decision["outcome"] = {"status": "blocked", "summary": message}
-        elif result.action == "warn" or result.evaluation_errors:
-            decision["outcome"] = {
-                "status": "warned",
-                "summary": (
-                    "Tool call authorized under fail-open after a policy "
-                    "evaluation failure"
-                    if result.evaluation_errors
-                    else "Tool call authorized with policy warning"
-                ),
-            }
-        else:
-            decision["outcome"] = {
-                "status": "success",
-                "summary": "Tool call authorized before execution",
-            }
-        try:
-            violations: list[dict] = []
-            if self.policy_engine is not None:
-                builder = getattr(
-                    self.policy_engine,
-                    "build_violation_event",
-                    None,
-                )
-                if callable(builder):
-                    for violation in result.violated_policies:
-                        policy_action = violation.get("action", "block")
-                        if policy_action not in ("warn", "block"):
-                            continue
-                        built = builder(
-                            event,
-                            violation.get("policy_name", "unknown"),
-                            violation.get("message", "Policy matched"),
-                            policy_action=policy_action,
-                            policy_snapshot_id=result.policy_snapshot_id,
-                            policy_engine_semantics_version=(
-                                result.policy_engine_semantics_version
-                            ),
-                        )
-                        if built is not None:
-                            violations.append(built)
-            insert_events = getattr(self.db, "insert_events", None)
-            if callable(insert_events):
-                # Preserve both the exact pre-execution request and its derived
-                # decision, plus policy violations, in one audit transaction.
-                # A decision_point alone would otherwise erase the fact that
-                # the adapter observed a distinct tool_call request.
-                insert_events([event, decision, *violations])
-            else:
-                # Compatibility for lightweight injected DB implementations.
-                self.db.insert_event(event)
-                self.db.insert_event(decision)
-                for violation in violations:
-                    self.db.insert_event(violation)
-            return True
-        except Exception:
-            # A deny must never turn into an exception that a permissive host
-            # could interpret as permission to execute.
-            log.exception("Failed to persist Hermes authorization decision")
-            return False
-
-    def authorize_tool_call(self, context: dict) -> AuthorizationDecision:
-        """Authorize a tool immediately before a host executes it.
-
-        Hermes' shipped ``agent:*`` lifecycle hooks are observation-only. A
-        Hermes host integration that supports a pre-execution tool hook should
-        call this method and decline execution when ``allowed`` is false.
-        Blocked calls are persisted here because no subsequent lifecycle step
-        will exist for a tool that was correctly denied.
-        """
-        if not isinstance(context, dict):
-            return AuthorizationDecision(
-                allowed=False,
-                action="block",
-                message="Invalid tool authorization context",
-            )
-
-        state = self._resolve_session(context)
-        # Once an agent:start callback establishes lifecycle identity, later
-        # authorizer claims cannot rewrite that session's run attribution.
-        session_id = state["session_id"]
-        run_id = state["run_id"]
-        user_id = state["user_id"]
-        tool_name = context.get("tool_name") or context.get("name") or "unknown"
-        with self._sessions_lock:
-            turn_number = state.get("turn", 0)
-        event = {
-            "event_id": uuid.uuid4().hex,
-            "timestamp": _utcnow_iso(),
-            "agent": {
-                "type": "hermes",
-                "session_id": session_id,
-                "run_id": run_id,
-            },
-            "user": {
-                "id": user_id,
-                "auth_method": "cli",
-            },
-            "event_type": "tool_call",
-            "action": {
-                "tool_name": tool_name,
-                "parameters": context.get("tool_input", context.get("parameters", {})),
-                "target": context.get("target"),
-                "call_id": context.get("call_id"),
-            },
-            "outcome": {
-                "status": "pending",
-                "summary": "Tool authorization requested before execution",
-            },
-            "context": {
-                "turn_number": turn_number,
-                "capture": HERMES_AUTHORIZER_CAPABILITIES.as_context(
-                    authorization_check="pre_execution"
-                ),
-            },
-            "cost": {},
-        }
-
-        try:
-            event = normalize_event(event)
-            validate_event(event)
-        except Exception as exc:
-            log.exception("Failed to normalize Hermes authorization event")
-            errors = [f"Authorization event normalization failed: {exc}"]
-            result = (
-                self.policy_engine.input_failure_result(errors)
-                if self.policy_engine
-                else _policy().PolicyEngine.make_failure_result(
-                    self.policy_failure_mode, errors
-                )
-            )
-            fallback_session_id = _safe_identifier(
-                session_id, uuid.uuid4().hex
-            )
-            fallback_run_id = _safe_identifier(run_id, uuid.uuid4().hex)
-            fallback_tool_name = _safe_identifier(tool_name, "unknown")
-            fallback = normalize_event({
-                "event_id": uuid.uuid4().hex,
-                "timestamp": _utcnow_iso(),
-                "agent": {
-                    "type": "hermes",
-                    "session_id": fallback_session_id,
-                    "run_id": fallback_run_id,
-                },
-                "user": {
-                    "id": _safe_identifier(user_id, "unknown"),
-                    "auth_method": "cli",
-                },
-                "event_type": "tool_call",
-                "action": {
-                    "tool_name": fallback_tool_name,
-                    "parameters": {},
-                    "target": None,
-                    "call_id": None,
-                },
-                "outcome": {
-                    "status": "pending",
-                    "summary": "Invalid tool authorization event received",
-                },
-                "context": {
-                    "turn_number": turn_number,
-                    "capture": HERMES_AUTHORIZER_CAPABILITIES.as_context(
-                        authorization_check="pre_execution",
-                        input_validation="failed",
-                    ),
-                },
-                "cost": {},
-            })
-            self._persist_decision(fallback, result)
-            if result.action == "block":
-                return AuthorizationDecision(
-                    allowed=False,
-                    action="block",
-                    message=_block_message(result),
-                )
-            return AuthorizationDecision(
-                allowed=True,
-                action="allow",
-                message=result.evaluation_errors[0],
-            )
-
-        if not self.policy_engine:
-            result = _policy().PolicyEngine.make_failure_result(
-                self.policy_failure_mode,
-                ["No policy engine is configured for tool authorization"],
-            )
-        else:
-            # Persistence is owned by _persist_decision so the source request,
-            # derived decision, and policy violations share one transaction.
-            result = self.policy_engine.evaluate(event)
-
-        persisted = self._persist_decision(event, result)
-        if result.action != "block":
-            if not persisted and self.policy_failure_mode == "fail_closed":
-                return AuthorizationDecision(
-                    allowed=False,
-                    action="block",
-                    message="Authorization evidence could not be persisted",
-                )
-            return AuthorizationDecision(
-                allowed=True,
-                action=result.action,
-                message=(result.warnings[0] if result.warnings else None),
-            )
-
-        message = _block_message(result)
-        return AuthorizationDecision(allowed=False, action="block", message=message)
 
     def register(self, ctx):
         """Register hook handlers with the Hermes plugin context."""
@@ -634,28 +354,11 @@ class AuditPlugin:
 _plugin = None
 
 
-def _configured_failure_mode() -> str:
-    """Read the installed plugin's failure mode from the environment.
-
-    An unrecognized value means the operator asked for something other than
-    the default, so it resolves to the stricter mode rather than fail-open.
-    """
-    value = os.environ.get(POLICY_FAILURE_MODE_ENV)
-    if value is None or value == "":
-        return "fail_open"
-    if value in POLICY_FAILURE_MODES:
-        return value
-    log.error(
-        "Unrecognized %s=%r; using fail_closed", POLICY_FAILURE_MODE_ENV, value
-    )
-    return "fail_closed"
-
-
 def get_plugin() -> AuditPlugin:
     """Return the shared default AuditPlugin, creating it on first use."""
     global _plugin
     if _plugin is None:
-        _plugin = AuditPlugin(policy_failure_mode=_configured_failure_mode())
+        _plugin = AuditPlugin()
     return _plugin
 
 
