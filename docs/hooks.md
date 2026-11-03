@@ -50,10 +50,8 @@ unchanged.
 its `after_exchange` on an orderly shutdown (bounded by the upstream timeout,
 120 seconds; it logs a warning if exchanges are still running after that).
 
-A hooked proxy cannot also do credential injection (`provider_keys`), run the
-policy engine (`policies_dir`) or set `policy_failure_mode` (which would buffer
-every stream and block on policy errors): `ProxyServer` raises `ValueError`. A
-hook is the replacement for all three. The constructor arguments are `hooks`, `db`, `chain`,
+Panoptes has no credential injection, budgets or policy engine of its own: a hook
+is how a consumer adds them. The constructor arguments are `hooks`, `db`, `chain`,
 `upstreams`, `pricing`, `disconnect_drain_seconds` and `hook_slow_seconds`.
 
 ## What a hook may and may not do

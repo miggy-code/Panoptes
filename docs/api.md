@@ -210,7 +210,7 @@ evidence.
 
 Panoptes prices a response as an annotation (`cost.estimated_usd`,
 `cost.pricing_version`); it enforces nothing with it. A consumer that reserves
-or settles money against the same rate table (a gateway built on the hooks)
+or settles money against the same rate table (a consumer built on the hooks)
 relies on the
 format and the rounding below. They are **stable**: a change that alters a
 figure for an existing table is a breaking change, announced in the changelog

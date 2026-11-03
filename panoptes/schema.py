@@ -50,11 +50,6 @@ ALLOWED_OUTCOME_STATUSES = frozenset({
 LEGACY_AUTH_METHODS = frozenset({
     "api_key", "oauth", "cli",
 })
-# Deprecated aliases for the names v4 exported. Nothing enforces them any more
-# (v5 agent types and auth methods are open); they stay so code written against
-# v4 keeps importing, and go in 0.2.0 with the gateway modules that use them.
-ALLOWED_AGENT_TYPES = KNOWN_AGENT_TYPES
-ALLOWED_AUTH_METHODS = LEGACY_AUTH_METHODS
 _LEGACY_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
     "decision_point", "policy_violation",

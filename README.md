@@ -1,8 +1,8 @@
 # Panoptes
 
 <p align="center">
-  <strong>Agent observability, local audit trails, and policy gates.</strong><br>
-  A local-first view of OpenAI-, Anthropic-, Gemini-, and Hermes-based workflows.
+  <strong>Agent observability and local audit trails.</strong><br>
+  A local-first record of OpenAI-, Anthropic-, Gemini-, and Hermes-based workflows.
 </p>
 
 <p align="center">
@@ -11,31 +11,34 @@
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg">
 </p>
 
-Panoptes gives AI-agent traffic one place to land. Point a supported model
-client at the local reverse proxy and Panoptes turns requests, responses, tool
-instructions, policy decisions, and cost data into a queryable SQLite audit
-trail. Hermes integrations can also report lifecycle events and ask Panoptes
-for a synchronous pre-tool decision.
+Panoptes records what agents and models did and lets you read it back. Point a
+supported model client at the local reverse proxy and Panoptes turns requests,
+responses, tool instructions, and cost data into a queryable SQLite audit trail.
+Hermes integrations can also report lifecycle events.
 
-Panoptes runs locally with no external service. It records model API traffic
-and host-reported lifecycle events; tool calls emitted by a model remain
-requests unless the host reports an execution outcome.
+Panoptes observes. It never decides and never blocks: nothing in it allows,
+denies, rewrites, or rate-limits a request. Anything that decides plugs in
+through the [hook seam](docs/hooks.md) from another package.
+
+It runs locally with no external service. It records model API traffic and
+host-reported lifecycle events; tool calls emitted by a model remain requests
+unless the host reports an execution outcome.
 
 ## Why
 
 Agent logs tend to be provider-specific, short-lived, and hard to compare.
 Panoptes is built to answer a smaller set of operational questions well:
 
-- Which model requests and tool instructions crossed the controlled API path?
-- Which tool requests did a native adapter authorize or deny?
-- Which policy snapshot informed each recorded authorization decision or violation?
+- Which model requests and tool instructions crossed the observed API path?
+- What did each exchange cost, and how many tokens did it use?
+- Which events belong to the same run, and which run spawned which?
 - Has the locally stored event history changed since a checkpoint?
 
 Every supported adapter writes the same event shape. Every event carries
 capture metadata describing where it came from and how strong that observation
-is. That gives you one dependable record for tracing agent behavior, reviewing
-policy decisions, investigating incidents, and testing ideas—without the
-operational weight of a distributed observability stack.
+is. That gives you one dependable record for tracing agent behavior,
+investigating incidents, and testing ideas, without the operational weight of a
+distributed observability stack.
 
 ## Quick Start
 
@@ -82,18 +85,9 @@ panoptes status
 panoptes query --event-type tool_call --limit 10
 ```
 
-Observation is fail-open by default. For enforcement, provide a valid policy
-directory and choose `fail_closed` explicitly:
-
-```bash
-panoptes proxy \
-  --port 8081 \
-  --policies-dir ~/.panoptes/policies \
-  --policy-failure-mode fail_closed
-```
-
-The installed Hermes plugin reads its failure mode from
-`PANOPTES_POLICY_FAILURE_MODE` (`fail_open` or `fail_closed`).
+The proxy forwards every request and relays every stream as it arrives. Add
+`--pricing rates.json` (a versioned JSON rate table) and responses carry an
+estimated cost; a response that cannot be priced is recorded as unpriced.
 
 The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
 and the server accepts at most 64 concurrent requests by default; tune these
@@ -122,43 +116,6 @@ port = server.start()        # non-blocking; server.stop() when done
 
 The full contract is in [docs/hooks.md](docs/hooks.md).
 
-### Keep provider keys out of the agent
-
-With `--inject-credentials`, the provider API keys live only in Panoptes. The
-agent gets a Panoptes session token instead, and Panoptes swaps it for the real
-key on every request. An agent without the real key cannot skip the proxy and
-call the provider directly.
-
-```bash
-# Panoptes holds the keys (or pass --credentials-file, a 0600 YAML file
-# mapping anthropic/openai/gemini to keys).
-PANOPTES_ANTHROPIC_API_KEY=sk-ant-... panoptes proxy --port 8081 --inject-credentials
-
-# Issue a token for one agent session. Only the token is printed to stdout.
-TOKEN=$(panoptes token issue --agent claude_code --session my-run --ttl 28800)
-
-ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_API_KEY=$TOKEN claude
-```
-
-The agent sends the token where its SDK already sends a key: `x-api-key` or
-`Authorization: Bearer` for Anthropic, `Authorization: Bearer` for OpenAI, and
-`x-goog-api-key` or `?key=` for Gemini. A missing, unknown, expired, revoked,
-or ambiguous token gets HTTP 401 and a blocked audit event, and nothing reaches
-the provider. Panoptes stores only a SHA-256 hash of each token, and never
-writes a token or a provider key to the audit log or its own logs.
-
-The token also fixes the event identity: its agent type and session id replace
-the `X-Panoptes-Agent` and `X-Panoptes-Session` headers, and those events carry
-`context.capture.identity_assurance: "panoptes_session_token"`. Add
-`--max-requests N` to `token issue` to cap how many requests that token may
-authorize; further requests get HTTP 429 and a blocked audit event. For a dollar cap
-start the proxy with `--pricing rates.json` and issue the token with
-`--max-usd 2 --reserve-usd 0.05` (the reservation is the most one request may cost;
-unpriced responses are charged the whole reservation). Revoke a token
-with `panoptes token revoke <id>`; `panoptes token list` shows ids and status.
-Run Panoptes as a separate OS user or container and block direct provider
-egress, or the agent can still read the keys. See [SECURITY.md](SECURITY.md).
-
 ### Install Hermes lifecycle hooks
 
 ```bash
@@ -170,12 +127,9 @@ interface, plus legacy entrypoints. Add `panoptes` to Hermes `plugins.enabled`;
 the Panoptes package must be importable in the Hermes environment for local
 capture. Current Hermes `on_session_start`, `post_tool_call`, and `on_session_end`
 observations become Panoptes lifecycle events; `on_session_finalize` ends a
-session. Those hooks observe; they do not block. Local tool enforcement
-requires the Hermes host to call `authorize_tool_call()` synchronously and
-honor `allowed=False`. In `fail_closed` mode, an authorization whose evidence
-cannot be stored is denied. For isolated agents, `PANOPTES_HERMES_SINK` can
-direct observations to a separately protected Panoptes listener; this does not
-authenticate the host or prove tool execution.
+session. Those hooks observe; they do not block. For isolated agents,
+`PANOPTES_HERMES_SINK` can direct observations to a separately protected
+Panoptes listener; this does not authenticate the host or prove tool execution.
 For example, start a sink on a protected local network with:
 
 ```python
@@ -194,7 +148,6 @@ host-reported child links and request fingerprints for reconciliation.
 
 ```bash
 panoptes query --agent hermes --event-type agent_step --limit 50
-panoptes query --agent hermes --event-type decision_point --limit 50
 panoptes session <session-id>
 panoptes session <session-id> --limit 50
 panoptes session <session-id> --json
@@ -213,71 +166,58 @@ missing, mistyped, or empty `--db-path` exits with status 2 instead of creating
 a new database.
 
 `session` shows a chronological timeline with event status, tool or model,
-available duration, policy decisions, and event/run/call IDs. Model proposals
-and authorizations remain distinct from reported execution outcomes. Policy
-labels describe each event separately: a blocked tool proposal can withhold its
-containing model response even when that response event matched no block. By default
-it selects up to 10,000 newest events; `--limit` selects fewer. Partial timelines
-state the selected and matching counts. `--json` returns full stored events
-with those counts and a `partial` flag.
+available duration, and event/run/call IDs. Model proposals remain distinct from
+reported execution outcomes. By default it selects up to 10,000 newest events;
+`--limit` selects fewer. Partial timelines state the selected and matching
+counts. `--json` returns full stored events with those counts and a `partial`
+flag. Events written by an earlier version or by another producer may carry
+decision records; the timeline shows them as recorded.
 
 ### Check your setup
 
 ```bash
 panoptes doctor
-
-# Check the configuration you intend to use with the proxy
-panoptes doctor --policies-dir ~/.panoptes/policies \
-  --policy-failure-mode fail_closed --inject-credentials \
-  --credentials-file ~/.panoptes/credentials.yaml
 ```
 
-Doctor checks an existing database and schema, policy validity, and provider-key
-configuration when credential injection is requested. It reports the latest
-audit timestamp and warns when history is empty or older than 24 hours.
-Credential values stay hidden. It opens the database read-only, does not repair
-files or attempt audit writes, and makes no provider requests. Exit status is
-0 when checks pass (warnings may remain), or 2 when a check fails.
-
-The reported proxy mode describes the supplied flags and current policy files.
-Doctor does not discover a running proxy's settings, prove client routing or
-credential isolation, or verify the hash chain; use `panoptes verify` for the
-chain check. A valid configuration alone does not establish enforcement.
+Doctor checks an existing database and schema, reports the latest audit
+timestamp, and warns when history is empty or older than 24 hours. It opens the
+database read-only, does not repair files or attempt audit writes, and makes no
+provider requests. Exit status is 0 when checks pass (warnings may remain), or 2
+when a check fails. It does not discover a running proxy's settings, prove
+client routing, or verify the hash chain; use `panoptes verify` for the chain
+check.
 
 ## Architecture
 
 ```text
-Enforcement plane: adapter → normalize → policy gate → model/API boundary
-                                     │
-Audit plane:       adapter → normalized event → SQLite → CLI
+adapter → normalize → SQLite → read API / CLI
 ```
 
-The design has two intentionally small paths. The enforcement path makes a
-decision before a controlled boundary. The audit path commits normalized
-evidence to SQLite and keeps it available through the CLI. `capture.py`
-describes each adapter's fidelity so consumers can distinguish a model
-instruction from a host-reported or pre-authorized action.
+Each adapter normalizes what it observes into the schema below, and the store
+commits it with an optional local hash chain. `capture.py` describes each
+adapter's fidelity so consumers can distinguish a model instruction from a
+host-reported action.
 
 ### Capture adapters
 
-| Adapter | Observes | Enforcement boundary |
-|---------|----------|----------------------|
-| Reverse proxy | Supported model requests, responses, tool instructions, and client-reported tool results | Request preflight and fully buffered model responses |
-| Hermes plugin | Host-reported `agent_start`, `agent_step`, and `agent_end` events | Optional host-callable pre-tool authorizer, recorded as `decision_point` |
+| Adapter | Observes |
+|---------|----------|
+| Reverse proxy | Supported model requests, responses, tool instructions, and client-reported tool results |
+| Hermes plugin | Host-reported `agent_start`, `agent_step`, and `agent_end` events |
 
-The reverse proxy is a real boundary only for traffic that crosses it. It
-cannot see an arbitrary local file read after the agent receives a response,
-and an agent can bypass it if it still holds provider credentials. Stronger
-deployments must isolate those credentials and block direct provider egress.
-At the boundary itself, Panoptes rejects ambiguous JSON instead of guessing
-which duplicate value should inform a policy decision.
+The reverse proxy sees only traffic that crosses it. It cannot see an arbitrary
+local file read after the agent receives a response, and an agent that still
+holds provider credentials can bypass it. At the boundary itself, Panoptes
+withholds a buffered reply whose JSON repeats an object key, because the client
+and the audit trail could otherwise read different values, and it refuses a
+buffered reply larger than its limit.
 
 For reliable cross-request timelines, adapters should send
 `X-Panoptes-Session: <stable-session-id>`. Without it, each exchange is
 isolated. `X-Panoptes-Agent` and session headers are client assertions, not
 authenticated workload identities, and are removed before upstream forwarding.
-In credential-injection mode the session token supplies both values instead,
-and the headers are ignored.
+An embedding hook can set the identity itself; the event then records that a hook
+asserted it.
 
 Every proxied exchange gets a `run_id` and a `correlation_id`. The correlation
 id is the client's `X-Panoptes-Correlation-Id` when it sends a valid one (a
@@ -348,59 +288,26 @@ never as valid.
 
 Before an event reaches disk, Panoptes validates its identifiers, timestamps,
 outcomes, and costs; redacts common secret forms; and derives heuristic
-data-access tags from the action. Those tags are useful inputs for local policy
-and investigation, but they can be wrong. Treat both redaction and
-classification as defense in depth, not as complete data-loss prevention.
+data-access tags from the action. Those tags are useful for investigation, but
+they can be wrong. Treat both redaction and classification as defense in depth,
+not as complete data-loss prevention.
 
 Request events include complete bounded summaries of requested client-side,
-provider-hosted, and unknown tool capabilities. Client-executed model tool
-proposals remain `pending`; recognized provider-hosted actions record whether
-they completed, failed, or remain pending upstream. Hosted result excerpts are
-redacted and bounded. Unknown requested tool types are denied in
-`fail_closed`; `fail_open` records and logs a warning.
-
-### Policy engine
-
-Policies are YAML files in `~/.panoptes/policies/`:
-
-```yaml
-name: "no-prod-access"
-description: "Block tool calls classified as production access"
-enabled: true
-scope:
-  agents: ["*"]
-rule:
-  event_type: "tool_call"
-  conditions:
-    - field: "action.data_accessed"
-      operator: "contains"
-      value: "prod"
-  logic: "AND"
-action: block
-message: "Production access blocked. Request approval first."
-```
-
-- Operators: `==`, `!=`, `contains`, `in`, `matches`, `gt`, `lt`, `gte`, `lte`
-- Logic: `AND` / `OR`
-- Scopes: agent and session
-- Actions: `allow`, `warn`, `block`
-- Loading: one validated, content-digested policy set at startup; restart the
-  proxy after changing policy files
-- Failure posture: explicit `fail_open` or `fail_closed`
-
-Policies are strict on purpose. Unknown fields, malformed conditions, duplicate
-YAML keys, an empty directory, or any invalid file make the set fail to load.
-That turns a typo into a visible startup problem instead of a silently weaker
-rule.
+provider-hosted, and unknown tool capabilities, plus a system-prompt hash, a
+history hash and the declared tool names (no text is stored). Client-executed
+model tool proposals remain `pending`; recognized provider-hosted actions record
+whether they completed, failed, or remain pending upstream. Hosted result
+excerpts are redacted and bounded. A tool type Panoptes does not recognize is
+recorded under `action.unknown_tool_types`, never treated as known-safe.
 
 ## Supported Protocols and Adapters
 
-| Protocol / adapter | Capture method | Boundary |
-|--------------------|----------------|----------|
-| Anthropic Messages API | Reverse proxy | Model API |
-| OpenAI Chat Completions and Responses APIs | Reverse proxy | Model API |
-| Gemini `generateContent` and `streamGenerateContent` | Reverse proxy | Model API |
-| Hermes Agent | Native plugin | Host-reported lifecycle; optional pre-tool authorization |
+| Protocol / adapter | Capture method |
+|--------------------|----------------|
+| Anthropic Messages API | Reverse proxy |
+| OpenAI Chat Completions and Responses APIs | Reverse proxy |
+| Gemini `generateContent` and `streamGenerateContent` | Reverse proxy |
+| Hermes Agent | Native plugin (host-reported lifecycle) |
 
 An agent is proxy-compatible only if it lets you replace its model API base URL
 and emits a supported protocol. That is not equivalent to a tested native
@@ -408,12 +315,11 @@ integration.
 
 Current action parsing covers OpenAI function/custom/computer/shell/apply-patch
 and hosted-tool output items, Anthropic client and server tool blocks, and
-Gemini function, built-in tool, and code-execution parts. Unknown tool
-declarations or response item types never become an implicit safe result:
-`fail_closed` denies them, while `fail_open` records degraded inspection.
-Provider features introduced after this release, including OpenAI programmatic
-tool-calling output, require an adapter update and adversarial fixtures before
-they are supported.
+Gemini function, built-in tool, and code-execution parts. A tool declaration or
+response item type that Panoptes does not recognize is recorded as unknown and
+never becomes an implicit safe result. Provider features introduced after this
+release, including OpenAI programmatic tool-calling output, require an adapter
+update and adversarial fixtures before they are supported.
 
 ## Commands
 
@@ -421,37 +327,29 @@ they are supported.
 panoptes proxy          Start the loopback-only model-API reverse proxy
 panoptes --version      Show the installed Panoptes version
 panoptes status         Show event statistics
-panoptes doctor         Check local setup and requested proxy configuration
+panoptes doctor         Check the audit database (read-only)
 panoptes query          Query events by agent, type, tool, or time
 panoptes session <id>   Show a chronological timeline (--limit N, --json)
-panoptes evidence <id>  Reconstruct a related decision path
+panoptes evidence <id>  Reconstruct a related event path
 panoptes verify         Verify the local chain or a separately stored checkpoint
 panoptes checkpoint     Print the current chain checkpoint
-panoptes policy list    List the active policy snapshot
-panoptes policy add     Add a policy file
-panoptes policy check   Scan a bounded newest-event selection; errors exit nonzero
-panoptes policy test    Test one policy against one event
-panoptes token issue    Issue a session token for credential injection
-panoptes token revoke   Revoke a session token by id
-panoptes token list     List session tokens and their status (never values)
 ```
 
 ## Project Status
 
 | Component | Status |
 |-----------|--------|
-| Model-API reverse proxy | Alpha |
-| Hermes lifecycle plugin and authorizer API | Alpha |
+| Model-API reverse proxy and hook seam | Alpha |
+| Hermes lifecycle plugin | Alpha |
 | SQLite storage and local hash chain | Available; external checkpoints remain operator-managed |
-| Query, policy, and integrity CLI | Available |
-| YAML policy engine | Alpha |
-| Mandatory local execution broker | Out of scope today |
+| Query and integrity CLI | Available |
 
 The project targets Python 3.10 through 3.13 and runs its tests, distribution
 validation, and wheel smoke test in GitHub Actions. Passing tests do not expand
 the adapter guarantees described in [SECURITY.md](SECURITY.md).
 
-Runtime dependencies are intentionally small: `httpx` and `PyYAML`.
+The core has no runtime dependencies. The proxy needs `httpx`
+(`pip install 'panoptes-observe[proxy]'`).
 
 ## Development
 
@@ -470,18 +368,17 @@ The tests are local and network-independent. A change is ready to review when
 the full suite passes and `git diff --check` is clean. Release ownership and
 the tagged publishing flow are documented in [RELEASING.md](RELEASING.md).
 
-Focus tests on observable behavior: capture, policy decisions, credential
-handling, audit storage and integrity, and CLI flows. Use shared setup and
-parameterized cases for repeated inputs. Test helpers through those behaviors
-unless a separate test protects a distinct security or data-loss boundary.
+Focus tests on observable behavior: capture, the hook contract, audit storage
+and integrity, and CLI flows. Use shared setup and parameterized cases for
+repeated inputs. Test helpers through those behaviors unless a separate test
+protects a distinct data-loss boundary.
 
 ## Contributing
 
 Bug reports, protocol fixtures, and focused adapters are welcome. The most
-useful contributions strengthen an existing boundary: native pre-execution
-adapters, external append-only audit sinks, signed policy distribution, and
-adversarial provider fixtures. For security issues, please use the private
-reporting path in [SECURITY.md](SECURITY.md).
+useful contributions strengthen an existing boundary: external append-only audit
+sinks and adversarial provider fixtures. For security issues, please use the
+private reporting path in [SECURITY.md](SECURITY.md).
 
 ## License
 

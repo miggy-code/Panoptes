@@ -305,17 +305,12 @@ def test_v5_event_round_trips_idempotently(db):
 
 # ── review fixes: aliases and anchoring ──────────────────────────────────────
 
-def test_v4_names_stay_importable_until_the_gateway_modules_go():
-    from panoptes.schema import (
-        ALLOWED_AGENT_TYPES,
-        ALLOWED_AUTH_METHODS,
-        KNOWN_AGENT_TYPES,
-        LEGACY_AUTH_METHODS,
-    )
+def test_the_v4_alias_names_are_gone():
+    from panoptes import schema
 
-    assert ALLOWED_AGENT_TYPES is KNOWN_AGENT_TYPES
-    assert ALLOWED_AUTH_METHODS is LEGACY_AUTH_METHODS
-    assert "hermes" in ALLOWED_AGENT_TYPES - {"unknown"}
+    assert not hasattr(schema, "ALLOWED_AGENT_TYPES")
+    assert not hasattr(schema, "ALLOWED_AUTH_METHODS")
+    assert "hermes" in schema.KNOWN_AGENT_TYPES - {"unknown"}
 
 
 @pytest.mark.parametrize(
