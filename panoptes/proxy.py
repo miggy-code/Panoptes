@@ -467,9 +467,11 @@ class AuditEventWriter:
         streaming: bool,
         token_identity: bool = False,
         correlation_id: str | None = None,
+        correlation_source: str | None = None,
+        exchange_id: str | None = None,
     ) -> dict:
         capture = self._capture_metadata(streaming, token_identity)
-        if correlation_id is not None:
+        if correlation_id is not None and correlation_source == "client":
             # A client assertion for joining this exchange to an external journal;
             # it never changes agent type, session, or identity assurance.
             capture["client_correlation_id"] = correlation_id
@@ -490,6 +492,13 @@ class AuditEventWriter:
             # First-class since schema v5. The capture copy above is kept for
             # readers of earlier events.
             event["correlation_id"] = correlation_id
+        if exchange_id is not None:
+            # A client may reuse a correlation id across requests; the exchange
+            # id is unique to this one and is what joins its events exactly.
+            event["attributes"] = {
+                "exchange_id": exchange_id,
+                "correlation_source": correlation_source,
+            }
         return event
 
     def build_request_events(
@@ -557,9 +566,16 @@ class AuditEventWriter:
             or run_id
         )
         token_identity = identity is not None
+        exchange_id = uuid.uuid4().hex
         correlation_id = _lower_keys(req_headers).get("x-panoptes-correlation-id")
         if correlation_id is not None:
             validate_identifier(correlation_id, "correlation_id")
+            correlation_source = "client"
+        else:
+            # Every exchange has a join key. Without a client-asserted one it is
+            # the exchange id.
+            correlation_id = exchange_id
+            correlation_source = "proxy"
 
         exchange_ctx = {
             "run_id": run_id,
@@ -571,6 +587,8 @@ class AuditEventWriter:
             "turn_number": turn_number,
             "token_identity": token_identity,
             "correlation_id": correlation_id,
+            "correlation_source": correlation_source,
+            "exchange_id": exchange_id,
         }
 
         def _base(event_type: str) -> dict:
@@ -579,6 +597,8 @@ class AuditEventWriter:
                 agent_type=agent_type, turn_number=turn_number,
                 streaming=req_info["stream"], token_identity=token_identity,
                 correlation_id=correlation_id,
+                correlation_source=correlation_source,
+                exchange_id=exchange_id,
             )
 
         events: list[dict] = []
@@ -682,6 +702,8 @@ class AuditEventWriter:
                 streaming=bool(req_info.get("stream", False)),
                 token_identity=bool(exchange_ctx.get("token_identity")),
                 correlation_id=exchange_ctx.get("correlation_id"),
+                correlation_source=exchange_ctx.get("correlation_source"),
+                exchange_id=exchange_ctx.get("exchange_id"),
             )
 
         events: list[dict] = []

@@ -274,7 +274,8 @@ def test_verify_never_re_anchors_a_stripped_chain(tmp_path, capsys):
     assert exc.value.code == 1
     result = json.loads(capsys.readouterr().out)
     assert result["valid"] is False
-    assert "not initialized" in result["error"]
+    assert result["chain"] == "broken"
+    assert "missing" in result["error"]
 
     # A writer refuses to bless the stripped history with a fresh anchor.
     from panoptes.db import ChainIntegrityError

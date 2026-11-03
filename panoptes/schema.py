@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 # are still validated and normalized under the rules they were written for, so
 # stored history and replays of it stay valid.
 SCHEMA_VERSION = 5
-LEGACY_SCHEMA_VERSION = 4
 
 # ── Allowed values ────────────────────────────────────────────────────────────
 # Adapters Panoptes ships knowledge of. This is informational: any validated
@@ -48,6 +47,11 @@ ALLOWED_OUTCOME_STATUSES = frozenset({
 LEGACY_AUTH_METHODS = frozenset({
     "api_key", "oauth", "cli",
 })
+# Deprecated aliases for the names v4 exported. Nothing enforces them any more
+# (v5 agent types and auth methods are open); they stay so code written against
+# v4 keeps importing, and go in 0.2.0 with the gateway modules that use them.
+ALLOWED_AGENT_TYPES = KNOWN_AGENT_TYPES
+ALLOWED_AUTH_METHODS = LEGACY_AUTH_METHODS
 _LEGACY_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
     "decision_point", "policy_violation",
@@ -80,9 +84,10 @@ _AGENT_TYPES_BY_SCHEMA_VERSION = {
     4: KNOWN_AGENT_TYPES,
 }
 # ``<namespace>.<name>[.<name>...]``, lower-case, so a custom type can never
-# collide with a built-in one (none contains a dot).
+# collide with a built-in one (none contains a dot). Matched with fullmatch:
+# ``$`` would also accept a trailing newline.
 _NAMESPACED_EVENT_TYPE_RE = re.compile(
-    r"^[a-z][a-z0-9_]{0,63}(?:\.[a-z0-9][a-z0-9_]{0,63})+$"
+    r"[a-z][a-z0-9_]{0,63}(?:\.[a-z0-9][a-z0-9_]{0,63})+"
 )
 MAX_EVENT_TYPE_LENGTH = 128
 MAX_ATTRIBUTES_BYTES = 64 * 1024
@@ -426,7 +431,7 @@ def is_valid_event_type(
     return (
         schema_version >= 5
         and len(event_type) <= MAX_EVENT_TYPE_LENGTH
-        and _NAMESPACED_EVENT_TYPE_RE.match(event_type) is not None
+        and _NAMESPACED_EVENT_TYPE_RE.fullmatch(event_type) is not None
     )
 
 
