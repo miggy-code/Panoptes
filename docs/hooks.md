@@ -361,7 +361,11 @@ provider's final usage. If the stream ends inside the bound, the usage is parsed
 normally and `complete` is `True`: `complete` describes what Panoptes read, not
 what the client received. If the bound is hit first, Panoptes closes the upstream
 connection, `complete` is `False` and `usage` is `{}`. `request_sent` is `True`
-either way. Draining holds the request slot, so the bound is the cost cap.
+either way. Draining holds the request slot, so the bound is the cost cap. The time bound is
+a wall-clock deadline: when it passes Panoptes cuts the upstream read even if the
+provider has gone silent, and `complete` is `False`. (A disconnect is noticed
+when Panoptes next writes to the client; until then the relay behaves as it
+always has, bounded by the upstream read timeout.)
 
 A buffered (non-streamed) response is read in full before it is written, so a
 client that disconnects before the write has no effect on `complete`.

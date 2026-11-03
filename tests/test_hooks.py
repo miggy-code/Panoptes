@@ -60,6 +60,7 @@ class FakeUpstream:
         self.piece_delay = 0.05            # between the pieces of a stream's tail
         self.gate = threading.Event()      # releases the tail of a gated stream
         self.head_sent = threading.Event()
+        self.stall = threading.Event()     # holds a "stalled" stream silent
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -111,6 +112,22 @@ class FakeUpstream:
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+                elif outer.mode == "stalled":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    self.wfile.write(SSE_HEAD)
+                    self.wfile.flush()
+                    outer.head_sent.set()
+                    outer.gate.wait(10)
+                    try:
+                        for piece in SSE_TAIL.split(b"\n\n")[:2]:
+                            self.wfile.write(piece + b"\n\n")
+                            self.wfile.flush()
+                            time.sleep(0.05)
+                        outer.stall.wait(10)         # then goes silent
+                    except OSError:
+                        pass
                 elif outer.mode in ("stream", "gated"):
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -151,6 +168,7 @@ class FakeUpstream:
 
     def close(self):
         self.gate.set()
+        self.stall.set()
         self.server.shutdown()
         self.server.server_close()
 
@@ -885,3 +903,26 @@ def test_a_hooked_stream_is_relayed_not_buffered(make_proxy, upstream):
         upstream.gate.set()
         list(chunks)
     wait_after(hooks)
+
+
+def test_the_drain_bound_is_a_wall_clock_deadline(make_proxy, upstream):
+    """A silent upstream must not hold the slot past disconnect_drain_seconds."""
+    upstream.mode = "stalled"
+    hooks = Recorder()
+    server, client, _ = make_proxy(hooks, disconnect_drain_seconds=0.5)
+    body = json.dumps(dict(BODY, stream=True)).encode()
+    sock = socket.create_connection(("127.0.0.1", server.port))
+    sock.sendall(
+        b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+    )
+    assert upstream.head_sent.wait(10)
+    sock.recv(4096)
+    abort(sock)
+    started = time.monotonic()
+    upstream.gate.set()                              # two pieces, then silence
+
+    ex = wait_after(hooks, timeout=6)
+    assert time.monotonic() - started < 4            # the upstream stays silent for 10 s
+    assert ex.request_sent is True and ex.complete is False and ex.usage == {}
+    assert ex.produced_output is True

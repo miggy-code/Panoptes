@@ -1581,6 +1581,33 @@ def _may_have_reached_upstream(exc: BaseException) -> bool:
     )
 
 
+def _start_drain_timer(resp: Any, seconds: float) -> tuple[threading.Timer, threading.Event]:
+    """Cut the upstream read after *seconds*, however silent the upstream is.
+
+    A deadline checked only when a chunk arrives is no bound at all: a stalled
+    upstream would hold the request slot until the read timeout.
+    """
+    expired = threading.Event()
+    network_stream = resp.extensions.get("network_stream")
+    get_extra = getattr(network_stream, "get_extra_info", None)
+    sock = get_extra("socket") if callable(get_extra) else None
+
+    def expire() -> None:
+        expired.set()
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+            else:
+                resp.close()
+        except Exception:
+            pass
+
+    timer = threading.Timer(seconds, expire)
+    timer.daemon = True
+    timer.start()
+    return timer, expired
+
+
 def _outbound(
     handler: Any,
     headers: dict[str, str],
@@ -1978,6 +2005,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
                 # Stream body
                 drain_deadline: float | None = None
+                drain_timer: threading.Timer | None = None
+                drain_expired: threading.Event | None = None
                 try:
                     for chunk in resp.iter_bytes():
                         if not chunk:
@@ -2001,11 +2030,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                 raise
                             report.client_gone = True
                             drain_deadline = time.monotonic() + drain_seconds
+                            drain_timer, drain_expired = _start_drain_timer(
+                                resp, drain_seconds
+                            )
                     if not report.client_gone:
                         self.wfile.flush()
                 except Exception:
                     audit_truncated = True
                     log.exception("Error mid-stream from %s", safe_label)
+                finally:
+                    if drain_timer is not None:
+                        drain_timer.cancel()
+                if drain_expired is not None and drain_expired.is_set():
+                    # A cut connection can look like a clean end of stream.
+                    audit_truncated = True
 
                 if hooked:
                     # Tell the client the stream is over now; the connection
