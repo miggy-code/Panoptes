@@ -974,3 +974,29 @@ def test_credentialed_urls_never_reach_the_logs(tmp_path, upstream, caplog, hook
     finally:
         server.stop()
     assert "SEKRETLOG" not in caplog.text
+
+
+def test_a_client_that_left_does_not_turn_an_upstream_error_into_aborted(
+    make_proxy, upstream, monkeypatch
+):
+    from panoptes.proxy import ProxyHandler
+
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    port = dead.getsockname()[1]
+    dead.close()
+    monkeypatch.setenv("PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{port}")
+
+    def gone(self, status, message, extra=None):
+        raise BrokenPipeError("client is gone")
+
+    monkeypatch.setattr(ProxyHandler, "_send_json_error", gone)
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+    try:
+        client.post("/v1/messages", json=dict(BODY, stream=True))
+    except httpx.HTTPError:
+        pass
+    ex = wait_after(hooks)
+    assert ex.outcome == "upstream_error" and ex.status == 502
+    assert ex.request_sent is False

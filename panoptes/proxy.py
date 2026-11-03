@@ -1612,6 +1612,14 @@ def _start_drain_timer(resp: Any, seconds: float) -> tuple[threading.Timer, thre
     return timer, expired
 
 
+def _answer_if_client_present(handler: Any, status: int, message: str) -> None:
+    """Send an error reply; a client that has left must not change the outcome."""
+    try:
+        handler._send_json_error(status, message)
+    except OSError:
+        log.warning("Client disconnected before the %s reply was written", status)
+
+
 def _outbound(
     handler: Any,
     headers: dict[str, str],
@@ -2067,20 +2075,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             report.upstream_error = True
             report.request_sent |= _may_have_reached_upstream(exc)
             if not response_started:
-                self._send_json_error(504, "Gateway Timeout")
+                _answer_if_client_present(self, 504, "Gateway Timeout")
             return 504, {"content-type": "application/json"}, b"", True
         except httpx.ConnectError:
             log.error("Upstream connect error (streaming): %s %s", method, safe_label)
             report.upstream_error = True
             if not response_started:
-                self._send_json_error(502, "Bad Gateway")
+                _answer_if_client_present(self, 502, "Bad Gateway")
             return 502, {"content-type": "application/json"}, b"", True
         except Exception as exc:
             log.exception("Upstream streaming error: %s %s", method, safe_label)
             report.upstream_error = True
             report.request_sent |= _may_have_reached_upstream(exc)
             if not response_started:
-                self._send_json_error(502, "Bad Gateway")
+                _answer_if_client_present(self, 502, "Bad Gateway")
             return 502, {"content-type": "application/json"}, b"", True
         finally:
             if owned:
