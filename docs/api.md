@@ -52,6 +52,13 @@ log = AuditDB.open_readonly("~/.panoptes/audit.db")   # reads, changes nothing
   names its own events `<namespace>.<name>` (lower-case, for example
   `agentgate.allow`; at most 128 characters). Custom types get no derived
   `data_accessed` tags.
+- **Request capture.** A proxied `model_request` event's `action` carries
+  `messages_count`, `declared_tools` (the names of the tools the request
+  declares), `system_prompt_sha256` and `history_sha256`. The hashes are SHA-256
+  of the canonical JSON of the system/developer/instructions content and of every
+  conversation turn before the newest, so two requests that continue one history
+  share `history_sha256`. No prompt text is stored in these fields. A field is
+  absent when there is nothing to hash. (`raw_request` is separate and unchanged.)
 - **`attributes`** is an open JSON object, at most 64 KiB serialized, redacted
   like `context` (secret-shaped keys and values). An empty object is stored as
   absent.

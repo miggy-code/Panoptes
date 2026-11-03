@@ -262,6 +262,36 @@ class OpenAIProvider(Provider):
             "stream": bool(body.get("stream", False)),
         }
 
+    def _fingerprint_parts(self, body: dict) -> tuple[Any, list, list]:
+        tools = body.get("tools") or body.get("functions")
+        names: list = []
+        for tool in tools if isinstance(tools, list) else []:
+            if not isinstance(tool, dict):
+                continue
+            function = tool.get("function")
+            names.append(
+                (function.get("name") if isinstance(function, dict) else None)
+                or tool.get("name")
+                or tool.get("type")
+            )
+        if "input" in body and "messages" not in body:
+            value = body.get("input")
+            turns = value if isinstance(value, list) else (
+                [value] if value is not None else []
+            )
+            return body.get("instructions"), turns, names
+        messages = body.get("messages")
+        system: list = []
+        turns = []
+        for message in messages if isinstance(messages, list) else []:
+            if isinstance(message, dict) and message.get("role") in (
+                "system", "developer",
+            ):
+                system.append(message.get("content"))
+            else:
+                turns.append(message)
+        return system or None, turns, names
+
     @staticmethod
     def _response_dialect(
         *,

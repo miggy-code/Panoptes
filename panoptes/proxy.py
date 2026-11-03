@@ -718,6 +718,7 @@ class AuditEventWriter:
             "tools_count": req_info["tools_count"],
             "streaming": req_info["stream"],
             **requested_tools,
+            **provider.request_fingerprint(req_body),
         }
         req_event["outcome"] = {"status": "success"}
         req_event["raw_request"] = _cap_raw(req_body)

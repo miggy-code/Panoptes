@@ -94,6 +94,20 @@ class AnthropicProvider(Provider):
             "stream": bool(body.get("stream", False)),
         }
 
+    def _fingerprint_parts(self, body: dict) -> tuple[Any, list, list]:
+        messages = body.get("messages")
+        tools = body.get("tools")
+        names = [
+            tool.get("name") or tool.get("type")
+            for tool in (tools if isinstance(tools, list) else [])
+            if isinstance(tool, dict)
+        ]
+        return (
+            body.get("system"),
+            messages if isinstance(messages, list) else [],
+            names,
+        )
+
     def extract_tool_calls(
         self,
         resp_body: dict,
