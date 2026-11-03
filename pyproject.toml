@@ -5,18 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "panoptes-observe"
 version = "0.2.0.dev1"
-description = "Adapter-based agent observability, local audit trails, and policy gates."
+description = "Adapter-based agent observability and local audit trails."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "PyYAML>=6,<7",
-]
+dependencies = []
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
     {name = "Miggy", email = "miguel@throttlai.com"}
 ]
-keywords = ["agent", "ai", "audit", "security", "observability", "claude-code", "codex", "hermes", "antigravity", "policy"]
+keywords = ["agent", "ai", "audit", "security", "observability", "claude-code", "codex", "hermes", "antigravity"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,7 +24,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Quality Assurance",
-    "Topic :: Security",
 ]
 
 [project.optional-dependencies]
@@ -56,4 +53,4 @@ panoptes = "panoptes.cli:main"
 include = ["panoptes*"]
 
 [tool.setuptools.package-data]
-panoptes = ["default_policies/*.yaml", "py.typed"]
+panoptes = ["py.typed"]

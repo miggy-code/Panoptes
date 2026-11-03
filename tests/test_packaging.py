@@ -22,24 +22,29 @@ def test_importing_the_store_loads_neither_yaml_nor_an_http_client():
         "import panoptes\n"
         "from panoptes import AuditDB, validate_event, SCHEMA_VERSION\n"
         "from panoptes.hooks import ProxyHooks, Reject, Upstream\n"
-        "bad = [m for m in ('yaml', 'httpx', 'panoptes.policy', 'panoptes.proxy', "
-        "'panoptes.credentials') if m in sys.modules]\n"
+        "bad = [m for m in ('yaml', 'httpx', 'panoptes.proxy') if m in sys.modules]\n"
         "print(bad)\n"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[]"
 
 
-def test_policy_names_still_import_from_the_package():
+def test_the_policy_engine_and_its_names_are_gone():
     result = run(
-        "import panoptes\n"
-        "from panoptes import PolicyEngine, Policy, PolicyResult, "
-        "POLICY_ENGINE_SEMANTICS_VERSION\n"
-        "assert 'PolicyEngine' in dir(panoptes)\n"
+        "import importlib.util, panoptes\n"
+        "assert importlib.util.find_spec('panoptes.policy') is None\n"
+        "assert not hasattr(panoptes, 'PolicyEngine')\n"
         "try:\n    panoptes.Nope\nexcept AttributeError:\n    print('ok')\n"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok"
+
+
+def test_the_package_needs_no_third_party_dependency():
+    pyproject = (ROOT.parent / "pyproject.toml").read_text()
+    assert "dependencies = []" in pyproject
+    assert "yaml" not in pyproject.lower()
+    assert not (ROOT / "default_policies").exists()
 
 
 def test_the_ingest_server_does_not_need_the_proxy_module():
@@ -80,8 +85,7 @@ def test_the_hermes_ingest_server_runs_without_the_policy_engine(tmp_path):
         "from panoptes.hermes_ingest import make_server\n"
         f"server = make_server(('127.0.0.1', 0), {str(tmp_path / 'ingest.db')!r})\n"
         "server.server_close()\n"
-        "bad = [m for m in ('yaml', 'httpx', 'panoptes.policy', 'panoptes.proxy', "
-        "'panoptes.credentials') if m in sys.modules]\n"
+        "bad = [m for m in ('yaml', 'httpx', 'panoptes.proxy') if m in sys.modules]\n"
         "print(bad)\n"
     )
     assert result.returncode == 0, result.stderr

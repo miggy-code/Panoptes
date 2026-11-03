@@ -4,13 +4,11 @@ Covers:
   - Shared run_id across events in one exchange
   - Reverse-proxy path routing
   - SSE reassembly for Anthropic and OpenAI formats
-  - Pre-flight policy blocking
+  - Request and response event construction and persistence
 """
 
 import io
 import json
-import os
-import tempfile
 import time
 import uuid
 from email.message import Message
@@ -1128,29 +1126,13 @@ def test_openai_responses_rejects_incomplete_function_call_stream():
             {"content-type": "text/event-stream"},
             b'data: {"choices": []}\n\ndata: {not-json}\n\n',
         ),
-        (
-            "/custom/generate",
-            {"payload": "opaque"},
-            {"content-type": "application/json"},
-            b'{"possibly_hidden_tool_call": true}',
-        ),
     ],
 )
-def test_buffering_enforcement_denies_uninspectable_responses(
+def test_an_uninspectable_response_is_delivered_and_recorded_as_incomplete(
     path, request_body, response_headers, response_body
 ):
-    from panoptes.policy import PolicyResult
-
     db = _AuditDBStub()
     writer = AuditEventWriter(db)
-
-    class _BlockingCapableEngine:
-        has_blocking_policies = True
-
-        def check_event(self, event):
-            return PolicyResult(action="allow")
-
-    writer.policy_engine = _BlockingCapableEngine()
     req_events, exchange_ctx = writer.build_request_events(
         path=path,
         method="POST",
@@ -1194,15 +1176,14 @@ def test_buffering_enforcement_denies_uninspectable_responses(
         t0=time.monotonic(),
     )
 
-    assert handler.status == 502
-    denial = json.loads(handler.wfile.getvalue())
-    assert denial["inspection_error"] is True
-    assert handler.wfile.getvalue() != response_body
+    # Panoptes records what it could not read; it does not withhold the reply.
+    assert handler.status == 200
+    assert handler.wfile.getvalue() == response_body
     response_event = next(
         event for event in db.events if event["event_type"] == "model_response"
     )
-    assert response_event["outcome"]["status"] == "blocked"
-    assert response_event["context"]["capture"]["inspection_status"] == "blocked"
+    assert response_event["outcome"]["status"] == "error"
+    assert response_event["context"]["capture"]["inspection_status"] == "incomplete"
 
 
 def test_buffered_and_stream_audit_bodies_are_bounded():
@@ -1373,158 +1354,7 @@ def test_decoded_response_headers_and_connection_nominated_headers_are_removed()
     )
 
 
-def test_fail_closed_without_policy_engine_denies_and_records_provenance():
-    writer = AuditEventWriter(
-        _AuditDBStub(), policy_failure_mode="fail_closed"
-    )
-    events, _ = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body={"model": "gpt-test", "input": "hello"},
-    )
-    result = writer.check_policies(events)
-    assert result.action == "block"
-    assert result.violated_policies[0]["policy_name"] == "policy_engine_error"
-    assert events[0]["context"]["policy"]["action"] == "block"
-
-
-def test_proxy_policy_aggregation_preserves_matches_and_snapshot():
-    from panoptes.policy import PolicyResult
-
-    writer = AuditEventWriter(_AuditDBStub())
-
-    class _Engine:
-        has_blocking_policies = False
-
-        def check_event(self, event):
-            return PolicyResult(
-                action="allow",
-                matched_policies=[{
-                    "policy_name": "explicit-allow",
-                    "action": "allow",
-                    "reason": "test",
-                    "message": "allowed",
-                }],
-                policy_snapshot_id="snapshot-123",
-            )
-
-    writer.policy_engine = _Engine()
-    events, _ = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body={"model": "gpt-test", "input": "hello"},
-    )
-    result = writer.check_policies(events)
-    assert result.policy_snapshot_id == "snapshot-123"
-    assert result.matched_policies[0]["policy_name"] == "explicit-allow"
-    assert events[0]["context"]["policy"]["snapshot_id"] == "snapshot-123"
-    assert (
-        events[0]["context"]["policy"]["matched_policies"][0]["policy_name"]
-        == "explicit-allow"
-    )
-
-
-def test_proxy_batches_source_and_policy_violation_atomically(tmp_path):
-    class _BatchDB:
-        def __init__(self):
-            self.batches = []
-
-        def insert_events(self, events):
-            self.batches.append(list(events))
-
-        def insert_event(self, event):
-            raise AssertionError("atomic batch path should be used")
-
-    policies = tmp_path / "policies"
-    policies.mkdir()
-    (policies / "deny.yaml").write_text(
-        "\n".join([
-            'name: "deny-test-model"',
-            "enabled: true",
-            "rule:",
-            "  event_type: model_request",
-            "  conditions:",
-            '    - field: "action.model"',
-            '      operator: "=="',
-            '      value: "gpt-test"',
-            "action: block",
-            'message: "test model denied"',
-        ]),
-        encoding="utf-8",
-    )
-    db = _BatchDB()
-    writer = AuditEventWriter(db, policies_dir=str(policies))
-    events, _ = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body={"model": "gpt-test", "input": "hello"},
-    )
-
-    result = writer.check_policies(events)
-
-    assert result.action == "block"
-    assert db.batches == []
-    assert [event["event_type"] for event in events] == [
-        "model_request",
-        "policy_violation",
-    ]
-    assert (
-        events[1]["context"]["policy_snapshot_id"]
-        == result.policy_snapshot_id
-    )
-
-    writer.write(events)
-    assert len(db.batches) == 1
-    assert [event["event_type"] for event in db.batches[0]] == [
-        "model_request",
-        "policy_violation",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("failure_mode", "expected_action"),
-    [("fail_open", "warn"), ("fail_closed", "block")],
-)
-def test_unknown_requested_tool_type_never_silently_allows(
-    failure_mode, expected_action
-):
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db, policy_failure_mode=failure_mode)
-    events, _ = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body={
-            "model": "gpt-test",
-            "input": "future tool",
-            "tools": [{"type": "future_remote_execution"}],
-        },
-    )
-
-    result = writer.check_policies(events)
-    writer.write(events)
-
-    assert result.action == expected_action
-    assert any(
-        violation["policy_name"] == "unknown_requested_tool_type"
-        for violation in result.violated_policies
-    )
-    stored_source = next(
-        event for event in db.events if event["event_type"] == "model_request"
-    )
-    assert stored_source["context"]["policy"]["action"] == expected_action
-    assert any(
-        violation["policy_name"] == "unknown_requested_tool_type"
-        for violation in stored_source["context"]["policy"][
-            "violated_policies"
-        ]
-    )
-
-
-def test_proxy_validates_normalized_identity_before_policy_or_forwarding():
+def test_proxy_validates_normalized_identity_before_forwarding():
     writer = AuditEventWriter(_AuditDBStub())
     with pytest.raises(ValidationError, match="control characters"):
         writer.build_request_events(
@@ -1628,18 +1458,9 @@ def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery():
     assert response_event["context"]["capture"]["response_delivered"] is False
 
 
-@pytest.mark.parametrize(
-    ("failure_mode", "expected_status", "expected_outcome"),
-    [
-        ("fail_open", 200, "error"),
-        ("fail_closed", 503, "blocked"),
-    ],
-)
-def test_response_event_construction_failure_gets_explicit_fallback(
-    failure_mode, expected_status, expected_outcome, monkeypatch
-):
+def test_response_event_construction_failure_gets_explicit_fallback(monkeypatch):
     db = _AuditDBStub()
-    writer = AuditEventWriter(db, policy_failure_mode=failure_mode)
+    writer = AuditEventWriter(db)
     req_body = {"model": "gpt-test", "input": "hello"}
     req_events, exchange_ctx = writer.build_request_events(
         path="/v1/responses",
@@ -1693,19 +1514,13 @@ def test_response_event_construction_failure_gets_explicit_fallback(
         t0=time.monotonic(),
     )
 
-    assert handler.status == expected_status
+    assert handler.status == 200
     response_event = next(
         event for event in db.events if event["event_type"] == "model_response"
     )
-    assert response_event["outcome"]["status"] == expected_outcome
-    assert (
-        response_event["context"]["capture"]["inspection_status"]
-        == ("blocked" if failure_mode == "fail_closed" else "incomplete")
-    )
-    if failure_mode == "fail_open":
-        assert handler.wfile.getvalue() == upstream
-    else:
-        assert handler.wfile.getvalue() != upstream
+    assert response_event["outcome"]["status"] == "error"
+    assert response_event["context"]["capture"]["inspection_status"] == "incomplete"
+    assert handler.wfile.getvalue() == upstream
 
 
 def test_audit_writer_raises_when_batch_and_fallback_cannot_persist_all_events():
@@ -1721,277 +1536,15 @@ def test_audit_writer_raises_when_batch_and_fallback_cannot_persist_all_events()
         writer.write([{"event_id": "one"}, {"event_id": "two"}])
 
 
-@pytest.mark.parametrize(
-    ("policy_action", "expected_status"),
-    [("allow", 503), ("block", 403)],
-)
-def test_fail_closed_never_forwards_without_durable_request_audit(
-    policy_action, expected_status
-):
-    from panoptes.policy import PolicyResult
-
-    class _FailingDB:
-        def insert_event(self, event):
-            raise OSError("audit storage unavailable")
-
-    writer = AuditEventWriter(
-        _FailingDB(), policy_failure_mode="fail_closed"
-    )
-
-    class _Engine:
-        has_blocking_policies = True
-
-        def check_event(self, event):
-            if policy_action == "block":
-                return PolicyResult(
-                    action="block",
-                    violated_policies=[{
-                        "policy_name": "deny-test",
-                        "message": "blocked",
-                    }],
-                )
-            return PolicyResult(action="allow")
-
-    writer.policy_engine = _Engine()
-
-    class _Handler:
-        headers = {}
-
-        def __init__(self):
-            self.writer = writer
-            self.forwarded = False
-            self.error = None
-
-        def _parse_target(self):
-            return "https", "api.openai.com", 443, "/v1/responses"
-
-        def _read_body(self):
-            return json.dumps({
-                "model": "gpt-test",
-                "input": "hello",
-            }).encode()
-
-        def _send_json_error(self, status, message, extra=None):
-            self.error = (status, message, extra)
-
-        def _handle_buffered(self, **kwargs):
-            self.forwarded = True
-
-    handler = _Handler()
-    ProxyHandler._handle_request(handler, "POST")
-    assert handler.forwarded is False
-    assert handler.error[0] == expected_status
-    if policy_action == "block":
-        assert handler.error[2]["audit_persisted"] is False
-
-
 # ---------------------------------------------------------------------------
-# Pre-flight policy blocking
+# Event persistence
 # ---------------------------------------------------------------------------
 
 
-def test_preflight_block_prevents_forward():
-    """Pre-flight check: blocked request events should be returned as 'block' without forwarding."""
+def test_request_and_response_events_are_written_together():
+    """Both request and response events are written under one run_id."""
     db = _AuditDBStub()
     writer = AuditEventWriter(db)
-
-    # Stub policy engine that always blocks
-    class _BlockingEngine:
-        def check_event(self, event):
-            from panoptes.policy import PolicyResult
-            return PolicyResult(
-                action="block",
-                violated_policies=[{"policy_name": "test_block", "message": "Blocked for testing"}],
-                warnings=["Blocked for testing"],
-            )
-
-    writer.policy_engine = _BlockingEngine()
-
-    req_body = {
-        "model": "gpt-4",
-        "messages": [{"role": "user", "content": "Do something bad"}],
-        "stream": False,
-    }
-
-    run_id = uuid.uuid4().hex
-    req_events, exchange_ctx = writer.build_request_events(
-        path="/v1/chat/completions",
-        method="POST",
-        req_headers={},
-        req_body=req_body,
-        run_id=run_id,
-    )
-
-    # Pre-flight check
-    policy_result = writer.check_policies(req_events)
-    assert policy_result.action == "block", f"Expected block, got {policy_result.action}"
-    assert len(policy_result.violated_policies) > 0
-
-    # Simulate handler writing events on block (no response events written)
-    writer.write(req_events)
-
-    # Verify events written to DB share the run_id
-    stored = db.query()
-    assert len(stored) > 0
-    for e in stored:
-        assert e["agent"]["run_id"] == run_id, (
-            f"run_id mismatch: expected {run_id}, got {e['agent']['run_id']}"
-        )
-
-    # No response events written (we blocked pre-flight)
-    assert all(e["event_type"] != "model_response" for e in stored), (
-        "model_response event should not be written on pre-flight block"
-    )
-
-
-def test_preflight_block_records_request_as_not_forwarded():
-    from panoptes.policy import PolicyResult
-
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)
-
-    class _BlockingEngine:
-        def check_event(self, event):
-            return PolicyResult(
-                action="block",
-                violated_policies=[{
-                    "policy_name": "deny-request",
-                    "message": "request denied",
-                }],
-            )
-
-    writer.policy_engine = _BlockingEngine()
-
-    class _Handler:
-        headers = {}
-
-        def __init__(self):
-            self.writer = writer
-            self.forwarded = False
-            self.error = None
-
-        def _parse_target(self):
-            return "https", "api.openai.com", 443, "/v1/responses"
-
-        def _read_body(self):
-            return json.dumps({
-                "model": "gpt-test",
-                "input": "hello",
-            }).encode()
-
-        def _send_json_error(self, status, message, extra=None):
-            self.error = (status, message, extra)
-
-        def _handle_buffered(self, **kwargs):
-            self.forwarded = True
-
-    handler = _Handler()
-    ProxyHandler._handle_request(handler, "POST")
-
-    assert handler.forwarded is False
-    assert handler.error[0] == 403
-    request_event = next(
-        event for event in db.events if event["event_type"] == "model_request"
-    )
-    assert request_event["outcome"]["status"] == "blocked"
-    assert (
-        request_event["context"]["capture"]["upstream_forwarded"] is False
-    )
-    assert (
-        request_event["context"]["capture"]["delivery_status"]
-        == "blocked_before_upstream"
-    )
-
-
-def test_buffered_postflight_block_records_response_and_tool_call_withheld():
-    from panoptes.policy import PolicyResult
-
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)
-
-    class _BlockingEngine:
-        has_blocking_policies = True
-
-        def check_event(self, event):
-            return PolicyResult(
-                action="block",
-                violated_policies=[{
-                    "policy_name": "deny-response",
-                    "message": "response denied",
-                }],
-            )
-
-    writer.policy_engine = _BlockingEngine()
-    req_body = {"model": "gpt-test", "input": "call a tool"}
-    req_events, exchange_ctx = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body=req_body,
-        run_id="withheld-response-run",
-    )
-    exchange_ctx["_request_events_persisted"] = True
-    upstream_body = json.dumps({
-        "object": "response",
-        "output": [{
-            "id": "fc_123",
-            "type": "function_call",
-            "call_id": "call_123",
-            "name": "terminal",
-            "arguments": '{"command":"dangerous"}',
-        }],
-    }).encode()
-
-    class _Handler:
-        def __init__(self):
-            self.writer = writer
-            self.wfile = io.BytesIO()
-            self.status = None
-            self.headers = []
-
-        def _forward_request(self, *args, **kwargs):
-            return 200, {"content-type": "application/json"}, upstream_body
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            self.headers.append((key, value))
-
-        def end_headers(self):
-            pass
-
-    handler = _Handler()
-    ProxyHandler._handle_buffered(
-        handler,
-        method="POST",
-        scheme="https",
-        host="api.openai.com",
-        port=443,
-        path="/v1/responses",
-        req_headers={},
-        body=json.dumps(req_body).encode(),
-        req_body=req_body,
-        req_events=req_events,
-        exchange_ctx=exchange_ctx,
-        t0=time.monotonic(),
-    )
-
-    assert handler.status == 403
-    assert handler.wfile.getvalue() != upstream_body
-    by_type = {event["event_type"]: event for event in db.events}
-    assert by_type["model_response"]["outcome"]["status"] == "blocked"
-    assert by_type["tool_call"]["outcome"]["status"] == "blocked"
-    for event_type in ("model_response", "tool_call"):
-        capture = by_type[event_type]["context"]["capture"]
-        assert capture["response_delivered"] is False
-        assert capture["delivery_status"] == "withheld"
-
-
-def test_preflight_allow_writes_all_events():
-    """When policies allow, both request and response events are written."""
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)  # no policy engine — always allows
 
     req_body = {
         "model": "claude-opus-4-5",
@@ -2011,9 +1564,6 @@ def test_preflight_allow_writes_all_events():
         path="/v1/messages", method="POST",
         req_headers={}, req_body=req_body, run_id=run_id,
     )
-    policy_result = writer.check_policies(req_events)
-    assert policy_result.action == "allow"
-
     resp_events = writer.build_response_events(
         path="/v1/messages", req_body=req_body,
         resp_status=200, resp_headers={}, resp_body=resp_body,

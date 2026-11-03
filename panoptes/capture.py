@@ -2,7 +2,7 @@
 
 An event can be perfectly normalized yet still be only an observation of a
 model response rather than proof that a local tool ran.  Adapters attach this
-metadata to every event so users and policy authors can distinguish those
+metadata to every event so readers can distinguish those
 guarantees.  The metadata is an adapter assertion, not authenticated
 provenance or cryptographic proof of the reported identity or execution.
 """
@@ -13,12 +13,6 @@ from dataclasses import dataclass
 from typing import Any, Tuple
 
 from .schema import ALLOWED_EVENT_TYPES
-
-# Policy-engine constants that lifecycle code needs without loading the engine
-# (and PyYAML). They live here; panoptes.policy imports them back.
-DEFAULT_POLICIES_DIR = "~/.panoptes/policies/"
-POLICY_FAILURE_MODES = frozenset({"fail_open", "fail_closed"})
-
 
 CAPTURE_PROVENANCE = "adapter_asserted"
 CAPTURE_PROVENANCE_AUTHENTICATED = False

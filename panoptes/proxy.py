@@ -16,12 +16,6 @@ Reverse-proxy mode (recommended — works with HTTPS):
         PANOPTES_UPSTREAM_OPENAI=https://api.openai.com
         PANOPTES_UPSTREAM_GEMINI=https://generativelanguage.googleapis.com
 
-Streaming policy behavior:
-    When an enabled blocking policy is loaded, streaming responses are buffered
-    until response-side policy checks complete. This protects the model-response
-    boundary but adds time-to-first-byte latency. Without a blocking policy,
-    streams are relayed immediately and are audit-only after the request check.
-
 Usage:
     panoptes proxy --port 8081 --db-path ./audit.db
 """
@@ -59,7 +53,6 @@ from panoptes._hooked import (
     HookedExchangeMixin,
     _answer_if_client_present,
     _ExchangeRun,
-    _mark_preflight_blocked,
     _may_have_reached_upstream,
     _report_of,
     _start_drain_timer,
@@ -73,7 +66,6 @@ from panoptes.hooks import (
     ProxyHooks,
     Upstream,
 )
-from panoptes.policy import PolicyEngine, PolicyResult, _policy_result_context
 from panoptes.schema import (
     KNOWN_AGENT_TYPES,
     ValidationError,
@@ -103,10 +95,9 @@ log = logging.getLogger("panoptes")
 
 _RAW_MAX = 64 * 1024  # 64 KB cap on stored raw payloads
 
-# Transport limits protect the proxy process itself. Enforcement-buffered
-# responses are never truncated and released: exceeding the limit is a hard
-# denial. Audit-only passthrough streams may continue to the client, but their
-# local capture is bounded and explicitly marked incomplete.
+# Transport limits protect the proxy process itself. A buffered response over
+# the limit is refused with a 502. Passthrough streams may continue to the
+# client, but their local capture is bounded and explicitly marked incomplete.
 DEFAULT_MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 32 * 1024 * 1024
 DEFAULT_MAX_AUDIT_STREAM_BYTES = 8 * 1024 * 1024
@@ -262,27 +253,6 @@ def _parse_provider_response(
     return parsed
 
 
-def _response_requires_inspection(
-    writer: "AuditEventWriter | None",
-    method: str,
-    resp_status: int,
-) -> bool:
-    """Whether a response must be understood before any bytes are released."""
-    if not writer:
-        return False
-    requires_buffering = getattr(
-        writer,
-        "requires_stream_buffering",
-        getattr(writer, "policy_failure_mode", "fail_open") == "fail_closed",
-    )
-    return bool(
-        requires_buffering
-        and method != "HEAD"
-        and 200 <= resp_status < 300
-        and resp_status not in (204, 205)
-    )
-
-
 def _mark_inspection_failure(
     events: list[dict],
     message: str,
@@ -308,87 +278,13 @@ def _mark_inspection_failure(
             capture["audit_body_truncated"] = True
 
 
-def _mark_postflight_blocked(events: list[dict]) -> None:
-    """Record that a buffered response and its tool proposals were withheld."""
-    for event in events:
-        event_type = event.get("event_type")
-        if event_type == "model_response":
-            event["outcome"] = {
-                "status": "blocked",
-                "summary": "Upstream response withheld by postflight policy",
-            }
-        elif event_type == "tool_call":
-            event["outcome"] = {
-                "status": "blocked",
-                "summary": (
-                    "Model proposed this tool call, but its containing response "
-                    "was withheld; local execution was not observed"
-                ),
-            }
-        else:
-            continue
-        capture = event.setdefault("context", {}).setdefault("capture", {})
-        capture["response_delivered"] = False
-        capture["delivery_status"] = "withheld"
-
-
-def _apply_unknown_tool_posture(
-    event: dict,
-    result: PolicyResult,
-    *,
-    failure_mode: str,
-) -> PolicyResult:
-    """Never silently allow an unrecognized provider execution surface."""
-    unknown_types = (event.get("action", {}) or {}).get(
-        "unknown_tool_types",
-        [],
-    )
-    if not unknown_types:
-        return result
-
-    synthetic_action = "block" if failure_mode == "fail_closed" else "warn"
-    message = (
-        "Unknown requested tool types were denied by fail-closed mode"
-        if synthetic_action == "block"
-        else "Unknown requested tool types were allowed with a fail-open warning"
-    )
-    synthetic = {
-        "policy_name": "unknown_requested_tool_type",
-        "message": message,
-        "reason": "action.unknown_tool_types is non-empty",
-        "action": synthetic_action,
-    }
-    if result.action == "block" or synthetic_action == "block":
-        final_action = "block"
-    else:
-        final_action = "warn"
-    return PolicyResult(
-        action=final_action,
-        violated_policies=[*result.violated_policies, synthetic],
-        warnings=[*result.warnings, message],
-        evaluation_errors=list(
-            getattr(result, "evaluation_errors", [])
-        ),
-        matched_policies=[
-            *getattr(result, "matched_policies", []),
-            synthetic,
-        ],
-        policy_snapshot_id=getattr(result, "policy_snapshot_id", None),
-        policy_engine_semantics_version=getattr(
-            result,
-            "policy_engine_semantics_version",
-            1,
-        ),
-    )
-
-
 # ---------------------------------------------------------------------------
 # AuditEventWriter
 # ---------------------------------------------------------------------------
 
 
 class AuditEventWriter:
-    """Build audit events and enforce policy at the model API boundary.
+    """Build audit events at the model API boundary.
 
     The proxy observes requests, responses, and model-issued tool instructions.
     It does not observe arbitrary local tool execution after an agent receives a
@@ -398,8 +294,6 @@ class AuditEventWriter:
     def __init__(
         self,
         db: Any,
-        policies_dir: str | None = None,
-        policy_failure_mode: str = "fail_open",
         max_tool_events_per_exchange: int = DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE,
         pricing: Any = None,
     ) -> None:
@@ -408,21 +302,7 @@ class AuditEventWriter:
         self.db = db
         self.pricing = pricing
         self._session_id: str | None = None
-        self.policy_engine: Any = None
-        self.policy_failure_mode = policy_failure_mode
         self.max_tool_events_per_exchange = max_tool_events_per_exchange
-        self.policy_initialization_error: str | None = None
-        if policies_dir:
-            try:
-                self.policy_engine = PolicyEngine(
-                    policies_dir=policies_dir,
-                    db=db,
-                    failure_mode=policy_failure_mode,
-                )
-                log.debug("Policy engine initialized with %d policies", len(self.policy_engine.policies))
-            except Exception as exc:
-                self.policy_initialization_error = str(exc)
-                log.exception("Failed to initialize policy engine — policies disabled")
 
     @property
     def session_id(self) -> str:
@@ -437,24 +317,8 @@ class AuditEventWriter:
     # Build helpers
     # ------------------------------------------------------------------
 
-    @property
-    def requires_stream_buffering(self) -> bool:
-        """True when a streamed model response must be checked before delivery."""
-        if not self.policy_engine:
-            return self.policy_failure_mode == "fail_closed"
-        return bool(
-            getattr(self.policy_engine, "has_blocking_policies", False)
-            or self.policy_failure_mode == "fail_closed"
-        )
-
     def _capture_metadata(self, streaming: bool) -> dict:
-        stream_delivery = None
-        if streaming:
-            stream_delivery = (
-                "buffered_for_enforcement"
-                if self.requires_stream_buffering
-                else "passthrough_audit_only"
-            )
+        stream_delivery = "passthrough_audit_only" if streaming else None
         return PROXY_CAPABILITIES.as_context(stream_delivery=stream_delivery)
 
     def _make_base_event(
@@ -977,151 +841,6 @@ class AuditEventWriter:
         self.write(all_events)
         return all_events
 
-    def check_policies(self, events: list[dict]) -> Any:
-        """Check events against loaded policies.
-
-        Returns a PolicyResult (action="allow" if no policy engine).
-        """
-        if not self.policy_engine:
-            if self.policy_failure_mode == "fail_closed":
-                message = "Policy engine unavailable; denied by fail-closed mode"
-                reason = (
-                    self.policy_initialization_error
-                    or "no policy engine was configured"
-                )
-                result = PolicyResult(
-                    action="block",
-                    violated_policies=[{
-                        "policy_name": "policy_engine_error",
-                        "message": message,
-                        "reason": reason,
-                    }],
-                    warnings=[message],
-                    evaluation_errors=[reason],
-                )
-            else:
-                result = PolicyResult(
-                    action="allow", violated_policies=[], warnings=[]
-                )
-            aggregate_result = result
-            for event in events:
-                event_result = _apply_unknown_tool_posture(
-                    event,
-                    result,
-                    failure_mode=self.policy_failure_mode,
-                )
-                self._attach_policy_result(event, event_result)
-                if event_result is not result:
-                    aggregate_result = event_result
-            return aggregate_result
-
-        all_violated: list[dict] = []
-        all_matched: list[dict] = []
-        all_warnings: list[str] = []
-        all_errors: list[str] = []
-        snapshot_ids: set[str] = set()
-        final_action = "allow"
-
-        source_events = list(events)
-        evaluate = getattr(self.policy_engine, "evaluate", None)
-        if evaluate is None:
-            evaluate = self.policy_engine.check_event
-        build_violation = getattr(
-            self.policy_engine,
-            "build_violation_event",
-            None,
-        )
-
-        for event in source_events:
-            # PolicyEngine.evaluate() is pure with respect to audit storage.
-            # Violation records are appended to this same batch so a database
-            # supporting insert_events() commits source and decision evidence
-            # atomically.
-            result = _apply_unknown_tool_posture(
-                event,
-                evaluate(event),
-                failure_mode=self.policy_failure_mode,
-            )
-            all_violated.extend(result.violated_policies)
-            all_matched.extend(getattr(result, "matched_policies", []))
-            all_warnings.extend(result.warnings)
-            all_errors.extend(getattr(result, "evaluation_errors", []))
-            snapshot_id = getattr(result, "policy_snapshot_id", None)
-            if snapshot_id:
-                snapshot_ids.add(snapshot_id)
-            self._attach_policy_result(event, result)
-            if build_violation is not None:
-                for violation in result.violated_policies:
-                    policy_action = violation.get("action")
-                    if policy_action not in ("warn", "block"):
-                        policy_action = (
-                            result.action
-                            if result.action in ("warn", "block")
-                            else "block"
-                        )
-                    violation_event = build_violation(
-                        event,
-                        violation["policy_name"],
-                        violation["message"],
-                        policy_action=policy_action,
-                        policy_snapshot_id=snapshot_id,
-                        policy_engine_semantics_version=getattr(
-                            result,
-                            "policy_engine_semantics_version",
-                            1,
-                        ),
-                    )
-                    if violation_event is not None:
-                        events.append(violation_event)
-            if result.action == "block":
-                final_action = "block"
-            elif result.action == "warn" and final_action != "block":
-                final_action = "warn"
-
-        if len(snapshot_ids) > 1:
-            snapshot_error = (
-                "Policy snapshot changed while one proxy event batch was evaluated"
-            )
-            all_errors.append(snapshot_error)
-            all_warnings.append(snapshot_error)
-            if self.policy_failure_mode == "fail_closed":
-                final_action = "block"
-                all_violated.append({
-                    "policy_name": "policy_snapshot_changed",
-                    "message": snapshot_error,
-                    "reason": snapshot_error,
-                    "action": "block",
-                })
-                if build_violation is not None and source_events:
-                    snapshot_violation = build_violation(
-                        source_events[0],
-                        "policy_snapshot_changed",
-                        snapshot_error,
-                        policy_action="block",
-                        policy_snapshot_id=None,
-                    )
-                    if snapshot_violation is not None:
-                        events.append(snapshot_violation)
-
-        return PolicyResult(
-            action=final_action,
-            violated_policies=all_violated,
-            warnings=all_warnings,
-            evaluation_errors=all_errors,
-            matched_policies=all_matched,
-            policy_snapshot_id=(
-                next(iter(snapshot_ids)) if len(snapshot_ids) == 1 else None
-            ),
-        )
-
-    @staticmethod
-    def _attach_policy_result(event: dict, result: PolicyResult) -> None:
-        """Persist the exact decision provenance alongside the checked event."""
-        event.setdefault("context", {})["policy"] = _policy_result_context(
-            result, semantics_key="engine_semantics_version"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Upstream routing (reverse-proxy mode)
 # ---------------------------------------------------------------------------
@@ -1363,82 +1082,6 @@ def _header_values(headers: Any, name: str) -> list[str]:
 def _safe_upstream_label(scheme: str, host: str, port: int, path: str) -> str:
     """Return a log label that cannot expose query-string credentials."""
     return _upstream_url(scheme, host, port, urlparse(path).path or "/")
-
-
-def _block_payload(policy_result: PolicyResult) -> tuple[str, dict]:
-    """Build the (message, extra-fields) pair for a policy-block response."""
-    messages = [
-        vp.get("message", "Blocked by policy")
-        for vp in policy_result.violated_policies
-    ]
-    block_msg = "; ".join(messages) or "Blocked by policy"
-    extra = {
-        "violated_policies": [
-            vp.get("policy_name", "") for vp in policy_result.violated_policies
-        ],
-        "matched_policies": [
-            match.get("policy_name", "")
-            for match in getattr(policy_result, "matched_policies", [])
-        ],
-        "policy_snapshot_id": getattr(
-            policy_result, "policy_snapshot_id", None
-        ),
-    }
-    return block_msg, extra
-
-
-def _log_policy_warnings(policy_result: PolicyResult) -> None:
-    if policy_result.action == "warn":
-        for w in policy_result.warnings:
-            log.warning("Policy warning: %s", w)
-
-
-def _policy_exception_payload(
-    writer: AuditEventWriter | None,
-    phase: str,
-    exc: Exception,
-) -> tuple[str, dict] | None:
-    """Return a denial payload when policy errors must fail closed.
-
-    Delegates to PolicyEngine.make_failure_result() so the fail-closed
-    semantics are defined in exactly one place.
-    """
-    failure_mode = writer.policy_failure_mode if writer else "fail_open"
-    result = PolicyEngine.make_failure_result(failure_mode, [str(exc)])
-    if result.action == "block":
-        log.exception("%s policy processing failed — denying traffic", phase)
-        return (
-            result.violated_policies[0]["message"] if result.violated_policies
-            else "Policy processing failed; denied by fail-closed mode",
-            {"policy_error": True, "phase": phase},
-        )
-    log.exception("%s policy processing failed — allowing traffic", phase)
-    return None
-
-
-def _mark_policy_processing_failure(
-    events: list[dict],
-    writer: AuditEventWriter,
-    phase: str,
-    exc: Exception,
-) -> None:
-    """Record fail-open/fail-closed policy errors on every affected event."""
-    action = (
-        "block"
-        if writer.policy_failure_mode == "fail_closed"
-        else "allow"
-    )
-    snapshot_id = getattr(
-        getattr(writer, "policy_engine", None), "policy_snapshot_id", None
-    )
-    for event in events:
-        event.setdefault("context", {})["policy"] = {
-            "action": action,
-            "matched_policies": [],
-            "violated_policies": [],
-            "evaluation_errors": [f"{phase}: {exc}"],
-            "snapshot_id": snapshot_id,
-        }
 
 
 def _unpersisted_exchange_events(
@@ -1899,7 +1542,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             self._finish_run()
 
     def _handle_request(self, method: str) -> None:
-        """Handle a proxied request: parse → pre-flight → forward → post-flight → respond."""
+        """Handle a proxied request: parse → record → forward → record → respond."""
         t0 = time.monotonic()
 
         hooks = getattr(self, "hooks", None)
@@ -1943,7 +1586,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-        # 3. Build request events and run pre-flight policy check
+        # 3. Build request events
         writer = self.writer
         req_events: list[dict] = []
         exchange_ctx: dict = {}
@@ -1962,14 +1605,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     400, "Request metadata cannot be represented safely"
                 )
                 return
-            except Exception as exc:
-                failure = _policy_exception_payload(
-                    writer, "preflight event construction", exc
-                )
-                if failure:
-                    message, extra = failure
-                    self._send_json_error(503, message, extra)
-                    return
+            except Exception:
+                log.exception("Request event construction failed — continuing")
             if hooks is not None:
                 run = self._enter_exchange(
                     method=method, path=path, raw_path=raw_path,
@@ -1983,57 +1620,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 req_events, exchange_ctx = run.events, run.ctx
                 self._exchange_ctx = exchange_ctx
             elif req_events:
-                try:
-                    policy_result = writer.check_policies(req_events)
-                except Exception as exc:
-                    _mark_policy_processing_failure(
-                        req_events, writer, "preflight", exc
-                    )
-                    failure = _policy_exception_payload(
-                        writer, "preflight", exc
-                    )
-                    if failure:
-                        _mark_preflight_blocked(req_events)
-                        try:
-                            writer.write(req_events)
-                        except AuditWriteError:
-                            log.exception(
-                                "Fail-closed preflight error audit was not durable"
-                            )
-                        message, extra = failure
-                        self._send_json_error(503, message, extra)
-                        return
-                else:
-                    if policy_result.action == "block":
-                        block_msg, extra = _block_payload(policy_result)
-                        _mark_preflight_blocked(req_events)
-                        try:
-                            writer.write(req_events)
-                            extra["audit_persisted"] = True
-                        except AuditWriteError:
-                            log.exception(
-                                "Policy block audit was not durable; request remains blocked"
-                            )
-                            extra["audit_persisted"] = False
-                        log.warning("Policy PRE-FLIGHT BLOCK: %s", block_msg)
-                        self._send_json_error(403, block_msg, extra)
-                        return
-                    _log_policy_warnings(policy_result)
-
                 # Make the request intent durable before it leaves the process.
-                # Fail-open may continue after a storage outage; fail-closed may not.
+                # A storage outage is logged; it does not stop the request.
                 try:
                     writer.write(req_events)
                     exchange_ctx["_request_events_persisted"] = True
                 except AuditWriteError:
                     log.exception("Request-intent audit could not be persisted")
-                    if writer.policy_failure_mode == "fail_closed":
-                        self._send_json_error(
-                            503,
-                            "Request denied because its audit record could not be persisted",
-                            {"audit_error": True},
-                        )
-                        return
 
         # 4. Forward to upstream (streaming decided by the provider — body
         #    flag for OpenAI/Anthropic, URL path for Gemini)
@@ -2063,25 +1656,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         exchange_ctx: dict,
         t0: float,
     ) -> None:
-        """Handle a streamed model response.
-
-        Enforcement-enabled streams are buffered so a policy can deny a
-        model-issued tool instruction before the agent receives it. Otherwise
-        this retains low-latency pass-through streaming and audits post-hoc.
-        """
+        """Relay a streamed model response and record it after delivery."""
         writer = self.writer
-        if writer and writer.requires_stream_buffering:
-            # _handle_buffered preserves the upstream SSE content type and
-            # payload but intentionally delays delivery until policy checking
-            # completes. It is the only safe proxy-level enforcement posture
-            # for streamed tool instructions.
-            self._handle_buffered(
-                method=method, scheme=scheme, host=host, port=port, path=path,
-                req_headers=req_headers, body=body, req_body=req_body,
-                req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
-            )
-            return
-
         resp_status, resp_headers_raw, accumulated, audit_truncated = (
             self._forward_streaming(
                 method, scheme, host, port, path, req_headers, body,
@@ -2113,7 +1689,6 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             except ResponseInspectionError as exc:
                 inspection_error = str(exc)
 
-        resp_events: list[dict] = []
         try:
             resp_events = writer.build_response_events(
                 path=path, req_body=req_body, resp_status=resp_status,
@@ -2133,22 +1708,11 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     read_in_full=not audit_truncated,
                     inspection_error=inspection_error,
                 )
-            # Post-flight policy is audit-only here because bytes already left
-            # the proxy. Blocking-policy configurations take the buffered path
-            # above instead.
-            policy_result = writer.check_policies(resp_events)
             writer.write(
                 _unpersisted_exchange_events(
                     req_events, resp_events, exchange_ctx
                 )
             )
-            if policy_result.action == "block":
-                log.warning(
-                    "Policy BLOCK after pass-through streaming response — bytes already sent; "
-                    "violation was recorded but cannot be retroactively enforced."
-                )
-            else:
-                _log_policy_warnings(policy_result)
         except ValidationError as exc:
             message = (
                 "Pass-through response produced invalid audit events after delivery"
@@ -2178,21 +1742,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             log.exception(
                 "Pass-through response audit was not durable after delivery"
             )
-        except Exception as exc:
-            if resp_events:
-                _mark_policy_processing_failure(
-                    resp_events, writer, "streaming postflight", exc
-                )
-                try:
-                    writer.write(
-                        _unpersisted_exchange_events(
-                            req_events, resp_events, exchange_ctx
-                        )
-                    )
-                except AuditWriteError:
-                    log.exception(
-                        "Streaming policy-failure audit was not durable"
-                    )
+        except Exception:
             log.exception("Failed to process streaming audit events — continuing")
 
     def _handle_buffered(
@@ -2210,7 +1760,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         exchange_ctx: dict,
         t0: float,
     ) -> None:
-        """Buffered path: forward, audit, optionally replace a blocked response."""
+        """Buffered path: forward the whole reply, record it, then deliver it."""
         writer = self.writer
 
         def build_inspection_failure(
@@ -2282,17 +1832,10 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 inspection_error = str(exc)
 
         parse_failed = inspection_error is not None
-        inspection_required = _response_requires_inspection(
-            writer, method, resp_status
-        )
-        if inspection_required and exchange_ctx.get("req_format") == "unknown":
-            inspection_error = (
-                "Response format is unsupported and cannot be checked for tool calls"
-            )
-        if inspection_required and not resp_body_bytes:
-            inspection_error = "Successful upstream response body was empty"
 
-        if inspection_error and (inspection_required or ambiguous_response):
+        if ambiguous_response:
+            # Two readings of one object: the client could act on a different
+            # one than the audit recorded, so the reply is withheld.
             message = (
                 "Upstream response denied because it could not be safely inspected"
             )
@@ -2320,7 +1863,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     "Uninspectable-response denial audit was not durable"
                 )
             inspection_error = None  # denial has already been persisted
-            writer = None  # do not run response policies on an opaque body
+            writer = None  # nothing further to record for an opaque body
 
         if writer:
             resp_events: list[dict] = []
@@ -2341,52 +1884,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                         read_in_full=True,
                         inspection_error="unparsed" if parse_failed else None,
                     )
-                # Post-flight policy check — response events only; request
-                # events were already checked (and violations recorded)
-                # pre-flight, so re-checking them would double-count.
-                policy_result = writer.check_policies(resp_events)
-                if policy_result.action == "block":
-                    block_msg, extra = _block_payload(policy_result)
-                    _mark_postflight_blocked(resp_events)
-                    log.warning("Policy POST-FLIGHT BLOCK: %s", block_msg)
-                    resp_status = 403
-                    resp_headers_raw = {
-                        "content-type": "application/json",
-                        "x-policy-blocked": "true",
-                    }
-                else:
-                    _log_policy_warnings(policy_result)
-                try:
-                    writer.write(
-                        _unpersisted_exchange_events(
-                            req_events, resp_events, exchange_ctx
-                        )
+                writer.write(
+                    _unpersisted_exchange_events(
+                        req_events, resp_events, exchange_ctx
                     )
-                    if policy_result.action == "block":
-                        extra["audit_persisted"] = True
-                except AuditWriteError:
-                    log.exception("Response audit could not be persisted")
-                    if policy_result.action == "block":
-                        # A storage outage must never turn a block into an allow.
-                        extra["audit_persisted"] = False
-                    elif writer.policy_failure_mode == "fail_closed":
-                        resp_status = 503
-                        resp_headers_raw = {
-                            "content-type": "application/json",
-                            "x-audit-error": "true",
-                        }
-                        resp_body_bytes = json.dumps({
-                            "error": (
-                                "Response denied because its audit record "
-                                "could not be persisted"
-                            ),
-                            "audit_error": True,
-                        }).encode()
-                if policy_result.action == "block":
-                    resp_body_bytes = json.dumps({
-                        "error": block_msg,
-                        **extra,
-                    }).encode()
+                )
+            except AuditWriteError:
+                log.exception("Response audit could not be persisted")
             except ValidationError as exc:
                 message = (
                     "Upstream response denied because its audit events were invalid"
@@ -2416,63 +1920,25 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     "x-panoptes-inspection-blocked": "true",
                 }
             except Exception as exc:
-                event_construction_failed = not resp_events
-                if event_construction_failed:
+                log.exception(
+                    "Response event construction failed; recording an "
+                    "explicit incomplete fallback"
+                )
+                try:
+                    fallback_events = build_inspection_failure(
+                        f"Response event construction failed: {exc}",
+                        status=resp_status, headers=resp_headers_raw,
+                        blocked=False,
+                    )
+                    writer.write(
+                        _unpersisted_exchange_events(
+                            req_events, fallback_events, exchange_ctx
+                        )
+                    )
+                except Exception:
                     log.exception(
-                        "Response event construction failed; recording an "
-                        "explicit incomplete fallback"
+                        "Failed to build the incomplete response fallback"
                     )
-                    failure = (
-                        (
-                            "Response processing failed; denied by fail-closed mode",
-                            {
-                                "inspection_error": True,
-                                "policy_error": True,
-                                "phase": "response_event_construction",
-                            },
-                        )
-                        if writer.policy_failure_mode == "fail_closed"
-                        else None
-                    )
-                    try:
-                        resp_events = build_inspection_failure(
-                            f"Response event construction failed: {exc}",
-                            status=resp_status, headers=resp_headers_raw,
-                            blocked=failure is not None,
-                        )
-                    except Exception:
-                        resp_events = []
-                        log.exception(
-                            "Failed to build the incomplete response fallback"
-                        )
-                else:
-                    failure = _policy_exception_payload(
-                        writer, "postflight", exc
-                    )
-                if resp_events:
-                    _mark_policy_processing_failure(
-                        resp_events, writer, "postflight", exc
-                    )
-                    if failure and not event_construction_failed:
-                        _mark_postflight_blocked(resp_events)
-                    try:
-                        writer.write(
-                            _unpersisted_exchange_events(
-                                req_events, resp_events, exchange_ctx
-                            )
-                        )
-                    except AuditWriteError:
-                        log.exception(
-                            "Postflight policy-failure audit was not durable"
-                        )
-                if failure:
-                    message, extra = failure
-                    resp_status = 503
-                    resp_body_bytes = json.dumps({"error": message, **extra}).encode()
-                    resp_headers_raw = {
-                        "content-type": "application/json",
-                        "x-policy-error": "true",
-                    }
 
         # Send response to client
         run = getattr(self, "_run", None)
@@ -2527,8 +1993,6 @@ class ProxyServer:
         host: str = "127.0.0.1",
         port: int = 8081,
         db_path: str | None = None,
-        policies_dir: str | None = None,
-        policy_failure_mode: str = "fail_open",
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         max_buffered_response_bytes: int = DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,
         max_audit_stream_bytes: int = DEFAULT_MAX_AUDIT_STREAM_BYTES,
@@ -2550,14 +2014,8 @@ class ProxyServer:
             )
         if db is not None and db_path is not None:
             raise ValueError("db and db_path are mutually exclusive")
-        if hooks is not None:
-            if not isinstance(hooks, ProxyHooks):
-                raise TypeError("hooks must be a ProxyHooks instance")
-            if policies_dir or policy_failure_mode != "fail_open":
-                raise ValueError(
-                    "hooks cannot be combined with the policy engine or "
-                    "policy_failure_mode; a hook replaces them"
-                )
+        if hooks is not None and not isinstance(hooks, ProxyHooks):
+            raise TypeError("hooks must be a ProxyHooks instance")
         for value, name in (
             (disconnect_drain_seconds, "disconnect_drain_seconds"),
             (hook_slow_seconds, "hook_slow_seconds"),
@@ -2573,8 +2031,6 @@ class ProxyServer:
         self.port = port
         self._external_db = db
         self.db_path = db_path if db_path is not None else ":memory:"
-        self.policies_dir = policies_dir
-        self.policy_failure_mode = policy_failure_mode
         for value, name in (
             (max_request_body_bytes, "max_request_body_bytes"),
             (max_buffered_response_bytes, "max_buffered_response_bytes"),
@@ -2640,8 +2096,6 @@ class ProxyServer:
             self._http_client = _upstream_client(120.0)
             self.writer = AuditEventWriter(
                 self._db,
-                policies_dir=self.policies_dir,
-                policy_failure_mode=self.policy_failure_mode,
                 max_tool_events_per_exchange=self.max_tool_events_per_exchange,
                 pricing=self.pricing,
             )
@@ -2747,9 +2201,7 @@ def start_proxy(
     port: int = 8081,
     host: str = "127.0.0.1",
     db_path: str = "~/.panoptes/audit.db",
-    policies_dir: str | None = None,
     log_level: str = "INFO",
-    policy_failure_mode: str = "fail_open",
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     max_buffered_response_bytes: int = DEFAULT_MAX_BUFFERED_RESPONSE_BYTES,
     max_audit_stream_bytes: int = DEFAULT_MAX_AUDIT_STREAM_BYTES,
@@ -2771,8 +2223,6 @@ def start_proxy(
 
     server = ProxyServer(
         host=host, port=port, db_path=db_path_expanded,
-        policies_dir=policies_dir,
-        policy_failure_mode=policy_failure_mode,
         max_request_body_bytes=max_request_body_bytes,
         max_buffered_response_bytes=max_buffered_response_bytes,
         max_audit_stream_bytes=max_audit_stream_bytes,
@@ -2785,9 +2235,6 @@ def start_proxy(
 
     print(f"Panoptes proxy running on http://{host}:{actual_port}")
     print(f"Database: {db_path_expanded}")
-    if policies_dir:
-        print(f"Policies: {policies_dir}")
-        print(f"Policy failure mode: {policy_failure_mode}")
     print()
     print("Reverse-proxy mode (recommended — captures HTTPS traffic):")
     print(f"  export ANTHROPIC_BASE_URL=http://{host}:{actual_port}")

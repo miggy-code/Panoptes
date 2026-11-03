@@ -1,18 +1,15 @@
-"""Panoptes CLI for adapter observations, local audit trails, and policy gates."""
+"""Panoptes CLI for adapter observations and local audit trails."""
 
 import argparse
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import sys
-import tempfile
 
 from panoptes import __version__
 from panoptes.db import AuditDB
-from panoptes.policy import DEFAULT_POLICIES_DIR, PolicyEngine
 from panoptes.schema import redact_secrets
 
 
@@ -104,23 +101,6 @@ def cmd_doctor(args):
         if db is not None:
             db.close()
 
-    engine = PolicyEngine(args.policies_dir, failure_mode=args.policy_failure_mode)
-    if engine.policy_snapshot_id is None:
-        print("[ERROR] Policies: no valid policy snapshot")
-        for error in engine.load_errors:
-            print(f"        {_display_text(error, limit=1200)}")
-        failed = True
-        mode = f"policy configuration invalid; {args.policy_failure_mode} applies to policy failures"
-    else:
-        print(f"[OK] Policies: {len(engine.policies)} loaded; snapshot {engine.policy_snapshot_id}")
-        mode = (
-            "model-API policy gate; streaming responses buffered before delivery"
-            if engine.has_blocking_policies or args.policy_failure_mode == "fail_closed"
-            else "model-API observation; streaming responses are audit-only"
-        )
-    print(f"[INFO] Requested proxy mode: {mode} ({args.policy_failure_mode})")
-    print("[INFO] Local tool blocking requires a host pre-tool authorizer that honors denials")
-
     if failed:
         raise SystemExit(2)
 
@@ -202,7 +182,6 @@ def cmd_session(args):
         selection += f"; showing the newest {args.limit}; partial timeline"
     print(f"Session: {_display_text(args.session_id)} ({selection})")
     print("Chronological order; tool proposals and authorizations do not prove execution.")
-    print("Policy labels are per event; a blocked tool proposal can withhold its containing response.\n")
     for event in events:
         _print_timeline_event(event)
 
@@ -326,197 +305,6 @@ def cmd_checkpoint(args):
     print(json.dumps(db.get_chain_checkpoint(), indent=2, sort_keys=True))
 
 
-# ── Policy subcommands ────────────────────────────────────────────────────────
-
-
-def cmd_policy_check(args):
-    """Check configured policies against stored events."""
-    db = _open_existing_db(args.db_path)
-    engine = PolicyEngine(args.policies_dir, db)
-    if engine.policy_snapshot_id is None:
-        for error in engine.load_errors:
-            print(f"Policy load error: {error}", file=sys.stderr)
-        raise SystemExit(2)
-
-    results = db.query(
-        event_type=args.event_type,
-        since=args.since,
-        until=args.until,
-        limit=args.limit,
-    )
-    total_rows = db.aggregate(
-        group_by=[],
-        metrics=["count"],
-        event_type=args.event_type,
-        since=args.since,
-        until=args.until,
-    )
-    matching_total = int(total_rows[0]["count"]) if total_rows else 0
-
-    if not results:
-        print("No events to check.")
-        return
-
-    violations = []
-    evaluation_errors: list[tuple[dict, str]] = []
-    for event in results:
-        result = engine.evaluate(event)
-        for error in getattr(result, "evaluation_errors", []):
-            evaluation_errors.append((event, str(error)))
-        if result.action in ("warn", "block"):
-            violations.append((event, result))
-
-    if violations:
-        print(f"Policy violations found: {len(violations)}")
-        for event, result in violations:
-            action = event.get("action", {}) or {}
-            agent = event.get("agent", {}) or {}
-            policy_names = ", ".join(
-                vp["policy_name"] for vp in result.violated_policies
-            )
-            print(
-                f"  [{event['timestamp']}] {result.action.upper()}: "
-                f"agent={agent.get('type', '?')} "
-                f"tool={action.get('tool_name', '?')} "
-                f"policies=[{policy_names}]"
-            )
-    elif not evaluation_errors:
-        if len(results) < matching_total:
-            print(
-                "No policy violations detected in the selected events "
-                f"(newest {len(results)} of {matching_total} matching events; "
-                "partial scan)."
-            )
-        else:
-            print(
-                "No policy violations detected in the selected events "
-                f"({len(results)} matching events scanned)."
-            )
-    else:
-        print("Policy evaluation incomplete; no reliable clean result.")
-
-    if evaluation_errors:
-        for event, error in evaluation_errors:
-            print(
-                "Policy evaluation error "
-                f"for event {event.get('event_id', '?')}: {error}",
-                file=sys.stderr,
-            )
-    print(
-        f"\nChecked {len(results)} of {matching_total} matching events "
-        f"against {len(engine.policies)} policies."
-    )
-    if evaluation_errors:
-        raise SystemExit(2)
-
-
-def cmd_policy_list(args):
-    """List all loaded policies."""
-    engine = PolicyEngine(args.policies_dir)
-    if not engine.policies:
-        print("No valid policy snapshot loaded.")
-        print(f"Policies directory: {engine._policies_dir}")
-        for error in engine.load_errors:
-            print(f"Policy load error: {error}", file=sys.stderr)
-        raise SystemExit(2)
-
-    print(f"Loaded {len(engine.policies)} policies from {engine._policies_dir}:\n")
-    print(f"Snapshot: {engine.policy_snapshot_id}\n")
-    for p in engine.policies:
-        status = "✓" if p.enabled else "✗ (disabled)"
-        scope_str = _format_scope(p.scope)
-        print(f"  {status} {p.name}")
-        if p.description:
-            print(f"     {p.description}")
-        print(f"     action: {p.action}")
-        print(f"     scope:  {scope_str}")
-        print()
-
-
-def cmd_policy_add(args):
-    """Copy a policy YAML file into the policies directory.
-
-    The engine publishes a snapshot only when every file in the directory is
-    valid, so one bad file would leave fail-open deployments with no policy at
-    all. The new file is checked together with the existing ones first.
-    """
-    src = os.path.expanduser(args.source)
-    if not os.path.isfile(src):
-        print(f"Error: source file not found: {src}")
-        sys.exit(1)
-    name = os.path.basename(src)
-    if not name.endswith((".yaml", ".yml")):
-        print(f"Error: policy files must end in .yaml or .yml: {name}")
-        sys.exit(1)
-
-    dst_dir = os.path.expanduser(args.policies_dir)
-    dst = os.path.join(dst_dir, name)
-    if os.path.exists(dst) and not args.force:
-        print(f"Error: {dst} already exists; pass --force to replace it")
-        sys.exit(1)
-
-    with tempfile.TemporaryDirectory() as candidate_dir:
-        if os.path.isdir(dst_dir):
-            for existing in os.listdir(dst_dir):
-                if existing.endswith((".yaml", ".yml")) and existing != name:
-                    shutil.copy2(
-                        os.path.join(dst_dir, existing),
-                        os.path.join(candidate_dir, existing),
-                    )
-        shutil.copy2(src, os.path.join(candidate_dir, name))
-        candidate = PolicyEngine(candidate_dir)
-        if candidate.policy_snapshot_id is None or candidate.load_errors:
-            print(f"Error: {name} was not added; the policy set would not load:")
-            for error in candidate.load_errors:
-                print(f"  {error.replace(candidate_dir, dst_dir)}")
-            sys.exit(1)
-
-    os.makedirs(dst_dir, exist_ok=True)
-    shutil.copy2(src, dst)
-    print(f"Added policy: {os.path.basename(src)} -> {dst}")
-    print("Reload the policy engine to apply changes.")
-
-
-def cmd_policy_test(args):
-    """Test a policy file against a JSON event string."""
-    try:
-        result = PolicyEngine.test_policy(args.policy_file, args.event_json)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        sys.exit(1)
-
-    print(f"Policy file: {args.policy_file}")
-    print(f"Result:     {result.action.upper()}")
-    if result.violated_policies:
-        for vp in result.violated_policies:
-            print(f"  Policy:   {vp['policy_name']}")
-            print(f"  Message:  {vp['message']}")
-            print(f"  Reason:   {vp['reason']}")
-    else:
-        print("  No policy violation — conditions did not match.")
-    if result.warnings:
-        print("  Warnings:")
-        for w in result.warnings:
-            print(f"    - {w}")
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-
-def _format_scope(scope: dict) -> str:
-    """Format a policy scope dict for display."""
-    parts = []
-    agents = scope.get("agents", [])
-    if agents:
-        parts.append(f"agents={agents}")
-    sessions = scope.get("sessions", [])
-    if sessions:
-        parts.append(f"sessions={sessions}")
-    if not parts:
-        return "* (all)"
-    return ", ".join(parts)
-
-
 # ── Main CLI ──────────────────────────────────────────────────────────────────
 
 
@@ -527,31 +315,15 @@ def main(argv=None):
     db_opts.add_argument(
         "--db-path", default="~/.panoptes/audit.db", help="Path to audit database"
     )
-    policy_opts = argparse.ArgumentParser(add_help=False)
-    policy_opts.add_argument(
-        "--policies-dir",
-        default=None,
-        help="Path to policy definitions directory",
-    )
-
-    gate_opts = argparse.ArgumentParser(add_help=False)
-    gate_opts.add_argument(
-        "--policy-failure-mode",
-        choices=["fail_open", "fail_closed"],
-        default="fail_open",
-        help=(
-            "Allow or deny traffic when policy loading/evaluation fails "
-            "(default: fail_open)"
-        ),
-    )
-    gate_opts.add_argument(
+    proxy_opts = argparse.ArgumentParser(add_help=False)
+    proxy_opts.add_argument(
         "--pricing",
         help="Versioned JSON rate table; annotates responses with an estimated cost",
     )
 
     parser = argparse.ArgumentParser(
         prog="panoptes",
-        description="Panoptes — adapter-based agent observability, local audit trails, and policy gates.",
+        description="Panoptes — adapter-based agent observability and local audit trails.",
     )
     parser.add_argument(
         "--version",
@@ -562,7 +334,7 @@ def main(argv=None):
 
     # --- proxy ---
     proxy_parser = subparsers.add_parser(
-        "proxy", help="Start the model-API reverse proxy", parents=[db_opts, policy_opts, gate_opts]
+        "proxy", help="Start the model-API reverse proxy", parents=[db_opts, proxy_opts]
     )
     proxy_parser.add_argument("--port", default=8081, type=int, help="Proxy listen port")
     proxy_parser.add_argument(
@@ -590,7 +362,7 @@ def main(argv=None):
 
     subparsers.add_parser(
         "doctor", help="Check local setup and requested proxy configuration (read-only)",
-        parents=[db_opts, policy_opts, gate_opts],
+        parents=[db_opts, proxy_opts],
     )
 
     # --- query ---
@@ -640,52 +412,10 @@ def main(argv=None):
         parents=[db_opts],
     )
 
-    # --- policy ---
-    policy_parser = subparsers.add_parser("policy", help="Policy management commands")
-    policy_subs = policy_parser.add_subparsers(dest="policy_command")
-
-    # policy check
-    policy_check = policy_subs.add_parser(
-        "check", help="Check policies against events", parents=[db_opts, policy_opts]
-    )
-    policy_check.add_argument("--event-type", help="Filter by event type")
-    policy_check.add_argument("--since", help="ISO8601 start time")
-    policy_check.add_argument("--until", help="ISO8601 end time")
-    policy_check.add_argument(
-        "--limit", default=100, type=int, help="Max events to check"
-    )
-
-    # policy list
-    policy_subs.add_parser(
-        "list", help="List all loaded policies", parents=[policy_opts]
-    )
-
-    # policy add
-    policy_add = policy_subs.add_parser(
-        "add", help="Add a policy file to the policies directory",
-        parents=[policy_opts],
-    )
-    policy_add.add_argument("source", help="Path to the policy YAML file to add")
-    policy_add.add_argument(
-        "--force", action="store_true",
-        help="Replace a policy file of the same name",
-    )
-
-    # policy test
-    policy_test = policy_subs.add_parser(
-        "test", help="Test a policy file against a JSON event"
-    )
-    policy_test.add_argument("policy_file", help="Path to the policy YAML file")
-    policy_test.add_argument("event_json", help="JSON event string to test against")
-
     args = parser.parse_args(argv)
 
     if args.command == "session" and not 1 <= args.limit <= 10000:
         parser.error("--limit must be between 1 and 10000")
-
-    # Resolve policies_dir defaults where needed
-    if hasattr(args, "policies_dir") and not args.policies_dir:
-        args.policies_dir = DEFAULT_POLICIES_DIR
 
     if args.command == "proxy":
         try:
@@ -714,25 +444,11 @@ def main(argv=None):
             port=args.port,
             host=args.host,
             db_path=args.db_path,
-            policies_dir=args.policies_dir,
             log_level=args.log_level,
-            policy_failure_mode=args.policy_failure_mode,
             client_socket_timeout_seconds=args.client_timeout,
             max_concurrent_requests=args.max_concurrent_requests,
             pricing=pricing,
         )
-    elif args.command == "policy":
-        policy_commands = {
-            "check": cmd_policy_check,
-            "list": cmd_policy_list,
-            "add": cmd_policy_add,
-            "test": cmd_policy_test,
-        }
-        handler = policy_commands.get(args.policy_command)
-        if handler:
-            handler(args)
-        else:
-            policy_parser.print_help()
     else:
         commands = {
             "doctor": cmd_doctor,

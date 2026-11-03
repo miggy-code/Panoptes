@@ -1,10 +1,9 @@
-"""Adapter-based agent observations, local audit trails, and policy gates.
+"""Adapter-based agent observations and local audit trails.
 
 Panoptes normalizes events emitted by supported adapters into a canonical
 schema and stores them in SQLite. Capture metadata is an unauthenticated
-adapter assertion describing whether an event was observed, host-reported, or
-synchronously authorized; schema conformance does not prove identity or local
-execution.
+adapter assertion describing whether an event was observed or host-reported;
+schema conformance does not prove identity or local execution.
 """
 
 from importlib.metadata import PackageNotFoundError, version
@@ -32,30 +31,6 @@ from .schema import (
     validate_identifier,
 )
 
-# The policy engine pulls in PyYAML; load it only when it is asked for, so
-# ``from panoptes import AuditDB`` stays light.
-_LAZY_POLICY_EXPORTS = frozenset({
-    "POLICY_ENGINE_SEMANTICS_VERSION",
-    "Policy",
-    "PolicyEngine",
-    "PolicyResult",
-})
-
-
-def __getattr__(name: str):
-    if name in _LAZY_POLICY_EXPORTS:
-        from . import policy
-
-        value = getattr(policy, name)
-        globals()[name] = value
-        return value
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | _LAZY_POLICY_EXPORTS)
-
-
 try:
     __version__ = version("panoptes-observe")
 except PackageNotFoundError:
@@ -70,10 +45,6 @@ __all__ = [
     "IdentifierRewriteError",
     "KNOWN_AGENT_TYPES",
     "NotAnAuditDatabaseError",
-    "POLICY_ENGINE_SEMANTICS_VERSION",
-    "Policy",
-    "PolicyEngine",
-    "PolicyResult",
     "PROXY_CAPABILITIES",
     "SCHEMA_VERSION",
     "UnsupportedSchemaVersionError",

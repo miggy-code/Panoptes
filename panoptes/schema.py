@@ -940,7 +940,7 @@ def _format_utc(dt: datetime) -> str:
 def utcnow_iso() -> str:
     """Current UTC time in the canonical event timestamp format.
 
-    All event producers (proxy, policy engine, agent plugins) should use this
+    All event producers (proxy, agent plugins) should use this
     so stored timestamps sort consistently.
     """
     return _format_utc(datetime.now(timezone.utc))

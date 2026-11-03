@@ -747,14 +747,9 @@ def test_proxy_server_rejects_bad_configuration(tmp_path):
         ProxyServer(port=0, upstreams={"openai": "https://x.example"})
     with pytest.raises(TypeError):
         ProxyServer(port=0, hooks=object())
+    db = AuditDB(str(tmp_path / "x.db"))
     with pytest.raises(ValueError):
-        ProxyServer(port=0, hooks=ProxyHooks(), policies_dir="/nonexistent")
-    with pytest.raises(ValueError):
-        ProxyServer(port=0, hooks=ProxyHooks(), policies_dir=str(tmp_path))
-    if True:
-        db = AuditDB(str(tmp_path / "x.db"))
-        with pytest.raises(ValueError):
-            ProxyServer(port=0, db=db, db_path=str(tmp_path / "y.db"))
+        ProxyServer(port=0, db=db, db_path=str(tmp_path / "y.db"))
 
 
 def test_a_shared_db_is_used_and_not_closed_by_the_proxy(tmp_path, upstream):
@@ -903,9 +898,10 @@ def test_usage_is_empty_when_no_response_arrived(make_proxy, upstream, monkeypat
 @pytest.mark.parametrize("option", [
     {"policy_failure_mode": "fail_closed"},
     {"policies_dir": "/nonexistent"},
+    {"provider_keys": {"anthropic": "k"}},
 ])
-def test_hooks_refuse_every_legacy_gating_option(option):
-    with pytest.raises(ValueError, match="hooks cannot be combined"):
+def test_the_legacy_gating_options_no_longer_exist(option):
+    with pytest.raises(TypeError):
         ProxyServer(port=0, hooks=ProxyHooks(), **option)
 
 
@@ -923,6 +919,26 @@ def test_a_hooked_stream_is_relayed_not_buffered(make_proxy, upstream):
         upstream.gate.set()
         list(chunks)
     wait_after(hooks)
+
+
+def test_a_stream_is_relayed_not_buffered_and_recorded_as_passthrough(make_proxy, upstream):
+    """Nothing is held back for inspection: the stream is audit-only."""
+    upstream.mode = "gated"
+    _, client, db_path = make_proxy(None)
+    with client.stream("POST", "/v1/messages", json=dict(BODY, stream=True)) as response:
+        chunks = response.iter_bytes()
+        assert next(chunks).startswith(b"event: message_start")
+        upstream.gate.set()
+        list(chunks)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        events = stored(db_path)
+        if any(e["event_type"] == "model_response" for e in events):
+            break
+        time.sleep(0.05)
+    assert {e["context"]["capture"]["stream_delivery"] for e in events} == {
+        "passthrough_audit_only"
+    }
 
 
 def test_the_drain_bound_is_a_wall_clock_deadline(make_proxy, upstream):
