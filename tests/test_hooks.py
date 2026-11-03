@@ -926,3 +926,32 @@ def test_the_drain_bound_is_a_wall_clock_deadline(make_proxy, upstream):
     assert time.monotonic() - started < 4            # the upstream stays silent for 10 s
     assert ex.request_sent is True and ex.complete is False and ex.usage == {}
     assert ex.produced_output is True
+
+
+TOOLS_BODY = dict(BODY, system="the real system prompt",
+                  tools=[{"name": "read_file", "input_schema": {}}])
+
+
+@pytest.mark.parametrize("assign_identity", [True, False])
+def test_a_hook_cannot_change_what_is_recorded(make_proxy, upstream, assign_identity):
+    """The upstream gets the original body, so the record must describe it."""
+    def before(ex):
+        ex.request_json["tools"] = [{"name": "tampered_tool", "input_schema": {}}]
+        ex.request_json["system"] = "a tampered system prompt"
+        ex.request_json["messages"].append({"role": "user", "content": "injected"})
+        if assign_identity:
+            ex.identity = Identity(agent_type="custom_agent", session_id="s-1")
+
+    hooks = Recorder(before=before)
+    _, client, db_path = make_proxy(hooks)
+    client.post("/v1/messages", json=TOOLS_BODY)
+    wait_after(hooks)
+
+    sent = json.loads(upstream.requests[0]["body"])
+    assert sent["tools"][0]["name"] == "read_file"
+    request = next(e for e in stored(db_path) if e["event_type"] == "model_request")
+    assert request["action"]["declared_tools"] == ["read_file"]
+    assert request["action"]["messages_count"] == 2          # 1 message + system
+    assert "tampered" not in json.dumps(stored(db_path))
+    assert "injected" not in request["raw_request"]
+    assert json.loads(request["raw_request"])["system"] == "the real system prompt"

@@ -140,7 +140,7 @@ call `drop_query_credentials()`.
 | `request_headers` | read-only header list as received, credentials included. Keeps repeated lines: `get_all(name)` returns every value in order, `get(name)` the first, `items()` every `(name, value)` pair in received order and case. Lookup is case-insensitive |
 | `query_credentials` | tuple of the decoded values of every credential query parameter, in order of appearance. The parameters are `key`, `api_key`, `apikey` and `access_token`, matched case-insensitively after percent-decoding. Gemini sends its credential this way |
 | `request_body` | the raw body bytes, as received |
-| `request_json` | the body parsed as a strict JSON object, or `None` |
+| `request_json` | the body parsed as a strict JSON object, or `None`. A copy: editing it changes neither what is forwarded nor what is recorded (events are always built from the original body) |
 | `request_events` | the parsed request events (`model_request` and any `tool_result`) as deep copies; mutating them changes nothing |
 
 `request_headers` and `query_credentials` are how a hook sees **every**

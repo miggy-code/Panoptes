@@ -1661,6 +1661,7 @@ class _ExchangeRun:
     exchange: Exchange
     t0: float
     client_headers: dict
+    req_body: dict | None  # the original, never the copy a hook can edit
     seeded_events: list
     seeded_identity: Identity
     events: list
@@ -2372,6 +2373,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             exchange=exchange,
             t0=t0,
             client_headers=req_headers,
+            req_body=req_body,
             seeded_events=copy.deepcopy(req_events),
             seeded_identity=seeded,
             events=req_events,
@@ -2409,7 +2411,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         path=run.ctx["path"],
                         method=exchange.method,
                         req_headers=run.client_headers,
-                        req_body=exchange.request_json,
+                        req_body=run.req_body,
                         hook_mode=True,
                         hook_identity=exchange.identity,
                         exchange_id=exchange.exchange_id,
