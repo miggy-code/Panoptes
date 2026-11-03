@@ -1610,6 +1610,7 @@ class _ForwardReport:
 
     request_sent: bool = False
     answered: bool = False  # the upstream sent a response head
+    upstream_status: int | None = None  # the status the upstream itself sent
     upstream_error: bool = False  # no usable upstream response
     body_bytes: int = 0
     client_gone: bool = False
@@ -1826,6 +1827,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 method, upstream_url, headers=fwd_headers, content=body
             ) as resp:
                 report.request_sent = report.answered = True
+                report.upstream_status = resp.status_code
                 response_headers = dict(resp.headers)
                 _check_content_encoding(resp.headers)
                 content_lengths = _header_values(resp.headers, "Content-Length")
@@ -1948,6 +1950,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             with client.stream(method, upstream_url, headers=fwd_headers, content=body) as resp:
                 report.request_sent = report.answered = True
+                report.upstream_status = resp.status_code
                 _check_content_encoding(resp.headers)
                 # Send status and headers to client (strip Content-Length — unknown)
                 resp_headers = _decoded_body_headers(
@@ -2496,17 +2499,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "rejected", "hook_error", "not_forwarded"
         )
         status = run.status
-        provider_error = (
-            status is not None
-            and status >= 400
-            and report.answered
-            and not report.upstream_error
-        )
+        # What the provider did, not what the client was told: Panoptes may
+        # answer 502 to a 200 the provider billed.
+        upstream_status = report.upstream_status
+        provider_error = upstream_status is not None and upstream_status >= 400
         produced = (
-            report.answered
-            and not report.upstream_error
-            and status is not None
-            and status < 400
+            upstream_status is not None
+            and upstream_status < 400
             and report.body_bytes > 0
         ) or (isinstance(usage.get("tokens_out"), int) and usage["tokens_out"] > 0)
         exchange._settle(
@@ -2514,6 +2513,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             request_sent=sent,
             produced_output=bool(produced),
             status=status,
+            upstream_status=upstream_status,
             complete=bool(run.complete and outcome == "forwarded"),
             response_events=run.response_events,
             usage=usage,

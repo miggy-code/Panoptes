@@ -249,11 +249,12 @@ value either way.
 | `request_sent` | see below |
 | `produced_output` | see below |
 | `status` | the HTTP status Panoptes answered the client with (or would have, if the client had already gone), or `None` if none was produced |
+| `upstream_status` | the HTTP status **the provider itself** sent, or `None` if no response arrived (a rejection, a connect failure, a timeout before the response head). It differs from `status` whenever Panoptes replaced the reply: a `200` it could not safely read is answered `502`, but `upstream_status` is still `200` and the call was billed. `provider_error` and `produced_output` follow `upstream_status`, never `status` |
 | `complete` | a plain `bool`: `True` only if the whole upstream response was read and parsed, so `usage` is final. `False` whenever that is not known: a broken relay, a truncated audit capture, an upstream drop, no response. Never `None` |
 | `response_events` | the response events recorded (`model_response`, `tool_call`) as deep copies; empty if none |
 | `usage` | the token counts the provider reported in the `model_response` event's `cost` (`tokens_in`, `tokens_out`, and cache/reasoning counts), leaving out any it did not report; `{}` if none |
 | `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. `0` for a provider error (an error reply is not billed). Rounding is described in [api.md](api.md#pricing) |
-| `provider_error` | `True` if the upstream answered with a 4xx or 5xx |
+| `provider_error` | `True` if `upstream_status` is 4xx or 5xx. `False` when no response arrived; a Panoptes-made 502/504 is not a provider error |
 | `duration_ms` | proxy-measured wall time for the exchange |
 
 `repr(exchange)` omits headers, bodies and query credentials, so logging an

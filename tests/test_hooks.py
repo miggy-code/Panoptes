@@ -73,7 +73,25 @@ class FakeUpstream:
                     "headers": [(k, v) for k, v in self.headers.items()],
                     "body": self.rfile.read(length),
                 })
-                if outer.mode == "error500":
+                if outer.mode == "dupkey":
+                    payload = b'{"id": "a", "id": "b", "usage": {"input_tokens": 3}}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                elif outer.mode == "huge":
+                    payload = b'{"pad": "' + b"x" * 4096 + b'"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                elif outer.mode == "error500nobody":
+                    self.send_response(500)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                elif outer.mode == "error500":
                     payload = b'{"error":"boom"}'
                     self.send_response(500)
                     self.send_header("Content-Type", "application/json")
@@ -750,3 +768,38 @@ def test_without_hooks_nothing_changes_for_the_request(tmp_path, upstream):
 
 def test_exchange_type_is_exported():
     assert Exchange.__name__ == "Exchange"
+
+
+# ---------------------------------------------------------------------------
+# What the provider did versus what the client was told
+# ---------------------------------------------------------------------------
+
+
+def test_a_200_that_panoptes_refuses_is_still_a_provider_success(make_proxy, upstream):
+    """The provider answered 200 and billed it; the 502 is Panoptes' own."""
+    upstream.mode = "dupkey"
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+
+    assert client.post("/v1/messages", json=BODY).status_code == 502
+    ex = wait_after(hooks)
+    assert ex.status == 502 and ex.upstream_status == 200
+    assert (ex.provider_error, ex.produced_output) == (False, True)
+    assert (ex.request_sent, ex.complete) == (True, False)
+    assert ex.usage == {}
+
+
+def test_upstream_status_is_none_when_no_response_arrived(make_proxy, upstream):
+    hooks = Recorder(before=lambda ex: Reject(403, reason="no"))
+    _, client, _ = make_proxy(hooks)
+    client.post("/v1/messages", json=BODY)
+    assert wait_after(hooks).upstream_status is None
+
+
+def test_a_provider_error_reports_its_own_status(make_proxy, upstream):
+    upstream.mode = "error500"
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+    client.post("/v1/messages", json=BODY)
+    ex = wait_after(hooks)
+    assert (ex.upstream_status, ex.status, ex.provider_error) == (500, 500, True)

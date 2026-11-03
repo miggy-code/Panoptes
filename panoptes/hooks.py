@@ -314,6 +314,7 @@ class Exchange:
             "request_sent": False,
             "produced_output": False,
             "status": None,
+            "upstream_status": None,
             "complete": False,
             "response_events": [],
             "usage": {},
