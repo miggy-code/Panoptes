@@ -24,14 +24,17 @@ SCHEMA_VERSION = 5
 
 # ── Allowed values ────────────────────────────────────────────────────────────
 # Adapters Panoptes ships knowledge of. This is informational: any validated
-# identifier is a legal agent type, and nothing in the store enforces this set.
+# identifier is a legal agent type, and nothing in the store enforces this set
+# for v5 events. It is also the closed list that events declaring schema
+# version 1-4 are still checked against, so ``agentgate`` stays here: rows that
+# tool wrote under v4 must remain valid. Panoptes gives it no special handling.
 KNOWN_AGENT_TYPES = frozenset({
     "claude_code", "codex", "hermes", "antigravity", "cursor",
     "gemini_cli", "agentgate", "unknown",
 })
 
 # Built-in event types. A producer outside Panoptes names its own events with a
-# namespaced type, ``<namespace>.<name>`` (for example ``agentgate.allow``);
+# namespaced type, ``<namespace>.<name>`` (for example ``acme.allow``);
 # see ``is_valid_event_type``. The built-in set stays closed.
 ALLOWED_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
@@ -47,11 +50,6 @@ ALLOWED_OUTCOME_STATUSES = frozenset({
 LEGACY_AUTH_METHODS = frozenset({
     "api_key", "oauth", "cli",
 })
-# Deprecated aliases for the names v4 exported. Nothing enforces them any more
-# (v5 agent types and auth methods are open); they stay so code written against
-# v4 keeps importing, and go in 0.2.0 with the gateway modules that use them.
-ALLOWED_AGENT_TYPES = KNOWN_AGENT_TYPES
-ALLOWED_AUTH_METHODS = LEGACY_AUTH_METHODS
 _LEGACY_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
     "decision_point", "policy_violation",
@@ -937,7 +935,7 @@ def _format_utc(dt: datetime) -> str:
 def utcnow_iso() -> str:
     """Current UTC time in the canonical event timestamp format.
 
-    All event producers (proxy, policy engine, agent plugins) should use this
+    All event producers (proxy, agent plugins) should use this
     so stored timestamps sort consistently.
     """
     return _format_utc(datetime.now(timezone.utc))

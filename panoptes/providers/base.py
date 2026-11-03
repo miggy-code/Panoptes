@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
@@ -140,6 +141,20 @@ def _optional_usage_counts(usage: Any, fields: dict[str, str]) -> dict:
             and not isinstance(value, bool) and value >= 0}
 
 
+MAX_DECLARED_TOOLS = 256
+
+
+def _digest(value: Any) -> str | None:
+    """SHA-256 of a value's canonical JSON, or None for an empty value."""
+    if value in (None, "", [], {}):
+        return None
+    canonical = json.dumps(
+        value, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _empty_request_info() -> dict[str, Any]:
     """Request info returned when there is no parseable request body."""
     return {"model": "unknown", "messages_count": 0, "tools_count": 0, "stream": False}
@@ -207,6 +222,41 @@ class Provider(ABC):
     def model_from_path(self, path: str) -> str | None:
         """The model a route names, for providers that put it in the URL."""
         return None
+
+    def request_fingerprint(self, body: dict | None) -> dict[str, Any]:
+        """Hashes and names that identify a request without storing its text.
+
+        Keys, present only when there is something to report:
+        ``system_prompt_sha256`` (the system/developer/instructions content),
+        ``history_sha256`` (every conversation turn before the last one, so
+        requests that continue the same history share it) and
+        ``declared_tools`` (the names of the tools the request declares).
+        Never raises: a body of an unexpected shape yields what it can.
+        """
+        if not isinstance(body, dict):
+            return {}
+        try:
+            system, turns, tools = self._fingerprint_parts(body)
+        except Exception:
+            return {}
+        result: dict[str, Any] = {}
+        system_hash = _digest(system)
+        if system_hash:
+            result["system_prompt_sha256"] = system_hash
+        history_hash = _digest(turns[:-1]) if len(turns) > 1 else None
+        if history_hash:
+            result["history_sha256"] = history_hash
+        names = list(dict.fromkeys(
+            name[:256] for name in tools if isinstance(name, str) and name
+        ))[:MAX_DECLARED_TOOLS]
+        if names:
+            result["declared_tools"] = names
+        return result
+
+    def _fingerprint_parts(self, body: dict) -> tuple[Any, list, list]:
+        """Provider hook: ``(system content, conversation turns, tool names)``."""
+        messages = body.get("messages")
+        return None, messages if isinstance(messages, list) else [], []
 
     def _request_info(self, body: dict) -> dict[str, Any]:
         """Provider-specific request info extraction (body is a dict)."""

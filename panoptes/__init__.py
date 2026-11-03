@@ -1,18 +1,15 @@
-"""Adapter-based agent observations, local audit trails, and policy gates.
+"""Adapter-based agent observations and local audit trails.
 
 Panoptes normalizes events emitted by supported adapters into a canonical
 schema and stores them in SQLite. Capture metadata is an unauthenticated
-adapter assertion describing whether an event was observed, host-reported, or
-synchronously authorized; schema conformance does not prove identity or local
-execution.
+adapter assertion describing whether an event was observed or host-reported;
+schema conformance does not prove identity or local execution.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
 from .capture import (
-    AuthorizationDecision,
     CaptureCapabilities,
-    HERMES_AUTHORIZER_CAPABILITIES,
     HERMES_CAPABILITIES,
     PROXY_CAPABILITIES,
 )
@@ -22,12 +19,6 @@ from .db import (
     EventConflictError,
     NotAnAuditDatabaseError,
     UnsupportedSchemaVersionError,
-)
-from .policy import (
-    POLICY_ENGINE_SEMANTICS_VERSION,
-    Policy,
-    PolicyEngine,
-    PolicyResult,
 )
 from .schema import (
     KNOWN_AGENT_TYPES,
@@ -47,19 +38,13 @@ except PackageNotFoundError:
 
 __all__ = [
     "AuditDB",
-    "AuthorizationDecision",
     "CaptureCapabilities",
     "ChainIntegrityError",
     "EventConflictError",
-    "HERMES_AUTHORIZER_CAPABILITIES",
     "HERMES_CAPABILITIES",
     "IdentifierRewriteError",
     "KNOWN_AGENT_TYPES",
     "NotAnAuditDatabaseError",
-    "POLICY_ENGINE_SEMANTICS_VERSION",
-    "Policy",
-    "PolicyEngine",
-    "PolicyResult",
     "PROXY_CAPABILITIES",
     "SCHEMA_VERSION",
     "UnsupportedSchemaVersionError",

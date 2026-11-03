@@ -1,22 +1,14 @@
-"""Rate tables and per-token dollar caps."""
+"""Rate tables and the cost annotation on proxied responses."""
 
+import http.server
 import json
+import threading
 
 import httpx
 import pytest
 
-from panoptes import cli
-from panoptes.credentials import SessionTokenStore, TokenRejected
-from panoptes.db import AuditDB
 from panoptes.pricing import PricingError, PricingTable, usd_to_micros
 from panoptes.proxy import ProxyServer
-from panoptes.schema import ValidationError
-
-from tests.test_credentials import (  # noqa: F401  (fixture re-export)
-    FAKE_OPENAI_KEY,
-    OPENAI_BODY,
-    upstream,
-)
 
 # $1 per input token and $2 per output token makes the fake upstream's 3-in/1-out
 # response cost exactly $5.
@@ -32,34 +24,6 @@ RATES = {
         }
     },
 }
-
-
-def _post(client, token, model="gpt-test"):
-    return client.post(
-        "/v1/chat/completions",
-        json={**OPENAI_BODY, "model": model},
-        headers={"authorization": f"Bearer {token}"},
-    )
-
-
-@pytest.fixture
-def priced_proxy(tmp_path, upstream):
-    server = ProxyServer(
-        port=0,
-        db_path=str(tmp_path / "audit.db"),
-        provider_keys={"openai": FAKE_OPENAI_KEY},
-        pricing=PricingTable.from_dict(RATES),
-    )
-    port = server.start()
-    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False)
-    yield server, client
-    client.close()
-    server.stop()
-
-
-def _row(server, record):
-    (row,) = [t for t in server.token_store.list_tokens() if t["token_id"] == record["token_id"]]
-    return row
 
 
 def test_cost_is_priced_from_reported_tokens_and_rounded_up():
@@ -110,83 +74,74 @@ def test_dollar_amounts_must_be_positive_numbers(value):
         usd_to_micros(value)
 
 
-def test_dollar_cap_is_enforced_from_priced_responses(priced_proxy, upstream):
-    server, client = priced_proxy
-    token, record = server.token_store.issue(
-        "antigravity", "trial-usd", max_usd="12", reserve_usd="5"
+OPENAI_BODY = {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}]}
+OPENAI_REPLY = {
+    "id": "chatcmpl-1",
+    "object": "chat.completion",
+    "choices": [{
+        "index": 0,
+        "message": {"role": "assistant", "content": "hi"},
+        "finish_reason": "stop",
+    }],
+    "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+}
+
+
+@pytest.fixture
+def priced_proxy(tmp_path, monkeypatch):
+    class _Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            payload = json.dumps(OPENAI_REPLY).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+    threading.Thread(
+        target=upstream.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    ).start()
+    monkeypatch.setenv(
+        "PANOPTES_UPSTREAM_OPENAI", f"http://127.0.0.1:{upstream.server_address[1]}"
     )
-    statuses = [_post(client, token).status_code for _ in range(3)]
-
-    assert statuses == [200, 200, 429]
-    assert len(upstream) == 2
-    denied = [e for e in server.events if e["outcome"]["status"] == "blocked"]
-    assert [e["context"]["capture"]["identity_check"] for e in denied] == ["usd_budget_exhausted"]
-    responses = [e for e in server.events if e["event_type"] == "model_response"]
-    assert [e["cost"]["estimated_usd"] for e in responses] == [5.0, 5.0]
-    assert {e["cost"]["pricing_version"] for e in responses} == {"test-rates-1"}
-    row = _row(server, record)
-    assert (row["usd_used_micros"], row["usd_reserved_micros"], row["max_usd_micros"]) == (10_000_000, 0, 12_000_000)
-
-
-def test_unpriced_responses_are_charged_the_full_reservation(priced_proxy, upstream):
-    server, client = priced_proxy
-    token, record = server.token_store.issue(
-        "antigravity", "trial-unpriced", max_usd="15", reserve_usd="7"
+    server = ProxyServer(
+        port=0,
+        db_path=str(tmp_path / "audit.db"),
+        pricing=PricingTable.from_dict(RATES),
     )
-    statuses = [_post(client, token, model="unlisted-model").status_code for _ in range(3)]
-
-    assert statuses == [200, 200, 429]
-    row = _row(server, record)
-    assert row["usd_used_micros"] == 14_000_000
-    responses = [e for e in server.events if e["event_type"] == "model_response"]
-    assert all(e["cost"].get("estimated_usd") is None for e in responses)
-
-
-def test_holds_count_against_the_cap_until_settled(tmp_path):
-    store = SessionTokenStore(AuditDB(str(tmp_path / "audit.db")))
-    token, record = store.issue("codex", "s", max_usd="12", reserve_usd="5")
-    first = store.resolve(token, consume=True)
-    second = store.resolve(token, consume=True)
-    with pytest.raises(TokenRejected) as rejected:
-        store.resolve(token, consume=True)
-    assert rejected.value.reason == "usd_budget_exhausted"
-    store.settle(first, 1_000_000)
-    store.settle(second, 1_000_000)
-    assert store.resolve(token, consume=True).reserved_usd_micros == 5_000_000
+    port = server.start()
+    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False)
+    yield server, client
+    client.close()
+    server.stop()
+    upstream.shutdown()
+    upstream.server_close()
 
 
-def test_request_and_dollar_budgets_report_their_own_reason(tmp_path):
-    store = SessionTokenStore(AuditDB(str(tmp_path / "audit.db")))
-    token, _ = store.issue("codex", "s", max_requests=1, max_usd="20", reserve_usd="5")
-    store.resolve(token, consume=True)
-    with pytest.raises(TokenRejected) as rejected:
-        store.resolve(token, consume=True)
-    assert rejected.value.reason == "budget_exhausted"
+def test_responses_carry_the_priced_cost(priced_proxy):
+    server, client = priced_proxy
+    response = client.post("/v1/chat/completions", json=OPENAI_BODY)
+
+    assert response.status_code == 200
+    (event,) = [e for e in server.events if e["event_type"] == "model_response"]
+    assert event["cost"]["estimated_usd"] == 5.0
+    assert event["cost"]["pricing_version"] == "test-rates-1"
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"max_usd": "5"},
-        {"reserve_usd": "5"},
-        {"max_usd": "5", "reserve_usd": "6"},
-        {"max_usd": "0", "reserve_usd": "1"},
-        {"max_usd": "x", "reserve_usd": "1"},
-    ],
-)
-def test_invalid_dollar_caps_are_rejected(tmp_path, kwargs):
-    store = SessionTokenStore(AuditDB(str(tmp_path / "audit.db")))
-    with pytest.raises(ValidationError):
-        store.issue("codex", "s", **kwargs)
+def test_an_unlisted_model_is_recorded_unpriced_and_still_forwarded(priced_proxy):
+    server, client = priced_proxy
+    response = client.post(
+        "/v1/chat/completions", json={**OPENAI_BODY, "model": "unlisted-model"}
+    )
 
-
-def test_token_cli_issues_and_lists_dollar_caps(tmp_path, capsys):
-    db = str(tmp_path / "audit.db")
-    cli.main(["token", "issue", "--db-path", db, "--agent", "codex", "--session", "s",
-              "--max-usd", "2.5", "--reserve-usd", "0.5"])
-    capsys.readouterr()
-    cli.main(["token", "list", "--db-path", db])
-    assert "usd 0.000000/2.500000" in capsys.readouterr().out
+    assert response.status_code == 200
+    (event,) = [e for e in server.events if e["event_type"] == "model_response"]
+    assert event["cost"].get("estimated_usd") is None
 
 
 def test_pricing_file_loads_from_disk(tmp_path):

@@ -1,16 +1,10 @@
 # Proxy hooks
 
-> **Not implemented yet.** `panoptes/hooks.py` does not exist and `ProxyServer`
-> takes no `hooks=` argument. This file is a **proposed contract**, written
-> before the code so it can be reviewed. It is not frozen and nothing may build
-> on it until the draft banner below is removed.
->
-> **Status: draft for approval.** Decided: `after_exchange` is owed for every
+> **Status: implemented**, in `panoptes/hooks.py` and `ProxyServer`. The
+> contract below was approved before the code was written; changing it is a
+> breaking change to every embedder. Decided: `after_exchange` is owed for every
 > entered exchange; every exchange has a `correlation_id`; one hooks object per
-> proxy. Proposed in this revision, for approval: the embeddable entry point,
-> the `after_exchange` guarantees, streaming and disconnect behaviour, atomic
-> identity with a recorded source, explicit query-credential dropping,
-> `exchange_id` as the join key, upstream precedence, and `produced_output`.
+> proxy.
 
 The Panoptes reverse proxy observes model-API traffic: it forwards each request,
 parses it and the response, prices the usage and records events. It never
@@ -53,7 +47,12 @@ pass-through: no hook code runs, nothing new is buffered, and behaviour is
 unchanged.
 
 `stop()` waits for in-flight exchanges, so every entered exchange still gets
-its `after_exchange` on an orderly shutdown (bounded by the socket timeout).
+its `after_exchange` on an orderly shutdown (bounded by the upstream timeout,
+120 seconds; it logs a warning if exchanges are still running after that).
+
+Panoptes has no credential injection, budgets or policy engine of its own: a hook
+is how a consumer adds them. The constructor arguments are `hooks`, `db`, `chain`,
+`upstreams`, `pricing`, `disconnect_drain_seconds` and `hook_slow_seconds`.
 
 ## What a hook may and may not do
 
@@ -139,7 +138,7 @@ call `drop_query_credentials()`.
 | `request_headers` | read-only header list as received, credentials included. Keeps repeated lines: `get_all(name)` returns every value in order, `get(name)` the first, `items()` every `(name, value)` pair in received order and case. Lookup is case-insensitive |
 | `query_credentials` | tuple of the decoded values of every credential query parameter, in order of appearance. The parameters are `key`, `api_key`, `apikey` and `access_token`, matched case-insensitively after percent-decoding. Gemini sends its credential this way |
 | `request_body` | the raw body bytes, as received |
-| `request_json` | the body parsed as a strict JSON object, or `None` |
+| `request_json` | the body parsed as a strict JSON object, or `None`. A copy: editing it changes neither what is forwarded nor what is recorded (events are always built from the original body) |
 | `request_events` | the parsed request events (`model_request` and any `tool_result`) as deep copies; mutating them changes nothing |
 
 `request_headers` and `query_credentials` are how a hook sees **every**
@@ -178,6 +177,9 @@ headers, the User-Agent, and a generated `run_id`. Those are **client
 assertions**, nothing more. A hook that authenticates the caller replaces it
 wholesale, and the exchange is joined to that run, not to whatever the client
 claimed. `session_id` stays required and its type is frozen as `str`.
+
+A hook-set identity whose `run_id` is `None` records no `run_id` on its events:
+Panoptes never invents one.
 
 Panoptes reads `exchange.identity` once, when `before_forward` returns, and
 records every event of the exchange, request and response alike, under it,
@@ -246,11 +248,12 @@ value either way.
 | `request_sent` | see below |
 | `produced_output` | see below |
 | `status` | the HTTP status Panoptes answered the client with (or would have, if the client had already gone), or `None` if none was produced |
+| `upstream_status` | the HTTP status **the provider itself** sent, or `None` if no response arrived (a rejection, a connect failure, a timeout before the response head). It differs from `status` whenever Panoptes replaced the reply: a `200` it could not safely read is answered `502`, but `upstream_status` is still `200` and the call was billed. `provider_error` and `produced_output` follow `upstream_status`, never `status` |
 | `complete` | a plain `bool`: `True` only if the whole upstream response was read and parsed, so `usage` is final. `False` whenever that is not known: a broken relay, a truncated audit capture, an upstream drop, no response. Never `None` |
 | `response_events` | the response events recorded (`model_response`, `tool_call`) as deep copies; empty if none |
-| `usage` | token counts from the `model_response` event's `cost` (`tokens_in`, `tokens_out`, and cache/reasoning counts where the provider reports them), or `{}` |
-| `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. Rounding is described in [api.md](api.md#pricing) |
-| `provider_error` | `True` if the upstream answered with a 4xx or 5xx |
+| `usage` | the token counts the provider reported in a successful reply (`tokens_in`, `tokens_out`, and cache/reasoning counts), leaving out any it did not report. `{}` whenever the provider reported none: an error reply, no response, a body without a usage object, or a response Panoptes could not read. Never zeros standing in for "unknown" |
+| `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. `0` for a provider error (an error reply is not billed). Rounding is described in [api.md](api.md#pricing) |
+| `provider_error` | `True` if `upstream_status` is 4xx or 5xx. `False` when no response arrived; a Panoptes-made 502/504 is not a provider error |
 | `duration_ms` | proxy-measured wall time for the exchange |
 
 `repr(exchange)` omits headers, bodies and query credentials, so logging an
@@ -273,11 +276,13 @@ Panoptes errs toward `True`, the safe direction for a caller that settles money.
 
 #### `produced_output`
 
-`True` if there is evidence the provider generated output for this request: the
-upstream answered with a non-error status and sent any body bytes (for a
-stream, any bytes after the headers), or reported `tokens_out > 0`. `False`
-otherwise, including for an error status with an error body, an empty reply, and
-every exchange that never reached the provider.
+`True` if there is evidence the provider generated output for this request:
+`upstream_status` is non-error and the provider sent any body bytes (for a
+stream, any bytes after the headers), or it reported `tokens_out > 0`. This holds
+whatever Panoptes did next: an oversized or unreadable `200` that Panoptes
+answered `502` is still `True`. `False` otherwise, including for an error status
+with an error body, an empty reply, and every exchange that never reached the
+provider.
 
 It exists because `complete` and `usage` can be unknown while output was
 produced (a stream that broke after the first token). A caller that settles
@@ -354,10 +359,17 @@ provider's final usage. If the stream ends inside the bound, the usage is parsed
 normally and `complete` is `True`: `complete` describes what Panoptes read, not
 what the client received. If the bound is hit first, Panoptes closes the upstream
 connection, `complete` is `False` and `usage` is `{}`. `request_sent` is `True`
-either way. Draining holds the request slot, so the bound is the cost cap.
+either way. Draining holds the request slot, so the bound is the cost cap. The time bound is
+a wall-clock deadline: when it passes Panoptes cuts the upstream read even if the
+provider has gone silent, and `complete` is `False`. (A disconnect is noticed
+when Panoptes next writes to the client; until then the relay behaves as it
+always has, bounded by the upstream read timeout.)
 
 A buffered (non-streamed) response is read in full before it is written, so a
 client that disconnects before the write has no effect on `complete`.
+
+Draining is part of hook support: a proxy with no hooks ends the relay when the
+client leaves, as it always has.
 
 ## Upstreams
 

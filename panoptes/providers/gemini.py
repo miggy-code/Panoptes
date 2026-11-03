@@ -155,6 +155,28 @@ class GeminiProvider(Provider):
             "stream": False,
         }
 
+    def _fingerprint_parts(self, body: dict) -> tuple[Any, list, list]:
+        contents = body.get("contents")
+        names: list = []
+        tools = body.get("tools")
+        for tool in tools if isinstance(tools, list) else []:
+            if not isinstance(tool, dict):
+                continue
+            declarations = tool.get("function_declarations") or tool.get(
+                "functionDeclarations"
+            )
+            if isinstance(declarations, list):
+                names.extend(
+                    d.get("name") for d in declarations if isinstance(d, dict)
+                )
+            else:
+                names.extend(tool.keys())  # e.g. google_search, code_execution
+        return (
+            body.get("system_instruction") or body.get("systemInstruction"),
+            contents if isinstance(contents, list) else [],
+            names,
+        )
+
     def is_streaming(self, path: str, body: dict | None) -> bool:
         # Gemini streams via the :streamGenerateContent endpoint (optionally
         # with ?alt=sse), not a request-body flag.

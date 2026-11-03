@@ -9,11 +9,11 @@ from ._json import _strict_json_loads
 from .hermes_hooks import HOOKS, LegacyHooks, normalize, record_detail
 from .hermes_plugin import AuditPlugin
 from .schema import redact_secrets
-from .proxy import _BoundedThreadingHTTPServer
+from ._server import BoundedThreadingHTTPServer
 
 
 def make_server(address, db_path, journal_path=None):
-    plugin = AuditPlugin(db_path=str(db_path), policies_dir=None)
+    plugin = AuditPlugin(db_path=str(db_path))
     hooks = LegacyHooks()
     plugin.register(hooks)
     journal = Path(journal_path) if journal_path else None
@@ -46,4 +46,4 @@ def make_server(address, db_path, journal_path=None):
         def log_message(self, *args):
             pass
 
-    return _BoundedThreadingHTTPServer(address, Handler, client_socket_timeout_seconds=5, max_concurrent_requests=32)
+    return BoundedThreadingHTTPServer(address, Handler, client_socket_timeout_seconds=5, max_concurrent_requests=32)

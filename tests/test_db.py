@@ -25,7 +25,7 @@ import uuid
 import pytest
 
 from panoptes import AuditDB, ValidationError, normalize_event
-from panoptes.capture import HERMES_AUTHORIZER_CAPABILITIES
+from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import (
     ChainIntegrityError,
     EventConflictError,
@@ -1266,7 +1266,7 @@ def test_query_round_trip_is_idempotent_with_safe_capture_metadata():
             },
             "outcome": {"status": "success"},
             "context": {
-                "capture": HERMES_AUTHORIZER_CAPABILITIES.as_context(
+                "capture": HERMES_CAPABILITIES.as_context(
                     authorization_check="pre_execution",
                 ),
             },

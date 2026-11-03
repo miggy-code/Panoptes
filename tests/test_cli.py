@@ -1,4 +1,4 @@
-"""CLI behavior for integrity and policy-readiness commands."""
+"""CLI behavior for the read, integrity and setup commands."""
 
 import json
 
@@ -8,7 +8,6 @@ from panoptes import __version__
 from panoptes.cli import main
 from panoptes.db import AuditDB
 from panoptes.schema import SCHEMA_VERSION
-from panoptes.policy import PolicyResult
 
 
 def _event(event_id: str) -> dict:
@@ -118,7 +117,7 @@ def test_verify_checkpoint_cli_accepts_prefix_and_rejects_forgery(
         ["evidence", "event-1"],
         ["verify"],
         ["checkpoint"],
-        ["policy", "check"],
+        ["doctor"],
     ],
 )
 def test_read_only_commands_refuse_missing_database(argv, tmp_path, capsys):
@@ -142,94 +141,6 @@ def test_read_only_command_does_not_initialize_empty_file(tmp_path, capsys):
     assert exc.value.code == 2
     assert empty.read_bytes() == b""
     assert "not found or not initialized" in capsys.readouterr().err
-
-
-def test_policy_check_surfaces_evaluation_errors(
-    tmp_path, monkeypatch, capsys
-):
-    db_path = tmp_path / "audit.db"
-    db = AuditDB(str(db_path))
-    db.insert_event(_event("event-with-policy-error"))
-    db.close()
-
-    class _ErrorEngine:
-        policy_snapshot_id = "snapshot-test"
-        load_errors = []
-        policies = [object()]
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def evaluate(self, event):
-            return PolicyResult(
-                action="allow",
-                evaluation_errors=["condition evaluation failed"],
-            )
-
-    monkeypatch.setattr("panoptes.cli.PolicyEngine", _ErrorEngine)
-
-    with pytest.raises(SystemExit) as exc:
-        main([
-            "policy",
-            "check",
-            "--db-path",
-            str(db_path),
-            "--policies-dir",
-            str(tmp_path),
-        ])
-
-    assert exc.value.code == 2
-    captured = capsys.readouterr()
-    assert "Policy evaluation incomplete" in captured.out
-    assert "No policy violations detected" not in captured.out
-    assert "condition evaluation failed" in captured.err
-
-
-def test_policy_check_labels_bounded_selection_as_partial(
-    tmp_path, monkeypatch, capsys
-):
-    db_path = tmp_path / "audit.db"
-    db = AuditDB(str(db_path))
-    for index in range(3):
-        db.insert_event(_event(f"event-{index}"))
-    db.close()
-
-    class _AllowEngine:
-        policy_snapshot_id = "snapshot-test"
-        load_errors = []
-        policies = [object()]
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def evaluate(self, event):
-            return PolicyResult(action="allow")
-
-    monkeypatch.setattr("panoptes.cli.PolicyEngine", _AllowEngine)
-    main([
-        "policy",
-        "check",
-        "--db-path",
-        str(db_path),
-        "--policies-dir",
-        str(tmp_path),
-        "--limit",
-        "1",
-    ])
-
-    output = capsys.readouterr().out
-    assert "newest 1 of 3 matching events; partial scan" in output
-    assert "Checked 1 of 3 matching events" in output
-
-
-def test_policy_list_exits_nonzero_without_valid_snapshot(tmp_path, capsys):
-    with pytest.raises(SystemExit) as exc:
-        main(["policy", "list", "--policies-dir", str(tmp_path)])
-
-    assert exc.value.code == 2
-    captured = capsys.readouterr()
-    assert "No valid policy snapshot" in captured.out
-    assert "Policy load error" in captured.err
 
 
 def _write_events(db_path, *event_ids):
@@ -282,127 +193,6 @@ def test_verify_never_re_anchors_a_stripped_chain(tmp_path, capsys):
 
     with pytest.raises(ChainIntegrityError):
         AuditDB(str(db_path))
-
-
-def test_policy_add_refuses_a_file_that_breaks_the_policy_set(tmp_path, capsys):
-    policies = tmp_path / "policies"
-    policies.mkdir()
-    (policies / "block.yaml").write_text(
-        "name: block-bash\naction: block\nrule:\n  conditions:\n"
-        "    - field: action.tool_name\n      operator: ==\n      value: bash\n",
-        encoding="utf-8",
-    )
-    typo = tmp_path / "typo.yaml"
-    typo.write_text("name: typo\naction: block\nrul:\n  conditions: []\n", encoding="utf-8")
-
-    with pytest.raises(SystemExit) as exc:
-        main(["policy", "add", str(typo), "--policies-dir", str(policies)])
-    assert exc.value.code == 1
-    assert "was not added" in capsys.readouterr().out
-    assert sorted(p.name for p in policies.iterdir()) == ["block.yaml"]
-
-    good = tmp_path / "block.yaml"
-    good.write_text((policies / "block.yaml").read_text(encoding="utf-8"), encoding="utf-8")
-    with pytest.raises(SystemExit) as exc:
-        main(["policy", "add", str(good), "--policies-dir", str(policies)])
-    assert exc.value.code == 1
-    assert "--force" in capsys.readouterr().out
-    main(["policy", "add", str(good), "--policies-dir", str(policies), "--force"])
-
-
-@pytest.fixture
-def doctor_policies(tmp_path):
-    policies = tmp_path / "policies"
-    policies.mkdir()
-    (policies / "block.yaml").write_text(
-        "name: block-bash\naction: block\nrule:\n  conditions:\n"
-        "    - field: action.tool_name\n      operator: ==\n      value: bash\n",
-        encoding="utf-8",
-    )
-    return policies
-
-
-def test_doctor_checks_setup_without_writes_or_exposing_keys(
-    tmp_path, doctor_policies, monkeypatch, capsys,
-):
-    from panoptes.credentials import PROVIDER_KEY_ENV
-
-    db_path = tmp_path / "audit.db"
-    _write_events(db_path, "recent-event")
-    before = db_path.read_bytes()
-    mode = db_path.stat().st_mode
-    for variable in PROVIDER_KEY_ENV.values():
-        monkeypatch.delenv(variable, raising=False)
-    key = "sk-proj-fake-doctor-provider-key-0123456789"
-    monkeypatch.setenv("PANOPTES_OPENAI_API_KEY", key)
-    monkeypatch.setattr(AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events"))
-
-    main([
-        "doctor", "--db-path", str(db_path), "--policies-dir", str(doctor_policies),
-        "--inject-credentials", "--policy-failure-mode", "fail_closed",
-    ])
-
-    captured = capsys.readouterr()
-    assert f"[OK] Database: schema {SCHEMA_VERSION}, 1 events" in captured.out
-    assert "Last audit event: 2026-07-17" in captured.out
-    assert "[OK] Policies: 1 loaded; snapshot" in captured.out
-    assert "model-API policy gate" in captured.out
-    assert "buffered before delivery" in captured.out
-    assert "[OK] Credentials: configured for openai" in captured.out
-    assert "client routing, and direct egress are not verified" in captured.out
-    assert key not in captured.out + captured.err
-    assert db_path.read_bytes() == before
-    assert db_path.stat().st_mode == mode
-
-
-def test_doctor_reports_all_setup_failures_without_creating_paths(tmp_path, monkeypatch, capsys):
-    from panoptes.credentials import PROVIDER_KEY_ENV
-
-    for variable in PROVIDER_KEY_ENV.values():
-        monkeypatch.delenv(variable, raising=False)
-    db_path = tmp_path / "missing.db"
-    policies = tmp_path / "missing-policies"
-    with pytest.raises(SystemExit) as exc:
-        main([
-            "doctor", "--db-path", str(db_path), "--policies-dir", str(policies),
-            "--inject-credentials",
-        ])
-    assert exc.value.code == 2
-    output = capsys.readouterr().out
-    assert "[ERROR] Database" in output
-    assert "[ERROR] Policies" in output
-    assert "[ERROR] Credentials" in output
-    assert "policy configuration invalid; fail_open" in output
-    assert not db_path.exists()
-    assert not policies.exists()
-
-
-def test_doctor_observation_mode_and_unsafe_credentials_file(tmp_path, capsys):
-    db_path = tmp_path / "audit.db"
-    AuditDB(str(db_path)).close()
-    policies = tmp_path / "policies"
-    policies.mkdir()
-    (policies / "allow.yaml").write_text("name: observe\naction: allow\nrule:\n  conditions: []\n")
-    argv = ["doctor", "--db-path", str(db_path), "--policies-dir", str(policies)]
-    main(argv)
-    output = capsys.readouterr().out
-    assert "model-API observation" in output
-    assert "[WARN] Capture: no recorded activity" in output
-    assert "Credential injection disabled" in output
-
-    credentials = tmp_path / "credentials.yaml"
-    credentials.write_text("openai: sk-proj-fake-doctor-provider-key-0123456789\n")
-    credentials.chmod(0o644)
-    before = credentials.read_bytes()
-    with pytest.raises(SystemExit) as exc:
-        main([*argv, "--inject-credentials", "--credentials-file", str(credentials)])
-    assert exc.value.code == 2
-    output = capsys.readouterr().out
-    assert "[ERROR] Credentials:" in output
-    assert "chmod 600" in output
-    assert "sk-proj-" not in output
-    assert credentials.read_bytes() == before
-    assert credentials.stat().st_mode & 0o777 == 0o644
 
 
 def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys):
@@ -479,3 +269,63 @@ def test_session_partial_selection_json_and_empty_session(tmp_path, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["events"] == [] and data["matching_count"] == 0
     assert data["partial"] is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["token", "list"],
+    ["policy", "check"],
+    ["policy", "list"],
+    ["proxy", "--inject-credentials"],
+    ["proxy", "--policies-dir", "p"],
+    ["proxy", "--policy-failure-mode", "fail_closed"],
+    ["doctor", "--credentials-file", "keys.yaml"],
+])
+def test_the_gateway_commands_and_options_are_gone(argv, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+def test_credential_injection_is_not_part_of_the_package():
+    import importlib.util
+
+    from panoptes.proxy import ProxyServer
+
+    assert importlib.util.find_spec("panoptes.credentials") is None
+    with pytest.raises(TypeError):
+        ProxyServer(port=0, provider_keys={"openai": "k"})
+
+
+def test_doctor_checks_storage_and_capture_without_writing(tmp_path, monkeypatch, capsys):
+    db_path = tmp_path / "audit.db"
+    _write_events(db_path, "recent-event")
+    before = db_path.read_bytes()
+    mode = db_path.stat().st_mode
+    monkeypatch.setattr(AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events"))
+
+    main(["doctor", "--db-path", str(db_path)])
+
+    captured = capsys.readouterr()
+    assert f"[OK] Database: schema {SCHEMA_VERSION}, 1 events" in captured.out
+    assert "Last audit event: 2026-07-17" in captured.out
+    assert "client routing, and direct egress are not verified" in captured.out
+    assert "olicies" not in captured.out and "redential" not in captured.out
+    assert db_path.read_bytes() == before
+    assert db_path.stat().st_mode == mode
+
+
+def test_doctor_reports_an_unavailable_database_without_creating_it(tmp_path, capsys):
+    db_path = tmp_path / "missing.db"
+    with pytest.raises(SystemExit) as exc:
+        main(["doctor", "--db-path", str(db_path)])
+    assert exc.value.code == 2
+    assert "[ERROR] Database" in capsys.readouterr().out
+    assert not db_path.exists()
+
+
+def test_doctor_flags_a_database_with_no_recorded_activity(tmp_path, capsys):
+    db_path = tmp_path / "audit.db"
+    AuditDB(str(db_path)).close()
+    main(["doctor", "--db-path", str(db_path)])
+    assert "[WARN] Capture: no recorded activity" in capsys.readouterr().out

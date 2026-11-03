@@ -49,7 +49,7 @@ jobs:
           cd /tmp
           /tmp/panoptes-release-wheel/bin/panoptes --version
           /tmp/panoptes-release-wheel/bin/python -c "from importlib.metadata import version; assert version('panoptes-observe')"
-          /tmp/panoptes-release-wheel/bin/python -c "from importlib.resources import files; assert files('panoptes').joinpath('default_policies/no-prod-access.yaml').is_file()"
+          /tmp/panoptes-release-wheel/bin/python -c "from importlib.resources import files; assert files('panoptes').joinpath('py.typed').is_file()"
 
       - name: Upload distributions
         uses: actions/upload-artifact@v5

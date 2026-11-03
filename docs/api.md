@@ -50,8 +50,15 @@ log = AuditDB.open_readonly("~/.panoptes/audit.db")   # reads, changes nothing
   `model_response`, `tool_call`, `tool_result`, `decision_point`,
   `policy_violation`, `agent_start`, `agent_step`, `agent_end`. Another producer
   names its own events `<namespace>.<name>` (lower-case, for example
-  `agentgate.allow`; at most 128 characters). Custom types get no derived
+  `acme.allow`; at most 128 characters). Custom types get no derived
   `data_accessed` tags.
+- **Request capture.** A proxied `model_request` event's `action` carries
+  `messages_count`, `declared_tools` (the names of the tools the request
+  declares), `system_prompt_sha256` and `history_sha256`. The hashes are SHA-256
+  of the canonical JSON of the system/developer/instructions content and of every
+  conversation turn before the newest, so two requests that continue one history
+  share `history_sha256`. No prompt text is stored in these fields. A field is
+  absent when there is nothing to hash. (`raw_request` is separate and unchanged.)
 - **`attributes`** is an open JSON object, at most 64 KiB serialized, redacted
   like `context` (secret-shaped keys and values). An empty object is stored as
   absent.
@@ -203,7 +210,8 @@ evidence.
 
 Panoptes prices a response as an annotation (`cost.estimated_usd`,
 `cost.pricing_version`); it enforces nothing with it. A consumer that reserves
-or settles money against the same rate table (agentgate does) relies on the
+or settles money against the same rate table (a consumer built on the hooks)
+relies on the
 format and the rounding below. They are **stable**: a change that alters a
 figure for an existing table is a breaking change, announced in the changelog
 and a version bump.
@@ -254,6 +262,16 @@ one micro-dollar. `cost.estimated_usd` is that integer divided by
 applies the same rule to a dollar amount (positive, finite), and
 `MICROS_PER_USD` is 1,000,000. Public names in `panoptes.pricing`:
 `PricingTable`, `PricingError`, `usd_to_micros`, `MICROS_PER_USD`.
+
+## Proxy hooks
+
+`panoptes.hooks` is the contract for code that decides at the model-API
+boundary: `ProxyHooks`, `Exchange`, `Identity`, `User`, `Reject` and `Upstream`.
+`ProxyServer(hooks=..., db=..., upstreams=..., pricing=...)` calls
+`before_forward` and `after_exchange`. The contract, including what
+`after_exchange` guarantees and what each `Exchange` field means, is in
+[hooks.md](hooks.md). The hook types import no HTTP client; the proxy itself
+needs the `proxy` extra.
 
 ## Errors
 

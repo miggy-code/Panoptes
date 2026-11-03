@@ -20,8 +20,7 @@ MANIFEST_JSON = json.dumps(
         "name": "panoptes",
         "version": __version__,
         "description": (
-            "Panoptes Hermes lifecycle observation and host-callable tool "
-            "authorization"
+            "Panoptes Hermes lifecycle observation"
         ),
         "hooks": ["agent:start", "agent:step", "agent:end"],
         "entrypoint": "plugin.py",
@@ -49,11 +48,6 @@ Hermes plugin entrypoint.
 from panoptes.hermes_plugin import AuditPlugin, get_plugin
 
 plugin = get_plugin()
-
-# Hosts with a synchronous pre-tool hook call this function and must decline
-# execution when the returned decision has allowed=False. The lifecycle hooks
-# below remain observation-only.
-authorize_tool_call = plugin.authorize_tool_call
 '''
 
 

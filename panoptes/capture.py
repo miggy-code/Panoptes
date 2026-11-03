@@ -2,18 +2,17 @@
 
 An event can be perfectly normalized yet still be only an observation of a
 model response rather than proof that a local tool ran.  Adapters attach this
-metadata to every event so users and policy authors can distinguish those
+metadata to every event so readers can distinguish those
 guarantees.  The metadata is an adapter assertion, not authenticated
 provenance or cryptographic proof of the reported identity or execution.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Tuple
 
 from .schema import ALLOWED_EVENT_TYPES
-
 
 CAPTURE_PROVENANCE = "adapter_asserted"
 CAPTURE_PROVENANCE_AUTHENTICATED = False
@@ -135,14 +134,6 @@ PROXY_CAPABILITIES = CaptureCapabilities(
 )
 
 
-# Credential-injection mode: agent type and session come from a Panoptes
-# session token the proxy issued and resolved, not from client headers.
-PROXY_TOKEN_CAPABILITIES = replace(
-    PROXY_CAPABILITIES,
-    identity_assurance="panoptes_session_token",
-)
-
-
 HERMES_CAPABILITIES = CaptureCapabilities(
     adapter="hermes_plugin",
     fidelity="agent_lifecycle",
@@ -151,34 +142,5 @@ HERMES_CAPABILITIES = CaptureCapabilities(
     execution_observed=False,
     enforcement_mandatory=False,
     observed_events=("agent_start", "agent_step", "agent_end"),
-    enforcement_points=("optional_pre_execution_authorizer",),
-    notes=(
-        "The installed lifecycle hooks are observational. A host integration must call "
-        "AuditPlugin.authorize_tool_call() before execution to enforce a policy."
-    ),
+    notes="The installed lifecycle hooks are observational and never block.",
 )
-
-HERMES_AUTHORIZER_CAPABILITIES = CaptureCapabilities(
-    adapter="hermes_authorizer",
-    fidelity="host_pre_execution_authorization",
-    observation_boundary="hermes_host_authorizer",
-    identity_assurance="host_asserted",
-    execution_observed=False,
-    enforcement_mandatory=False,
-    observed_events=("tool_call", "decision_point"),
-    enforcement_points=("synchronous_pre_execution_authorizer",),
-    notes=(
-        "Records a host-supplied tool request before execution. Enforcement is "
-        "effective only when the host calls the authorizer synchronously and honors "
-        "allowed=False for the exact requested action."
-    ),
-)
-
-
-@dataclass(frozen=True)
-class AuthorizationDecision:
-    """The result a host receives from a pre-execution authorization check."""
-
-    allowed: bool
-    action: str
-    message: str | None = None

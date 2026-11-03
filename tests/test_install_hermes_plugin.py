@@ -17,7 +17,7 @@ def test_installer_writes_private_files_atomically(tmp_path, monkeypatch):
     assert stat.S_IMODE(plugin_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE((plugin_dir / "manifest.json").stat().st_mode) == 0o600
     assert stat.S_IMODE((plugin_dir / "plugin.py").stat().st_mode) == 0o600
-    assert "authorize_tool_call" in (plugin_dir / "plugin.py").read_text(
+    assert "authorize_tool_call" not in (plugin_dir / "plugin.py").read_text(
         encoding="utf-8"
     )
 

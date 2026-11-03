@@ -5,8 +5,27 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
 ### Breaking
 
+- **The policy engine and the Hermes authorizer are removed.** Panoptes records
+  and never decides. Gone: `panoptes.policy` and the `Policy`, `PolicyEngine`,
+  `PolicyResult` and `POLICY_ENGINE_SEMANTICS_VERSION` names exported from
+  `panoptes`; the `panoptes policy list|add|check|test` commands; `--policies-dir`
+  and `--policy-failure-mode` (on `proxy` and `doctor`); the bundled
+  `default_policies/`; `ProxyServer(policies_dir=, policy_failure_mode=)`;
+  `AuditPlugin.authorize_tool_call`, `AuditPlugin(policies_dir=, policy_failure_mode=)`,
+  `PANOPTES_POLICY_FAILURE_MODE`, `AuthorizationDecision` and
+  `HERMES_AUTHORIZER_CAPABILITIES`; and the PyYAML dependency. The Hermes plugin
+  keeps its observation hooks. A consumer that decides does so in a proxy hook.
+- Streamed responses are always relayed as they arrive; nothing is buffered for
+  inspection. A response Panoptes cannot read is delivered and recorded as
+  incomplete (`inspection_status: "incomplete"`). A buffered reply whose JSON
+  repeats an object key is still withheld, and an oversized buffered reply is
+  still refused with 502.
+- `ALLOWED_AGENT_TYPES` and `ALLOWED_AUTH_METHODS` are removed; use
+  `KNOWN_AGENT_TYPES` and `LEGACY_AUTH_METHODS`.
 - **Event schema v5.** A database migrates in place on its first writable open
   (nullable columns only; every v1–v4 hash chain still verifies). Once
   migrated, an older Panoptes refuses it. An event that declares
@@ -17,11 +36,13 @@ All notable changes to Panoptes are recorded here. Releases follow
     assigns one per exchange). `session_id` stays required.
   - `agent.type` and `user.auth_method` are open validated identifiers. The
     closed lists are now `KNOWN_AGENT_TYPES` (informational, not enforced) and
-    `LEGACY_AUTH_METHODS` (the v1–v4 rule). `ALLOWED_AGENT_TYPES` and
-    `ALLOWED_AUTH_METHODS` remain as deprecated aliases until the gateway
-    modules are removed.
+    `LEGACY_AUTH_METHODS` (the v1–v4 rule).
   - Custom events use a namespaced type `<namespace>.<name>`; the built-in
     event types stay closed.
+- `httpx` is no longer a base dependency. The proxy needs the new `[proxy]`
+  extra (`pip install 'panoptes-observe[proxy]'`); `panoptes proxy` says so when
+  it is missing. The store, schema, hooks types and Hermes ingest need no HTTP
+  client.
 - `AuditDB.query()` and `aggregate()` raise `ValueError` on an unknown filter
   name. Before, a misspelled filter silently matched every event.
 - `verify_chain()` results carry `chain`: `intact`, `broken`, `partial` or
@@ -52,52 +73,40 @@ All notable changes to Panoptes are recorded here. Releases follow
 - The proxy gives every exchange a `correlation_id` (the client's
   `X-Panoptes-Correlation-Id`, else the exchange id) and records
   `attributes.correlation_source` and `attributes.exchange_id` on its events.
-- `docs/api.md`, the supported Python API, and `docs/hooks.md`, a design for
-  proxy hooks that is **not implemented yet**.
-- `panoptes token issue --max-requests N` caps how many proxied requests a token
-  may authorize. Each request presenting a live token spends one unit atomically,
-  including requests the provider later rejects. Once spent, the proxy answers
-  HTTP 429, never forwards upstream, and records a blocked event attributed to the
-  token's session (`identity_check: budget_exhausted`). `token list` shows
-  used/maximum. Older token tables gain the columns on first write access.
+- Proxy hooks (`panoptes.hooks`, `docs/hooks.md`): `ProxyServer(hooks=...)` calls
+  `before_forward` (reject, set the identity, set outbound headers, drop query
+  credentials) and `after_exchange` (settle: outcome, `request_sent`,
+  `produced_output`, `complete`, usage, `estimated_usd_micros`) for every
+  entered exchange. A hook never forces buffering; a client that leaves
+  mid-stream is drained for up to `disconnect_drain_seconds`. Credential
+  injection, budgets and any decision belong in a hook. `Exchange.upstream_status`
+  carries the provider's own status, and `provider_error` and `produced_output`
+  follow it rather than the status Panoptes returned.
+- `ProxyServer(db=..., chain=..., upstreams={"openai": Upstream(url, name=...)})`
+  and `ProxyServer.stop()` now waits for in-flight exchanges. `upstreams=`
+  overrides the `PANOPTES_UPSTREAM_*` variables. `db_path` now defaults to
+  `None` (an in-memory proxy database) and is mutually exclusive with `db`.
+- Model-request events carry `declared_tools`, `system_prompt_sha256` and
+  `history_sha256` (hashes and names only, no prompt text).
+- `import panoptes` loads only the schema and the store. The package ships
+  `py.typed`, and the threaded server shared by the proxy and Hermes ingest is
+  `panoptes._server`.
+- `docs/api.md`, the supported Python API.
 - `panoptes proxy --pricing FILE` loads a versioned JSON rate table (`version`,
   `source`, `currency: USD`, per-model `input_per_million`,
   `cached_input_per_million`, `output_per_million`). Priced responses record
   `cost.estimated_usd` and `cost.pricing_version`. A response is never priced from
   a guessed rate: unknown models or missing token counts stay unpriced.
-- `panoptes token issue --max-usd CAP --reserve-usd HOLD` gives a token a dollar cap.
-  Admission holds the reservation atomically, so concurrent requests cannot jointly
-  pass the cap; settlement replaces the hold with the priced cost, or charges the
-  whole reservation when the response cannot be priced (provider errors are not
-  billed). Once the cap cannot fit another reservation the proxy answers HTTP 429
-  and records `identity_check: usd_budget_exhausted`. The cap is hard while no single
-  response costs more than the reservation. `token list` shows spend.
 - `X-Panoptes-Correlation-Id` request header: a validated, client-asserted ID
   recorded as `context.capture.client_correlation_id` on every event of the
   exchange so an external journal can be joined to Panoptes events one-to-one.
   It is stripped before forwarding and never changes agent type, session, or
   identity assurance. Invalid values get HTTP 400.
-- `panoptes doctor` checks local database access, policy configuration, optional
-  credential injection setup, and recent audit activity without modifying audit
-  data or contacting providers. Reports requested settings separately from
-  unverified running-proxy and client-routing state.
-- `panoptes session` displays a chronological CLI timeline with policy decisions,
-  execution provenance, durations, and correlation IDs. `--limit` bounds the
+- `panoptes doctor` checks local database access and recent audit activity
+  without modifying audit data or contacting providers.
+- `panoptes session` displays a chronological CLI timeline with execution
+  provenance, durations, and correlation IDs. `--limit` bounds the
   newest selection; `--json` returns full events and selection counts.
-- Credential injection for the reverse proxy. With `--inject-credentials`,
-  provider API keys load from `PANOPTES_<PROVIDER>_API_KEY` or an owner-only
-  `--credentials-file` and never reach the agent. Agents present a Panoptes
-  session token, which the proxy swaps for the routed provider's key. Missing,
-  unknown, expired, revoked, or ambiguous tokens get HTTP 401 and a blocked
-  audit event, and are never forwarded.
-- `panoptes token issue`, `revoke`, and `list`. Only a SHA-256 hash of each
-  token is stored, in a `session_tokens` table in the audit database.
-- Token-authenticated identity: in credential mode the token's agent type and
-  session id replace the `X-Panoptes-*` headers, and events record
-  `identity_assurance: "panoptes_session_token"`.
-- `PANOPTES_POLICY_FAILURE_MODE` sets the installed Hermes plugin's failure
-  mode. An unrecognized value selects `fail_closed`.
-- `panoptes policy add --force` replaces a policy file of the same name.
 - `AuditDB(path, read_only=True)` opens an existing database without creating,
   migrating, re-anchoring, or changing file modes.
 
@@ -109,23 +118,17 @@ All notable changes to Panoptes are recorded here. Releases follow
   `/v1[beta|alpha]/models/<model>:(stream)generateContent`. Batches, files,
   fine-tuning, Gemini's OpenAI-compatible routes, and every other path are
   refused instead of forwarded with an injected key.
-- An event that fails normalization or validation is denied in both failure
-  modes while any enabled block policy is active, so a caller cannot shape its
-  input around a block. Without a block policy the failure mode still applies.
-- `verify`, `checkpoint`, `query`, `status`, `session`, `evidence`,
-  `policy check`, and `token list` open the database read-only.
+- `verify`, `checkpoint`, `query`, `status`, `session`, `evidence` and `doctor`
+  open the database read-only.
 - `verify` reports a database whose events have no hash-chain metadata as
   invalid, and opening a schema v4 database whose chain metadata is missing
   raises `ChainIntegrityError` instead of starting a new chain.
 - `verify` requires each stored JSON column to be byte-identical to what
   Panoptes wrote, so duplicate keys or re-encodings are detected.
-- `panoptes policy add` validates the new file together with the existing set
-  before copying it, and refuses to overwrite without `--force`.
 - Recorded `tokens_in` includes Anthropic cache read and write tokens, and
   Gemini `tokens_out` includes thinking tokens. Gemini events record the model
   named in the route.
 - `cost` integers above 2^53 are rejected so SQLite sums cannot overflow.
-- Unauthenticated credential denials ignore the request body and User-Agent.
 
 ### Fixed
 
@@ -136,10 +139,11 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Repeated request headers are combined instead of keeping only the last.
 - Lone UTF-16 surrogates and timestamps outside the UTC range are validation
   errors instead of failures at storage or normalization time.
-- A FIFO in place of the credentials file fails fast instead of hanging.
 - Bare `pnpt_` session tokens are redacted from stored text.
 - The Hermes manifest reports the installed version, and uninstall removes only
   the files the installer wrote.
+- A successful reply without a usage object is unpriced (`estimated_usd: null`,
+  `Exchange.estimated_usd_micros is None`) instead of priced at zero tokens.
 
 ## [0.1.1] - 2026-10-21
 
@@ -163,6 +167,7 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Hermes lifecycle hooks and an optional synchronous tool authorizer.
 - Python 3.10–3.13 CI, distribution validation, and installed-wheel smoke tests.
 
-[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/miggy-code/Panoptes/releases/tag/v0.1.0
