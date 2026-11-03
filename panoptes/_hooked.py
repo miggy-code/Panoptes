@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from panoptes._events import AuditWriteError
 from panoptes.hooks import (
     STATIC_HOP_BY_HOP,
     Exchange,
@@ -42,10 +43,6 @@ def _mark_preflight_blocked(events: list[dict]) -> None:
         capture = event.setdefault("context", {}).setdefault("capture", {})
         capture["upstream_forwarded"] = False
         capture["delivery_status"] = "blocked_before_upstream"
-
-
-class AuditWriteError(RuntimeError):
-    """Raised when one or more required audit events could not be persisted."""
 
 
 def _upstream_url(scheme: str, host: str, port: int, path: str) -> str:
