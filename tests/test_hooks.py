@@ -58,6 +58,7 @@ class FakeUpstream:
     def __init__(self):
         self.requests = []
         self.mode = "json"
+        self.stream_body = False
         self.piece_delay = 0.05            # between the pieces of a stream's tail
         self.gate = threading.Event()      # releases the tail of a gated stream
         self.head_sent = threading.Event()
@@ -89,6 +90,25 @@ class FakeUpstream:
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+                elif outer.mode == "truncated":
+                    # A stream that ends after its first events, without a stop.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    self.wfile.write(SSE_HEAD)
+                    self.close_connection = True
+                elif outer.mode == "hang":
+                    outer.gate.wait(10)          # never answers in time
+                elif outer.mode == "middrop":
+                    self.send_response(200)
+                    self.send_header(
+                        "Content-Type",
+                        "text/event-stream" if outer.stream_body else "application/json")
+                    self.send_header("Content-Length", "400")
+                    self.end_headers()
+                    self.wfile.write(b'{"id": "msg_1", "content": [{"ty')
+                    self.wfile.flush()
+                    self.close_connection = True   # 400 promised, 35 sent
                 elif outer.mode == "hugenolen":
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -1000,3 +1020,67 @@ def test_a_client_that_left_does_not_turn_an_upstream_error_into_aborted(
     ex = wait_after(hooks)
     assert ex.outcome == "upstream_error" and ex.status == 502
     assert ex.request_sent is False
+
+
+# ---------------------------------------------------------------------------
+# Ways an exchange can end badly, and what they report
+# ---------------------------------------------------------------------------
+
+
+def _slow_timeout(monkeypatch, seconds=0.5):
+    import panoptes.proxy as proxy_module
+
+    real = proxy_module._upstream_client
+    monkeypatch.setattr(proxy_module, "_upstream_client", lambda timeout: real(seconds))
+
+
+def test_a_truncated_stream_reports_what_was_read(make_proxy, upstream):
+    upstream.mode = "truncated"
+    hooks = Recorder()
+    _, client, db_path = make_proxy(hooks)
+
+    response = client.post("/v1/messages", json=dict(BODY, stream=True))
+    assert response.status_code == 200               # the client already had the head
+    ex = wait_after(hooks)
+    assert ex.outcome == "forwarded" and ex.upstream_status == 200
+    assert (ex.request_sent, ex.produced_output) == (True, True)
+    assert (ex.complete, ex.usage) == (False, {})
+    response_event = next(e for e in stored(db_path) if e["event_type"] == "model_response")
+    assert response_event["outcome"]["status"] == "error"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_upstream_timeout_reports_a_sent_request_with_no_output(
+    make_proxy, upstream, monkeypatch, stream
+):
+    _slow_timeout(monkeypatch)
+    upstream.mode = "hang"
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+
+    response = client.post("/v1/messages", json=dict(BODY, stream=stream))
+    assert response.status_code == 504
+    ex = wait_after(hooks)
+    assert (ex.outcome, ex.status, ex.upstream_status) == ("upstream_error", 504, None)
+    # The provider may have received it and may bill it.
+    assert (ex.request_sent, ex.produced_output, ex.complete) == (True, False, False)
+    assert ex.usage == {} and ex.provider_error is False
+
+
+@pytest.mark.parametrize("stream, outcome", [(False, "upstream_error"), (True, "forwarded")])
+def test_a_connection_dropped_in_the_middle_of_the_body(
+    make_proxy, upstream, stream, outcome
+):
+    upstream.mode = "middrop"
+    upstream.stream_body = stream
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+
+    try:
+        client.post("/v1/messages", json=dict(BODY, stream=stream))
+    except httpx.HTTPError:
+        pass                                         # the client's own view varies
+    ex = wait_after(hooks)
+    assert ex.outcome == outcome and ex.upstream_status == 200
+    assert (ex.request_sent, ex.produced_output, ex.complete) == (True, True, False)
+    assert ex.usage == {} and ex.provider_error is False
