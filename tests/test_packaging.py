@@ -72,3 +72,17 @@ def test_a_missing_httpx_gives_an_install_hint():
     result = run(code)
     assert result.returncode == 2
     assert "panoptes-observe[proxy]" in result.stderr
+
+
+def test_the_hermes_ingest_server_runs_without_the_policy_engine(tmp_path):
+    result = run(
+        "import sys\n"
+        "from panoptes.hermes_ingest import make_server\n"
+        f"server = make_server(('127.0.0.1', 0), {str(tmp_path / 'ingest.db')!r})\n"
+        "server.server_close()\n"
+        "bad = [m for m in ('yaml', 'httpx', 'panoptes.policy', 'panoptes.proxy', "
+        "'panoptes.credentials') if m in sys.modules]\n"
+        "print(bad)\n"
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"

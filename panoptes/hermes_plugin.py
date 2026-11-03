@@ -18,20 +18,16 @@ import logging
 import os
 import threading
 import uuid
+from typing import TYPE_CHECKING
 
 from panoptes.capture import (
+    DEFAULT_POLICIES_DIR,
+    POLICY_FAILURE_MODES,
     AuthorizationDecision,
     HERMES_AUTHORIZER_CAPABILITIES,
     HERMES_CAPABILITIES,
 )
 from panoptes.db import AuditDB
-from panoptes.policy import (
-    DEFAULT_POLICIES_DIR,
-    POLICY_FAILURE_MODES,
-    PolicyEngine,
-    PolicyResult,
-    _policy_result_context,
-)
 from panoptes.schema import (
     normalize_event,
     redact_secrets,
@@ -43,10 +39,24 @@ from panoptes.schema import (
 DB_PATH = os.path.expanduser("~/.panoptes/audit.db")
 DEFAULT_MAX_ACTIVE_SESSIONS = 1024
 POLICY_FAILURE_MODE_ENV = "PANOPTES_POLICY_FAILURE_MODE"
+if TYPE_CHECKING:
+    from panoptes.policy import PolicyResult
+
 log = logging.getLogger("panoptes.hermes")
 
 
-def _block_message(result: PolicyResult) -> str:
+def _policy():
+    """The policy engine module, loaded only when authorization needs it.
+
+    Lifecycle observation (and the ingest server) never touches it, so they run
+    without PyYAML.
+    """
+    from panoptes import policy
+
+    return policy
+
+
+def _block_message(result: "PolicyResult") -> str:
     blocking_items = [
         item
         for item in result.violated_policies
@@ -108,7 +118,7 @@ class AuditPlugin:
         self.max_active_sessions = max_active_sessions
         self.policy_failure_mode = policy_failure_mode
         self.policy_engine = (
-            PolicyEngine(
+            _policy().PolicyEngine(
                 policies_dir=policies_dir,
                 db=self.db,
                 failure_mode=policy_failure_mode,
@@ -213,7 +223,7 @@ class AuditPlugin:
             log.exception("Failed to persist Hermes lifecycle event")
             return False
 
-    def _persist_decision(self, event: dict, result: PolicyResult) -> bool:
+    def _persist_decision(self, event: dict, result: "PolicyResult") -> bool:
         """Persist an authorization decision and report whether evidence was durable."""
         decision = copy.deepcopy(event)
         decision["event_id"] = uuid.uuid4().hex
@@ -222,7 +232,7 @@ class AuditPlugin:
         decision["context"]["decision_kind"] = "tool_authorization"
         decision["context"]["source_event_id"] = event["event_id"]
         decision["context"]["source_event_type"] = event["event_type"]
-        decision["context"]["policy"] = _policy_result_context(
+        decision["context"]["policy"] = _policy()._policy_result_context(
             result, semantics_key="semantics_version"
         )
         if result.action == "block":
@@ -354,7 +364,7 @@ class AuditPlugin:
             result = (
                 self.policy_engine.input_failure_result(errors)
                 if self.policy_engine
-                else PolicyEngine.make_failure_result(
+                else _policy().PolicyEngine.make_failure_result(
                     self.policy_failure_mode, errors
                 )
             )
@@ -409,7 +419,7 @@ class AuditPlugin:
             )
 
         if not self.policy_engine:
-            result = PolicyEngine.make_failure_result(
+            result = _policy().PolicyEngine.make_failure_result(
                 self.policy_failure_mode,
                 ["No policy engine is configured for tool authorization"],
             )

@@ -24,6 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import yaml
 
 from panoptes._json import _strict_json_loads
+from panoptes.capture import DEFAULT_POLICIES_DIR, POLICY_FAILURE_MODES
 from panoptes.schema import (
     KNOWN_AGENT_TYPES,
     ALLOWED_EVENT_TYPES,
@@ -37,9 +38,7 @@ log = logging.getLogger("panoptes.policy")
 
 # ── Default policies directory ───────────────────────────────────────────────
 
-DEFAULT_POLICIES_DIR = "~/.panoptes/policies/"
 POLICY_ENGINE_SEMANTICS_VERSION = 1
-POLICY_FAILURE_MODES = frozenset({"fail_open", "fail_closed"})
 CONDITION_OPERATORS = frozenset({
     "==", "!=", "contains", "in", "matches", "gt", "lt", "gte", "lte",
 })

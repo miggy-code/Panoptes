@@ -14,6 +14,11 @@ from typing import Any, Tuple
 
 from .schema import ALLOWED_EVENT_TYPES
 
+# Policy-engine constants that lifecycle code needs without loading the engine
+# (and PyYAML). They live here; panoptes.policy imports them back.
+DEFAULT_POLICIES_DIR = "~/.panoptes/policies/"
+POLICY_FAILURE_MODES = frozenset({"fail_open", "fail_closed"})
+
 
 CAPTURE_PROVENANCE = "adapter_asserted"
 CAPTURE_PROVENANCE_AUTHENTICATED = False
