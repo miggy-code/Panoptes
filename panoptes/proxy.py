@@ -1395,6 +1395,10 @@ def _upstream_client(timeout: float) -> httpx.Client:
     One client serves every session and token, so a stored ``Set-Cookie``
     would be replayed on other agents' requests and link or leak sessions.
     """
+    # httpx logs every request URL at INFO, query string included, and a
+    # credentialed URL would land in the log.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     no_cookies = http.cookiejar.CookieJar(
         policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
     )

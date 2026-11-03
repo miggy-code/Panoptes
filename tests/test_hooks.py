@@ -2,6 +2,7 @@
 
 import http.server
 import json
+import logging
 import socket
 import struct
 import threading
@@ -955,3 +956,21 @@ def test_a_hook_cannot_change_what_is_recorded(make_proxy, upstream, assign_iden
     assert "tampered" not in json.dumps(stored(db_path))
     assert "injected" not in request["raw_request"]
     assert json.loads(request["raw_request"])["system"] == "the real system prompt"
+
+
+@pytest.mark.parametrize("hooked", [True, False])
+def test_credentialed_urls_never_reach_the_logs(tmp_path, upstream, caplog, hooked):
+    for name in ("httpx", "httpcore"):               # undo any earlier proxy's setting
+        logging.getLogger(name).setLevel(logging.NOTSET)
+    server = ProxyServer(
+        port=0, db_path=str(tmp_path / "log.db"), hooks=Recorder() if hooked else None)
+    port = server.start()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            r = httpx.post(
+                f"http://127.0.0.1:{port}/v1/messages?key=SEKRETLOG&x=1",
+                json=BODY, timeout=15)
+        assert r.status_code == 200
+    finally:
+        server.stop()
+    assert "SEKRETLOG" not in caplog.text
