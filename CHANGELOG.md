@@ -5,6 +5,8 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
 ### Breaking
 
 - **The policy engine and the Hermes authorizer are removed.** Panoptes records
@@ -165,6 +167,7 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Hermes lifecycle hooks and an optional synchronous tool authorizer.
 - Python 3.10–3.13 CI, distribution validation, and installed-wheel smoke tests.
 
-[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/miggy-code/Panoptes/releases/tag/v0.1.0
