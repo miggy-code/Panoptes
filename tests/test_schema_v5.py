@@ -301,3 +301,55 @@ def test_v5_event_round_trips_idempotently(db):
     db.insert_event(copy.deepcopy(event))
     assert db.get_stats()["total_events"] == 1
     assert db.verify_chain()["valid"]
+
+
+# ── review fixes: aliases and anchoring ──────────────────────────────────────
+
+def test_v4_names_stay_importable_until_the_gateway_modules_go():
+    from panoptes.schema import (
+        ALLOWED_AGENT_TYPES,
+        ALLOWED_AUTH_METHODS,
+        KNOWN_AGENT_TYPES,
+        LEGACY_AUTH_METHODS,
+    )
+
+    assert ALLOWED_AGENT_TYPES is KNOWN_AGENT_TYPES
+    assert ALLOWED_AUTH_METHODS is LEGACY_AUTH_METHODS
+    assert "hermes" in ALLOWED_AGENT_TYPES - {"unknown"}
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "agentgate.allow\n", "agentgate.allow\r\n", "agentgate.allow\n\n",
+        "\nagentgate.allow", "agentgate.allow ", "agentgate.allow\x00",
+        "agentgate.allow ", "agentgate\n.allow",
+    ],
+)
+def test_a_trailing_newline_does_not_pass_the_event_type_check(event_type):
+    assert not is_valid_event_type(event_type)
+    with pytest.raises(ValidationError, match="Invalid event_type"):
+        validate_event(make_event(event_type=event_type))
+    with pytest.raises(ValidationError):
+        AuditDB(":memory:").insert_event(make_event(event_type=event_type))
+
+
+def test_the_clean_event_type_is_the_only_one_stored(db):
+    db.insert_event(make_event(event_type="agentgate.allow", action={}))
+    assert [e["event_type"] for e in db.query(event_type="agentgate.allow")] == [
+        "agentgate.allow"
+    ]
+
+
+def test_no_schema_regex_accepts_a_value_with_a_trailing_newline():
+    """Every pattern that decides whether a name is legal must be fully anchored."""
+    import re
+
+    from panoptes import schema
+
+    patterns = [
+        value for value in vars(schema).values()
+        if isinstance(value, re.Pattern) and value.pattern.startswith(("^", "["))
+        and value.pattern.endswith("$")
+    ]
+    assert patterns == []
