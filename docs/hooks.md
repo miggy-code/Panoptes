@@ -252,7 +252,7 @@ value either way.
 | `upstream_status` | the HTTP status **the provider itself** sent, or `None` if no response arrived (a rejection, a connect failure, a timeout before the response head). It differs from `status` whenever Panoptes replaced the reply: a `200` it could not safely read is answered `502`, but `upstream_status` is still `200` and the call was billed. `provider_error` and `produced_output` follow `upstream_status`, never `status` |
 | `complete` | a plain `bool`: `True` only if the whole upstream response was read and parsed, so `usage` is final. `False` whenever that is not known: a broken relay, a truncated audit capture, an upstream drop, no response. Never `None` |
 | `response_events` | the response events recorded (`model_response`, `tool_call`) as deep copies; empty if none |
-| `usage` | the token counts the provider reported in the `model_response` event's `cost` (`tokens_in`, `tokens_out`, and cache/reasoning counts), leaving out any it did not report; `{}` if none |
+| `usage` | the token counts the provider reported in a successful reply (`tokens_in`, `tokens_out`, and cache/reasoning counts), leaving out any it did not report. `{}` whenever the provider reported none: an error reply, no response, a body without a usage object, or a response Panoptes could not read. Never zeros standing in for "unknown" |
 | `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. `0` for a provider error (an error reply is not billed). Rounding is described in [api.md](api.md#pricing) |
 | `provider_error` | `True` if `upstream_status` is 4xx or 5xx. `False` when no response arrived; a Panoptes-made 502/504 is not a provider error |
 | `duration_ms` | proxy-measured wall time for the exchange |
@@ -277,11 +277,13 @@ Panoptes errs toward `True`, the safe direction for a caller that settles money.
 
 #### `produced_output`
 
-`True` if there is evidence the provider generated output for this request: the
-upstream answered with a non-error status and sent any body bytes (for a
-stream, any bytes after the headers), or reported `tokens_out > 0`. `False`
-otherwise, including for an error status with an error body, an empty reply, and
-every exchange that never reached the provider.
+`True` if there is evidence the provider generated output for this request:
+`upstream_status` is non-error and the provider sent any body bytes (for a
+stream, any bytes after the headers), or it reported `tokens_out > 0`. This holds
+whatever Panoptes did next: an oversized or unreadable `200` that Panoptes
+answered `502` is still `True`. `False` otherwise, including for an error status
+with an error body, an empty reply, and every exchange that never reached the
+provider.
 
 It exists because `complete` and `usage` can be unknown while output was
 produced (a stream that broke after the first token). A caller that settles

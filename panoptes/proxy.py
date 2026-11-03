@@ -1604,6 +1604,17 @@ def _report_of(handler: Any) -> "_ForwardReport":
     return run.report if run is not None else _ForwardReport()
 
 
+_USAGE_KEYS = ("usage", "usageMetadata", "usage_metadata")
+
+
+def _provider_reported_usage(resp_body: Any) -> bool:
+    """Whether a parsed response carries a usage object of the provider's own."""
+    return isinstance(resp_body, dict) and any(
+        isinstance(resp_body.get(key), dict) and resp_body.get(key)
+        for key in _USAGE_KEYS
+    )
+
+
 @dataclasses.dataclass
 class _ForwardReport:
     """What the forwarding code observed, for ``Exchange`` to report."""
@@ -1637,6 +1648,8 @@ class _ExchangeRun:
     status: int | None = None
     complete: bool = False
     response_events: list = dataclasses.field(default_factory=list)
+    usage: dict = dataclasses.field(default_factory=dict)
+    cost_micros: int | None = None
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -1859,6 +1872,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             "Negative upstream Content-Length header"
                         )
                     if declared_length > limit:
+                        report.body_bytes = declared_length
                         raise UpstreamBodyTooLarge(
                             limit,
                             upstream_status=resp.status_code,
@@ -1869,6 +1883,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 for chunk in resp.iter_bytes():
                     if not chunk:
                         continue
+                    report.body_bytes += len(chunk)
                     if len(accumulated) + len(chunk) > limit:
                         raise UpstreamBodyTooLarge(
                             limit,
@@ -1876,7 +1891,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             upstream_headers=response_headers,
                         )
                     accumulated.extend(chunk)
-                report.body_bytes = len(accumulated)
                 return (
                     resp.status_code,
                     _decoded_body_headers(response_headers, streaming=False),
@@ -2464,17 +2478,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _note_response(
         self,
         resp_events: list[dict],
-        resp_status: int,
-        *,
-        complete: bool,
         exchange_ctx: dict,
+        resp_body: dict | None,
+        *,
+        read_in_full: bool,
+        inspection_error: str | None,
     ) -> None:
-        run = self._run
+        """Record what the response events say, for ``after_exchange``."""
+        run = getattr(self, "_run", None)
         if run is None:
             return
-        run.complete = complete
+        report = run.report
+        run.complete = bool(
+            report.answered
+            and not report.upstream_error
+            and read_in_full
+            and inspection_error is None
+        )
         run.response_events = copy.deepcopy(resp_events)
-        run.ctx["cost_micros"] = exchange_ctx.get("cost_micros")
+        # The provider's own word only: nothing for an error reply, a missing
+        # response, or a body that carried no usage object.
+        ok = (
+            report.upstream_status is not None
+            and report.upstream_status < 400
+            and not report.upstream_error
+        )
+        if ok and _provider_reported_usage(resp_body):
+            for event in resp_events:
+                if event.get("event_type") == "model_response":
+                    run.usage = {
+                        key: value
+                        for key, value in (event.get("cost") or {}).items()
+                        if key not in ("estimated_usd", "pricing_version")
+                        and value is not None
+                    }
+                    break
+        if report.upstream_status is not None:
+            run.cost_micros = exchange_ctx.get("cost_micros")
 
     def _finish_run(self) -> None:
         """Settle the exchange and call ``after_exchange`` exactly once."""
@@ -2485,16 +2525,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         exchange = run.exchange
         report = run.report
         outcome = run.outcome or "aborted"
-        usage: dict = {}
-        for event in run.response_events:
-            if event.get("event_type") == "model_response":
-                usage = {
-                    key: value
-                    for key, value in (event.get("cost") or {}).items()
-                    if key not in ("estimated_usd", "pricing_version")
-                    and value is not None
-                }
-                break
+        usage = run.usage
         sent = report.request_sent and outcome not in (
             "rejected", "hook_error", "not_forwarded"
         )
@@ -2517,7 +2548,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             complete=bool(run.complete and outcome == "forwarded"),
             response_events=run.response_events,
             usage=usage,
-            estimated_usd_micros=run.ctx.get("cost_micros"),
+            estimated_usd_micros=run.cost_micros,
             provider_error=bool(provider_error),
             duration_ms=int((time.monotonic() - run.t0) * 1000),
         )
@@ -2685,15 +2716,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 )
             if run is not None:
                 self._note_response(
-                    resp_events,
-                    resp_status,
-                    complete=(
-                        run.report.answered
-                        and not run.report.upstream_error
-                        and not audit_truncated
-                        and inspection_error is None
-                    ),
-                    exchange_ctx=exchange_ctx,
+                    resp_events, exchange_ctx, resp_body,
+                    read_in_full=not audit_truncated,
+                    inspection_error=inspection_error,
                 )
             # Post-flight policy is audit-only here because bytes already left
             # the proxy. Blocking-policy configurations take the buffered path
@@ -2901,14 +2926,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 run = getattr(self, "_run", None)
                 if run is not None:
                     self._note_response(
-                        resp_events,
-                        resp_status,
-                        complete=(
-                            run.report.answered
-                            and not run.report.upstream_error
-                            and not parse_failed
-                        ),
-                        exchange_ctx=exchange_ctx,
+                        resp_events, exchange_ctx, resp_body_parsed,
+                        read_in_full=True,
+                        inspection_error="unparsed" if parse_failed else None,
                     )
                 # Post-flight policy check — response events only; request
                 # events were already checked (and violations recorded)

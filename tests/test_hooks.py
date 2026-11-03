@@ -87,6 +87,19 @@ class FakeUpstream:
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+                elif outer.mode == "hugenolen":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"pad": "' + b"x" * 4096 + b'"}')
+                    self.close_connection = True
+                elif outer.mode == "nousage":
+                    payload = json.dumps({k: v for k, v in RESPONSE.items() if k != "usage"}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
                 elif outer.mode == "error500nobody":
                     self.send_response(500)
                     self.send_header("Content-Length", "0")
@@ -803,3 +816,46 @@ def test_a_provider_error_reports_its_own_status(make_proxy, upstream):
     client.post("/v1/messages", json=BODY)
     ex = wait_after(hooks)
     assert (ex.upstream_status, ex.status, ex.provider_error) == (500, 500, True)
+
+
+@pytest.mark.parametrize("mode", ["huge", "hugenolen"])
+def test_an_oversized_buffered_200_still_counts_as_output(make_proxy, upstream, mode):
+    upstream.mode = mode
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks, max_buffered_response_bytes=100)
+
+    assert client.post("/v1/messages", json=BODY).status_code == 502
+    ex = wait_after(hooks)
+    assert ex.outcome == "upstream_error" and ex.upstream_status == 200
+    assert (ex.request_sent, ex.produced_output, ex.complete) == (True, True, False)
+    assert ex.provider_error is False and ex.usage == {}
+
+
+def test_usage_is_empty_unless_the_provider_reported_some(make_proxy, upstream):
+    """Zeros would read as 'the provider charged nothing'."""
+    seen = {}
+    cases = [
+        ("error500", {}),                # a 5xx with a JSON body
+        ("nousage", {}),                 # a 200 without a usage object
+        ("json", {"tokens_in": 3, "tokens_out": 1}),
+    ]
+    for mode, expected in cases:
+        upstream.mode = mode
+        hooks = Recorder()
+        _, client, _ = make_proxy(hooks)
+        client.post("/v1/messages", json=BODY)
+        seen[mode] = (wait_after(hooks).usage, expected)
+    assert all(got == want for got, want in seen.values()), seen
+
+
+def test_usage_is_empty_when_no_response_arrived(make_proxy, upstream, monkeypatch):
+    dead = socket.socket()
+    dead.bind(("127.0.0.1", 0))
+    port = dead.getsockname()[1]
+    dead.close()
+    monkeypatch.setenv("PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{port}")
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+    client.post("/v1/messages", json=BODY)
+    ex = wait_after(hooks)
+    assert ex.usage == {} and ex.estimated_usd_micros is None
