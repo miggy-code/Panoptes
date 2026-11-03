@@ -859,3 +859,29 @@ def test_usage_is_empty_when_no_response_arrived(make_proxy, upstream, monkeypat
     client.post("/v1/messages", json=BODY)
     ex = wait_after(hooks)
     assert ex.usage == {} and ex.estimated_usd_micros is None
+
+
+@pytest.mark.parametrize("option", [
+    {"policy_failure_mode": "fail_closed"},
+    {"policies_dir": "/nonexistent"},
+    {"provider_keys": {"anthropic": "k"}},
+])
+def test_hooks_refuse_every_legacy_gating_option(option):
+    with pytest.raises(ValueError, match="hooks cannot be combined"):
+        ProxyServer(port=0, hooks=ProxyHooks(), **option)
+
+
+def test_a_hooked_stream_is_relayed_not_buffered(make_proxy, upstream):
+    """The first chunk reaches the client while the upstream is still held."""
+    upstream.mode = "gated"
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks)
+    started = time.monotonic()
+    with client.stream("POST", "/v1/messages", json=dict(BODY, stream=True)) as response:
+        chunks = response.iter_bytes()
+        first = next(chunks)
+        elapsed = time.monotonic() - started
+        assert first.startswith(b"event: message_start") and elapsed < 3
+        upstream.gate.set()
+        list(chunks)
+    wait_after(hooks)

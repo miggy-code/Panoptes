@@ -3143,10 +3143,14 @@ class ProxyServer:
         if hooks is not None:
             if not isinstance(hooks, ProxyHooks):
                 raise TypeError("hooks must be a ProxyHooks instance")
-            if provider_keys is not None or policies_dir:
+            if (
+                provider_keys is not None
+                or policies_dir
+                or policy_failure_mode != "fail_open"
+            ):
                 raise ValueError(
-                    "hooks cannot be combined with credential injection or "
-                    "the policy engine; a hook replaces both"
+                    "hooks cannot be combined with credential injection, the "
+                    "policy engine or policy_failure_mode; a hook replaces them"
                 )
         for value, name in (
             (disconnect_drain_seconds, "disconnect_drain_seconds"),
