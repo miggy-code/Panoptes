@@ -35,6 +35,17 @@ DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE = 256
 _RAW_MAX = 64 * 1024  # 64 KB cap on stored raw payloads
 
 
+_USAGE_KEYS = ("usage", "usageMetadata", "usage_metadata")
+
+
+def provider_reported_usage(resp_body: Any) -> bool:
+    """Whether a parsed response carries a usage object of the provider's own."""
+    return isinstance(resp_body, dict) and any(
+        isinstance(resp_body.get(key), dict) and resp_body.get(key)
+        for key in _USAGE_KEYS
+    )
+
+
 class AuditWriteError(RuntimeError):
     """Raised when one or more required audit events could not be persisted."""
 
@@ -588,7 +599,8 @@ class AuditEventWriter:
         if resp_status >= 400:
             # An error response from the provider is not billed.
             exchange_ctx["cost_micros"] = 0
-        elif self.pricing is not None:
+        elif self.pricing is not None and provider_reported_usage(resp_body):
+            # No usage object means no token counts to price: unpriced, not free.
             micros = self.pricing.cost_micros(req_info["model"], resp_event["cost"])
             if micros is not None:
                 resp_event["cost"]["estimated_usd"] = micros / 1_000_000

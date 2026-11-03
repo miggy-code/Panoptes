@@ -630,6 +630,27 @@ def test_pricing_is_reported_in_whole_micro_dollars(make_proxy, tmp_path):
     assert isinstance(ex.estimated_usd_micros, int) and ex.estimated_usd_micros > 0
 
 
+
+def test_a_reply_without_usage_is_unpriced_not_free(make_proxy, upstream, tmp_path):
+    """No token counts means nothing to price: None, never 0."""
+    from panoptes.pricing import PricingTable
+
+    table = PricingTable.from_dict({
+        "currency": "USD", "version": "t1", "source": "test",
+        "models": {"claude-test": {
+            "input_per_million": "1", "cached_input_per_million": "0.1",
+            "output_per_million": "2"}},
+    })
+    upstream.mode = "nousage"
+    hooks = Recorder()
+    _, client, _ = make_proxy(hooks, pricing=table)
+    client.post("/v1/messages", json=BODY)
+    ex = wait_after(hooks)
+    assert ex.upstream_status == 200 and ex.provider_error is False
+    assert ex.estimated_usd_micros is None
+    response = [e for e in ex.response_events if e.get("event_type") == "model_response"]
+    assert response and (response[0].get("cost") or {}).get("estimated_usd") is None
+
 # ---------------------------------------------------------------------------
 # Streaming
 # ---------------------------------------------------------------------------

@@ -273,6 +273,37 @@ class Exchange:
     fields are filled in by the proxy for ``after_exchange``.
     """
 
+    # Request fields, set before ``before_forward``.
+    exchange_id: str
+    correlation_id: str
+    correlation_source: str
+    provider: str
+    upstream_name: str
+    upstream_url: str
+    method: str
+    path: str
+    request_headers: RequestHeaders
+    query_credentials: tuple[str, ...]
+    request_body: bytes
+    request_json: dict | None
+    request_events: list[dict]
+    # Hook-settable.
+    identity: Identity
+    outbound_headers: OutboundHeaders
+    state: dict
+    # Filled in for ``after_exchange``.
+    outcome: str | None
+    request_sent: bool
+    produced_output: bool
+    status: int | None
+    upstream_status: int | None
+    complete: bool
+    response_events: list[dict]
+    usage: dict
+    estimated_usd_micros: int | None
+    provider_error: bool
+    duration_ms: int | None
+
     def __init__(
         self,
         *,

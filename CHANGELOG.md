@@ -140,6 +140,8 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Bare `pnpt_` session tokens are redacted from stored text.
 - The Hermes manifest reports the installed version, and uninstall removes only
   the files the installer wrote.
+- A successful reply without a usage object is unpriced (`estimated_usd: null`,
+  `Exchange.estimated_usd_micros is None`) instead of priced at zero tokens.
 
 ## [0.1.1] - 2026-10-21
 

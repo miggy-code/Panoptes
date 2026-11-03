@@ -18,7 +18,7 @@ from typing import Any
 
 import httpx
 
-from panoptes._events import AuditWriteError
+from panoptes._events import AuditWriteError, provider_reported_usage
 from panoptes.hooks import (
     STATIC_HOP_BY_HOP,
     Exchange,
@@ -104,17 +104,6 @@ def _answer_if_client_present(handler: Any, status: int, message: str) -> None:
 def _report_of(handler: Any) -> "_ForwardReport":
     run = getattr(handler, "_run", None)
     return run.report if run is not None else _ForwardReport()
-
-
-_USAGE_KEYS = ("usage", "usageMetadata", "usage_metadata")
-
-
-def _provider_reported_usage(resp_body: Any) -> bool:
-    """Whether a parsed response carries a usage object of the provider's own."""
-    return isinstance(resp_body, dict) and any(
-        isinstance(resp_body.get(key), dict) and resp_body.get(key)
-        for key in _USAGE_KEYS
-    )
 
 
 @dataclasses.dataclass
@@ -377,7 +366,7 @@ class HookedExchangeMixin:
             and report.upstream_status < 400
             and not report.upstream_error
         )
-        if ok and _provider_reported_usage(resp_body):
+        if ok and provider_reported_usage(resp_body):
             for event in resp_events:
                 if event.get("event_type") == "model_response":
                     run.usage = {
