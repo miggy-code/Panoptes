@@ -50,7 +50,7 @@ log = AuditDB.open_readonly("~/.panoptes/audit.db")   # reads, changes nothing
   `model_response`, `tool_call`, `tool_result`, `decision_point`,
   `policy_violation`, `agent_start`, `agent_step`, `agent_end`. Another producer
   names its own events `<namespace>.<name>` (lower-case, for example
-  `agentgate.allow`; at most 128 characters). Custom types get no derived
+  `acme.allow`; at most 128 characters). Custom types get no derived
   `data_accessed` tags.
 - **Request capture.** A proxied `model_request` event's `action` carries
   `messages_count`, `declared_tools` (the names of the tools the request
@@ -210,7 +210,8 @@ evidence.
 
 Panoptes prices a response as an annotation (`cost.estimated_usd`,
 `cost.pricing_version`); it enforces nothing with it. A consumer that reserves
-or settles money against the same rate table (agentgate does) relies on the
+or settles money against the same rate table (a gateway built on the hooks)
+relies on the
 format and the rounding below. They are **stable**: a change that alters a
 figure for an existing table is a breaking change, announced in the changelog
 and a version bump.
@@ -261,6 +262,16 @@ one micro-dollar. `cost.estimated_usd` is that integer divided by
 applies the same rule to a dollar amount (positive, finite), and
 `MICROS_PER_USD` is 1,000,000. Public names in `panoptes.pricing`:
 `PricingTable`, `PricingError`, `usd_to_micros`, `MICROS_PER_USD`.
+
+## Proxy hooks
+
+`panoptes.hooks` is the contract for code that decides at the model-API
+boundary: `ProxyHooks`, `Exchange`, `Identity`, `User`, `Reject` and `Upstream`.
+`ProxyServer(hooks=..., db=..., upstreams=..., pricing=...)` calls
+`before_forward` and `after_exchange`. The contract, including what
+`after_exchange` guarantees and what each `Exchange` field means, is in
+[hooks.md](hooks.md). The hook types import no HTTP client; the proxy itself
+needs the `proxy` extra.
 
 ## Errors
 

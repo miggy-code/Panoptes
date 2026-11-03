@@ -99,6 +99,29 @@ The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
 and the server accepts at most 64 concurrent requests by default; tune these
 with `--client-timeout` and `--max-concurrent-requests`.
 
+### Embed the proxy and decide with hooks
+
+The proxy can run inside another process, with a hook that is called before a
+request is forwarded and after the exchange ends. A hook can reject a request,
+set the identity it is recorded under, set the outbound headers (that is how a
+gateway injects a provider key) and settle the cost afterwards. The proxy itself
+never decides anything.
+
+```python
+from panoptes.hooks import ProxyHooks, Reject
+from panoptes.proxy import ProxyServer
+
+class Gate(ProxyHooks):
+    def before_forward(self, exchange):
+        if exchange.provider == "openai":
+            return Reject(403, reason="openai_not_allowed")
+
+server = ProxyServer(port=0, db_path="~/.panoptes/audit.db", hooks=Gate())
+port = server.start()        # non-blocking; server.stop() when done
+```
+
+The full contract is in [docs/hooks.md](docs/hooks.md).
+
 ### Keep provider keys out of the agent
 
 With `--inject-credentials`, the provider API keys live only in Panoptes. The
@@ -312,7 +335,7 @@ defaults:
 - `correlation_id` is a first-class, indexed field, and `attributes` is an open,
   size-bounded JSON object redacted like `context`.
 - Another producer names its events `<namespace>.<name>` (for example
-  `agentgate.allow`); the built-in event types stay a closed set.
+  `acme.allow`); the built-in event types stay a closed set.
 - An event that declares `context.schema_version` 1 to 4 keeps the rules of that
   version, and v1–v4 databases migrate in place with their hash chains still
   verifying.

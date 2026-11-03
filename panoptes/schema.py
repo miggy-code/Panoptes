@@ -24,14 +24,17 @@ SCHEMA_VERSION = 5
 
 # ── Allowed values ────────────────────────────────────────────────────────────
 # Adapters Panoptes ships knowledge of. This is informational: any validated
-# identifier is a legal agent type, and nothing in the store enforces this set.
+# identifier is a legal agent type, and nothing in the store enforces this set
+# for v5 events. It is also the closed list that events declaring schema
+# version 1-4 are still checked against, so ``agentgate`` stays here: rows that
+# tool wrote under v4 must remain valid. Panoptes gives it no special handling.
 KNOWN_AGENT_TYPES = frozenset({
     "claude_code", "codex", "hermes", "antigravity", "cursor",
     "gemini_cli", "agentgate", "unknown",
 })
 
 # Built-in event types. A producer outside Panoptes names its own events with a
-# namespaced type, ``<namespace>.<name>`` (for example ``agentgate.allow``);
+# namespaced type, ``<namespace>.<name>`` (for example ``acme.allow``);
 # see ``is_valid_event_type``. The built-in set stays closed.
 ALLOWED_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
