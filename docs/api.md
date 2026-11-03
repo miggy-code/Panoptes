@@ -156,6 +156,62 @@ never having one.
 chain is local tamper evidence: a checkpoint stored outside the database is
 needed to detect a rewrite of the whole history.
 
+## Pricing
+
+Panoptes prices a response as an annotation (`cost.estimated_usd`,
+`cost.pricing_version`); it enforces nothing with it. A consumer that reserves
+or settles money against the same rate table (agentgate does) relies on the
+format and the rounding below. They are **stable**: a change that alters a
+figure for an existing table is a breaking change, announced in the changelog
+and a version bump.
+
+**Rate table** (JSON, loaded with `PricingTable.load(path)` or
+`PricingTable.from_dict(obj)`):
+
+```json
+{
+  "version": "2026-11-01",
+  "source": "https://provider.example/pricing",
+  "currency": "USD",
+  "models": {
+    "gpt-example": {
+      "input_per_million": "0.15",
+      "cached_input_per_million": "0.075",
+      "output_per_million": "0.60"
+    }
+  }
+}
+```
+
+`currency` must be `"USD"`; `version` and `source` are required non-empty
+strings; every model names all three rates, finite and non-negative. Rates may
+be JSON numbers or strings and are read as exact decimals. A malformed table
+raises `PricingError`. Models are matched by exact name.
+
+**Formula** (`PricingTable.cost_micros(model, cost)`), with the response's
+`cost` counts:
+
+```
+billed_in = tokens_in - cached_input_tokens + tool_prompt_tokens
+usd = (billed_in * input + cached_input_tokens * cached_input
+       + tokens_out * output) / 1_000_000
+```
+
+`tokens_out` already includes reasoning tokens. Absent optional counts
+(`cached_input_tokens`, `tool_prompt_tokens`) are zero, which never
+under-counts. The result is `None` (unpriced) when the model is not in the
+table, `tokens_in` or `tokens_out` is missing or invalid, or
+`cached_input_tokens > tokens_in`. Panoptes never guesses a rate.
+
+**Rounding.** The whole response is priced exactly in decimal, then rounded
+**up** once to a whole micro-dollar (`ROUND_CEILING`): the figure never
+under-counts, and any response whose exact price is above zero costs at least
+one micro-dollar. `cost.estimated_usd` is that integer divided by
+1,000,000 as a float; use the integer for money. `usd_to_micros(amount)`
+applies the same rule to a dollar amount (positive, finite), and
+`MICROS_PER_USD` is 1,000,000. Public names in `panoptes.pricing`:
+`PricingTable`, `PricingError`, `usd_to_micros`, `MICROS_PER_USD`.
+
 ## Errors
 
 | Exception | Meaning |
