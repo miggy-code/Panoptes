@@ -35,12 +35,15 @@ Usage:
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import http.cookiejar
 import http.server
 import ipaddress
 import json
 import logging
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -57,6 +60,18 @@ from panoptes.credentials import (
     TokenRejected,
 )
 from panoptes.db import AuditDB
+from panoptes.hooks import (
+    CLIENT_CREDENTIAL_HEADERS,
+    QUERY_CREDENTIAL_PARAMS,
+    STATIC_HOP_BY_HOP,
+    Exchange,
+    Identity,
+    OutboundHeaders,
+    ProxyHooks,
+    RequestHeaders,
+    Upstream,
+    reject_response,
+)
 from panoptes.policy import PolicyEngine, PolicyResult, _policy_result_context
 from panoptes.schema import (
     KNOWN_AGENT_TYPES,
@@ -97,6 +112,10 @@ DEFAULT_MAX_AUDIT_STREAM_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE = 256
 DEFAULT_CLIENT_SOCKET_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+DEFAULT_DISCONNECT_DRAIN_SECONDS = 30.0
+DEFAULT_HOOK_SLOW_SECONDS = 5.0
+# stop() waits this long for in-flight exchanges (the upstream read timeout).
+_STOP_GRACE_SECONDS = 120.0
 
 def _is_loopback_bind_host(host: str) -> bool:
     """Return whether ``host`` is an explicit loopback bind target."""
@@ -460,7 +479,7 @@ class AuditEventWriter:
         self,
         event_type: str,
         *,
-        run_id: str,
+        run_id: str | None,
         session_id: str,
         agent_type: str,
         turn_number: int,
@@ -469,8 +488,16 @@ class AuditEventWriter:
         correlation_id: str | None = None,
         correlation_source: str | None = None,
         exchange_id: str | None = None,
+        parent_run_id: str | None = None,
+        user: dict | None = None,
+        identity_attr: dict | None = None,
+        identity_assured: bool = False,
     ) -> dict:
         capture = self._capture_metadata(streaming, token_identity)
+        if identity_assured:
+            # An embedder asserted this identity; Panoptes cannot know how it
+            # was established.
+            capture["identity_assurance"] = "hook_asserted"
         if correlation_id is not None and correlation_source == "client":
             # A client assertion for joining this exchange to an external journal;
             # it never changes agent type, session, or identity assurance.
@@ -478,7 +505,7 @@ class AuditEventWriter:
         event = {
             "event_id": uuid.uuid4().hex,
             "timestamp": utcnow_iso(),
-            "agent": {"type": agent_type, "session_id": session_id, "run_id": run_id},
+            "agent": {"type": agent_type, "session_id": session_id},
             "event_type": event_type,
             "action": {},
             "outcome": {},
@@ -488,6 +515,12 @@ class AuditEventWriter:
             },
             "cost": {},
         }
+        if run_id is not None:
+            event["agent"]["run_id"] = run_id
+        if parent_run_id is not None:
+            event["agent"]["parent_run_id"] = parent_run_id
+        if user:
+            event["user"] = dict(user)
         if correlation_id is not None:
             # First-class since schema v5. The capture copy above is kept for
             # readers of earlier events.
@@ -499,6 +532,46 @@ class AuditEventWriter:
                 "exchange_id": exchange_id,
                 "correlation_source": correlation_source,
             }
+            if identity_attr is not None:
+                event["attributes"]["identity"] = dict(identity_attr)
+        return event
+
+    @staticmethod
+    def _base_kwargs(exchange_ctx: dict) -> dict:
+        """Event-identity arguments carried by an exchange context."""
+        return {
+            "run_id": exchange_ctx["run_id"],
+            "session_id": exchange_ctx["session_id"],
+            "agent_type": exchange_ctx["agent_type"],
+            "turn_number": exchange_ctx.get("turn_number", 0),
+            "token_identity": bool(exchange_ctx.get("token_identity")),
+            "correlation_id": exchange_ctx.get("correlation_id"),
+            "correlation_source": exchange_ctx.get("correlation_source"),
+            "exchange_id": exchange_ctx.get("exchange_id"),
+            "parent_run_id": exchange_ctx.get("parent_run_id"),
+            "user": exchange_ctx.get("user"),
+            "identity_attr": exchange_ctx.get("identity_attr"),
+            "identity_assured": bool(exchange_ctx.get("identity_assured")),
+        }
+
+    def build_hook_error_event(self, exchange_ctx: dict, exc: BaseException) -> dict:
+        """The ``panoptes.hook_error`` event for an ``after_exchange`` failure."""
+        event = self._make_base_event(
+            "panoptes.hook_error",
+            streaming=False,
+            **{
+                **self._base_kwargs(exchange_ctx),
+                "token_identity": False,
+            },
+        )
+        event["outcome"] = {"status": "error", "summary": "after_exchange raised"}
+        event["attributes"].update({
+            "hook": "after_exchange",
+            "error_type": type(exc).__name__,
+            "error": str(redact_secrets(str(exc)))[:500],
+        })
+        event = normalize_event(event)
+        validate_event(event)
         return event
 
     def build_request_events(
@@ -510,12 +583,19 @@ class AuditEventWriter:
         req_body: dict | None,
         run_id: str | None = None,
         identity: SessionIdentity | None = None,
+        hook_mode: bool = False,
+        hook_identity: Identity | None = None,
+        exchange_id: str | None = None,
     ) -> tuple[list[dict], dict]:
         """Build request-side audit events (model_request + tool_result).
 
         Returns (events, exchange_ctx). Pass exchange_ctx to build_response_events
         to share run_id, session_id, agent_type, req_format, and turn_number.
         A token-resolved ``identity`` replaces the client's identity headers.
+
+        ``hook_mode`` records how the identity was established; a
+        ``hook_identity`` replaces the seeded one wholesale and its ``run_id``
+        is never invented. ``exchange_id`` lets a rebuild keep the join key.
         """
         if run_id is None:
             run_id = uuid.uuid4().hex
@@ -566,7 +646,32 @@ class AuditEventWriter:
             or run_id
         )
         token_identity = identity is not None
-        exchange_id = uuid.uuid4().hex
+        parent_run_id: str | None = None
+        user: dict | None = None
+        identity_attr: dict | None = None
+        if hook_identity is not None:
+            agent_type = hook_identity.agent_type
+            session_id = hook_identity.session_id
+            run_id = hook_identity.run_id
+            parent_run_id = hook_identity.parent_run_id
+            if hook_identity.user is not None:
+                user = {
+                    key: value
+                    for key, value in (
+                        ("id", hook_identity.user.id),
+                        ("auth_method", hook_identity.user.auth_method),
+                    )
+                    if value is not None
+                } or None
+        if hook_mode:
+            identity_attr = {
+                "source": "hook" if hook_identity is not None else "seeded",
+                "assurance": (
+                    hook_identity.assurance if hook_identity is not None else None
+                ),
+            }
+        if exchange_id is None:
+            exchange_id = uuid.uuid4().hex
         correlation_id = _lower_keys(req_headers).get("x-panoptes-correlation-id")
         if correlation_id is not None:
             validate_identifier(correlation_id, "correlation_id")
@@ -589,16 +694,16 @@ class AuditEventWriter:
             "correlation_id": correlation_id,
             "correlation_source": correlation_source,
             "exchange_id": exchange_id,
+            "parent_run_id": parent_run_id,
+            "user": user,
+            "identity_attr": identity_attr,
+            "identity_assured": hook_identity is not None,
         }
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
-                event_type, run_id=run_id, session_id=session_id,
-                agent_type=agent_type, turn_number=turn_number,
-                streaming=req_info["stream"], token_identity=token_identity,
-                correlation_id=correlation_id,
-                correlation_source=correlation_source,
-                exchange_id=exchange_id,
+                event_type, streaming=req_info["stream"],
+                **self._base_kwargs(exchange_ctx),
             )
 
         events: list[dict] = []
@@ -674,10 +779,11 @@ class AuditEventWriter:
         exchange_ctx: dict,
     ) -> list[dict]:
         """Build response-side audit events (model_response + tool_call)."""
-        run_id = exchange_ctx.get("run_id") or uuid.uuid4().hex
-        session_id = exchange_ctx.get("session_id") or self.session_id
-        agent_type = exchange_ctx.get("agent_type", "unknown")
-        turn_number = exchange_ctx.get("turn_number", 0)
+        # Fill what a caller-built context may omit; a hook-set identity can
+        # legitimately carry no run_id, so only a missing key is defaulted.
+        exchange_ctx.setdefault("run_id", uuid.uuid4().hex)
+        exchange_ctx["session_id"] = exchange_ctx.get("session_id") or self.session_id
+        exchange_ctx.setdefault("agent_type", "unknown")
 
         # Resolve provider for tool extraction (re-detect only if ctx is missing it)
         req_format = exchange_ctx.get("req_format")
@@ -697,13 +803,9 @@ class AuditEventWriter:
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
-                event_type, run_id=run_id, session_id=session_id,
-                agent_type=agent_type, turn_number=turn_number,
+                event_type,
                 streaming=bool(req_info.get("stream", False)),
-                token_identity=bool(exchange_ctx.get("token_identity")),
-                correlation_id=exchange_ctx.get("correlation_id"),
-                correlation_source=exchange_ctx.get("correlation_source"),
-                exchange_id=exchange_ctx.get("exchange_id"),
+                **self._base_kwargs(exchange_ctx),
             )
 
         events: list[dict] = []
@@ -1166,11 +1268,7 @@ PANOPTES_INTERNAL_HEADERS = frozenset({
 # Credential injection: every client credential is stripped, and only the
 # routed provider's key is added. Clients present their Panoptes token in the
 # slot their provider SDK already uses for an API key.
-CLIENT_CREDENTIAL_HEADERS = frozenset({
-    "authorization",
-    "x-api-key",
-    "x-goog-api-key",
-})
+# (CLIENT_CREDENTIAL_HEADERS is defined in panoptes.hooks.)
 _CLIENT_TOKEN_SLOTS: dict[str, tuple[str, ...]] = {
     "anthropic": ("x-api-key", "authorization"),
     "openai": ("authorization",),
@@ -1183,10 +1281,16 @@ _PROVIDER_KEY_HEADERS: dict[str, tuple[str, str]] = {
 }
 
 
-def _strip_query_credentials(path: str) -> tuple[str, list[str]]:
-    """Remove every ``key`` query parameter, returning the path and its values.
+def _strip_query_credentials(
+    path: str,
+    names: frozenset[str] = frozenset({"key"}),
+    *,
+    fold: bool = False,
+) -> tuple[str, list[str]]:
+    """Remove every credential query parameter, returning the path and values.
 
-    Other parameters keep their original encoding and order.
+    ``names`` are matched after percent-decoding, case-insensitively when
+    ``fold`` is set. Other parameters keep their original encoding and order.
     """
     base, sep, query = path.partition("?")
     if not sep:
@@ -1196,7 +1300,8 @@ def _strip_query_credentials(path: str) -> tuple[str, list[str]]:
     values: list[str] = []
     for part in query.split("&"):
         name, _, value = part.partition("=")
-        if unquote_plus(name) == "key":
+        decoded = unquote_plus(name)
+        if (decoded.lower() if fold else decoded) in names:
             values.append(unquote_plus(value))
         else:
             kept.append(part)
@@ -1450,6 +1555,78 @@ def _unpersisted_exchange_events(
     return req_events + resp_events
 
 
+def _may_have_reached_upstream(exc: BaseException) -> bool:
+    """False only for failures that happen before any request byte is written."""
+    return not isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            httpx.UnsupportedProtocol,
+            httpx.LocalProtocolError,
+            httpx.InvalidURL,
+        ),
+    )
+
+
+def _outbound(
+    handler: Any,
+    headers: dict[str, str],
+    path: str,
+    upstream_credential: tuple[str, str] | None,
+) -> tuple[dict[str, str], str]:
+    """The headers and path to forward: a hook's choice, or the default."""
+    run = getattr(handler, "_run", None)
+    if run is not None and run.fwd_headers is not None:
+        return run.fwd_headers, run.forward_path or path
+    return (
+        _with_upstream_credential(
+            handler._build_fwd_headers(headers), upstream_credential
+        ),
+        path,
+    )
+
+
+def _report_of(handler: Any) -> "_ForwardReport":
+    run = getattr(handler, "_run", None)
+    return run.report if run is not None else _ForwardReport()
+
+
+@dataclasses.dataclass
+class _ForwardReport:
+    """What the forwarding code observed, for ``Exchange`` to report."""
+
+    request_sent: bool = False
+    answered: bool = False  # the upstream sent a response head
+    upstream_error: bool = False  # no usable upstream response
+    body_bytes: int = 0
+    client_gone: bool = False
+
+
+@dataclasses.dataclass
+class _ExchangeRun:
+    """Proxy-side state of one exchange that entered ``before_forward``."""
+
+    exchange: Exchange
+    t0: float
+    client_headers: dict
+    seeded_events: list
+    seeded_identity: Identity
+    events: list
+    ctx: dict
+    report: _ForwardReport = dataclasses.field(default_factory=_ForwardReport)
+    fwd_headers: dict | None = None
+    forward_path: str | None = None
+    raw_path: str = ""
+    entered: bool = False
+    finished: bool = False
+    outcome: str | None = None
+    status: int | None = None
+    complete: bool = False
+    response_events: list = dataclasses.field(default_factory=list)
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     """HTTP reverse-proxy request handler."""
 
@@ -1462,6 +1639,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # Credential-injection mode is on when provider_keys is not None.
     provider_keys: dict[str, str] | None = None
     token_store: SessionTokenStore | None = None
+    # Hook seam. ``upstreams`` maps a wire protocol to (name, Upstream).
+    hooks: ProxyHooks | None = None
+    upstreams: dict[str, tuple[str, Upstream]] = {}
+    disconnect_drain_seconds: float = 30.0
+    hook_slow_seconds: float = 5.0
+    _run: _ExchangeRun | None = None
+    _upstream_name: str = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:
         safe_args = list(args)
@@ -1507,9 +1691,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         for provider in _providers.REGISTRY:
             if provider.matches_path(path):
+                # Precedence: upstreams=, then the environment, then the
+                # provider's public API.
+                configured = getattr(self, "upstreams", {}).get(provider.name)
                 env_var = _PROVIDER_ENV.get(provider.name)
                 env_val = os.environ.get(env_var) if env_var else None
-                if env_val:
+                self._upstream_name = provider.name
+                if configured is not None:
+                    self._upstream_name, upstream = configured
+                    s, h, p = _parse_upstream_url(upstream.origin)
+                elif env_val:
                     s, h, p = _parse_upstream_url(env_val)
                 else:
                     s, h, p = _parse_upstream_url(provider.default_upstream)
@@ -1609,11 +1800,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream_credential: tuple[str, str] | None = None,
     ) -> tuple[int, dict[str, str], bytes]:
         """Buffered forward: return (status, headers, body_bytes)."""
+        fwd_headers, path = _outbound(self, headers, path, upstream_credential)
         upstream_url = _upstream_url(scheme, host, port, path)
         safe_label = _safe_upstream_label(scheme, host, port, path)
-        fwd_headers = _with_upstream_credential(
-            self._build_fwd_headers(headers), upstream_credential
-        )
+        report = _report_of(self)
         client, owned = self._get_client()
         limit = getattr(
             self,
@@ -1624,6 +1814,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             with client.stream(
                 method, upstream_url, headers=fwd_headers, content=body
             ) as resp:
+                report.request_sent = report.answered = True
                 response_headers = dict(resp.headers)
                 _check_content_encoding(resp.headers)
                 content_lengths = _header_values(resp.headers, "Content-Length")
@@ -1672,28 +1863,36 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             upstream_headers=response_headers,
                         )
                     accumulated.extend(chunk)
+                report.body_bytes = len(accumulated)
                 return (
                     resp.status_code,
                     _decoded_body_headers(response_headers, streaming=False),
                     bytes(accumulated),
                 )
         except UpstreamBodyTooLarge:
+            report.upstream_error = True
             raise
         except ResponseInspectionError:
             log.exception("Unsafe upstream response framing from %s", safe_label)
+            report.upstream_error = True
             return (
                 502,
                 {"content-type": "application/json"},
                 json.dumps({"error": "Unsafe upstream response framing"}).encode(),
             )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             log.error("Upstream timeout: %s %s", method, safe_label)
+            report.upstream_error = True
+            report.request_sent |= _may_have_reached_upstream(exc)
             return 504, {"content-type": "application/json"}, json.dumps({"error": "Gateway Timeout"}).encode()
         except httpx.ConnectError:
             log.error("Upstream connect error: %s %s", method, safe_label)
+            report.upstream_error = True
             return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
-        except Exception:
+        except Exception as exc:
             log.exception("Upstream error: %s %s", method, safe_label)
+            report.upstream_error = True
+            report.request_sent |= _may_have_reached_upstream(exc)
             return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
         finally:
             if owned:
@@ -1717,21 +1916,27 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         Truncated bytes are never used for response-side enforcement: any
         enforcement-capable stream takes the bounded pre-delivery path instead.
         """
+        fwd_headers, path = _outbound(self, headers, path, upstream_credential)
         upstream_url = _upstream_url(scheme, host, port, path)
         safe_label = _safe_upstream_label(scheme, host, port, path)
-        fwd_headers = _with_upstream_credential(
-            self._build_fwd_headers(headers), upstream_credential
-        )
+        report = _report_of(self)
         accumulated = bytearray()
         audit_truncated = False
         audit_limit = getattr(
             self, "max_audit_stream_bytes", DEFAULT_MAX_AUDIT_STREAM_BYTES
+        )
+        # Hooks owe usage even if the client leaves: keep reading the upstream
+        # for a bounded time. Without hooks a disconnect ends the relay as before.
+        hooked = getattr(self, "hooks", None) is not None
+        drain_seconds = (
+            getattr(self, "disconnect_drain_seconds", 30.0) if hooked else 0.0
         )
         client, owned = self._get_client()
         response_started = False
 
         try:
             with client.stream(method, upstream_url, headers=fwd_headers, content=body) as resp:
+                report.request_sent = report.answered = True
                 _check_content_encoding(resp.headers)
                 # Send status and headers to client (strip Content-Length — unknown)
                 resp_headers = _decoded_body_headers(
@@ -1744,20 +1949,40 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 response_started = True
 
                 # Stream body
+                drain_deadline: float | None = None
                 try:
                     for chunk in resp.iter_bytes():
-                        if chunk:
-                            if not audit_truncated:
-                                remaining = audit_limit - len(accumulated)
-                                if remaining > 0:
-                                    accumulated.extend(chunk[:remaining])
-                                if len(chunk) > remaining:
-                                    audit_truncated = True
+                        if not chunk:
+                            continue
+                        report.body_bytes += len(chunk)
+                        if not audit_truncated:
+                            remaining = audit_limit - len(accumulated)
+                            if remaining > 0:
+                                accumulated.extend(chunk[:remaining])
+                            if len(chunk) > remaining:
+                                audit_truncated = True
+                        if drain_deadline is not None:
+                            if audit_truncated or time.monotonic() > drain_deadline:
+                                audit_truncated = True
+                                break
+                            continue
+                        try:
                             self.wfile.write(chunk)
-                    self.wfile.flush()
+                        except OSError:
+                            if drain_seconds <= 0:
+                                raise
+                            report.client_gone = True
+                            drain_deadline = time.monotonic() + drain_seconds
+                    if not report.client_gone:
+                        self.wfile.flush()
                 except Exception:
                     audit_truncated = True
                     log.exception("Error mid-stream from %s", safe_label)
+
+                if hooked:
+                    # Tell the client the stream is over now; the connection
+                    # would otherwise stay open until this handler returns.
+                    self._end_client_stream()
 
                 return (
                     resp.status_code,
@@ -1766,24 +1991,38 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     audit_truncated,
                 )
 
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             log.error("Upstream timeout (streaming): %s %s", method, safe_label)
+            report.upstream_error = True
+            report.request_sent |= _may_have_reached_upstream(exc)
             if not response_started:
                 self._send_json_error(504, "Gateway Timeout")
             return 504, {"content-type": "application/json"}, b"", True
         except httpx.ConnectError:
             log.error("Upstream connect error (streaming): %s %s", method, safe_label)
+            report.upstream_error = True
             if not response_started:
                 self._send_json_error(502, "Bad Gateway")
             return 502, {"content-type": "application/json"}, b"", True
-        except Exception:
+        except Exception as exc:
             log.exception("Upstream streaming error: %s %s", method, safe_label)
+            report.upstream_error = True
+            report.request_sent |= _may_have_reached_upstream(exc)
             if not response_started:
                 self._send_json_error(502, "Bad Gateway")
             return 502, {"content-type": "application/json"}, b"", True
         finally:
             if owned:
                 client.close()
+
+    def _end_client_stream(self) -> None:
+        """Half-close the client connection so a close-delimited body ends."""
+        self.close_connection = True
+        try:
+            self.wfile.flush()
+            self.connection.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------
     # Response helpers
@@ -1808,9 +2047,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """Run one proxied request and settle its dollar hold however it ends."""
         self._usd_hold: SessionIdentity | None = None
         self._exchange_ctx: dict = {}
+        self._run = None
         try:
             self._handle_request(method)
         finally:
+            self._finish_run()
             hold = self._usd_hold
             if hold is not None and hold.reserved_usd_micros > 0:
                 try:
@@ -1826,9 +2067,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Credential mode: a query-string token must never reach routing,
         # audit records, logs, or the upstream URL.
         provider_keys = getattr(self, "provider_keys", None)
+        hooks = getattr(self, "hooks", None)
         query_credentials: list[str] = []
+        raw_path = ""
         if provider_keys is not None:
             self.path, query_credentials = _strip_query_credentials(self.path)
+        elif hooks is not None:
+            raw_path = self.path
+            # Routing and every recorded path use the stripped form. What is
+            # forwarded is the hook's choice (drop_query_credentials()).
+            self.path, query_credentials = _strip_query_credentials(
+                self.path, QUERY_CREDENTIAL_PARAMS, fold=True
+            )
 
         # 1. Parse target and read body
         try:
@@ -1915,6 +2165,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 req_events, exchange_ctx = writer.build_request_events(
                     path=path, method=method, req_headers=req_headers,
                     req_body=req_body, identity=identity,
+                    hook_mode=hooks is not None,
                 )
                 self._exchange_ctx = exchange_ctx
             except (ValidationError, SSEParseError, ValueError) as exc:
@@ -1931,7 +2182,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     message, extra = failure
                     self._send_json_error(503, message, extra)
                     return
-            if req_events:
+            if hooks is not None:
+                run = self._enter_exchange(
+                    method=method, path=path, raw_path=raw_path,
+                    target=(scheme, host, port), req_headers=req_headers,
+                    body=body, req_body=req_body, req_events=req_events,
+                    exchange_ctx=exchange_ctx, query_credentials=query_credentials,
+                    t0=t0,
+                )
+                if not self._run_before_forward(run):
+                    return
+                req_events, exchange_ctx = run.events, run.ctx
+                self._exchange_ctx = exchange_ctx
+            elif req_events:
                 try:
                     policy_result = writer.check_policies(req_events)
                 except Exception as exc:
@@ -1997,6 +2260,267 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
             upstream_credential=upstream_credential,
         )
+
+    # ------------------------------------------------------------------
+    # Hook seam (docs/hooks.md)
+    # ------------------------------------------------------------------
+
+    def _enter_exchange(
+        self,
+        *,
+        method: str,
+        path: str,
+        raw_path: str,
+        target: tuple[str, str, int],
+        req_headers: dict[str, str],
+        body: bytes,
+        req_body: dict | None,
+        req_events: list[dict],
+        exchange_ctx: dict,
+        query_credentials: list[str],
+        t0: float,
+    ) -> _ExchangeRun:
+        seeded = Identity(
+            agent_type=exchange_ctx["agent_type"],
+            session_id=exchange_ctx["session_id"],
+            run_id=exchange_ctx["run_id"],
+        )
+        exchange = Exchange(
+            exchange_id=exchange_ctx["exchange_id"],
+            correlation_id=exchange_ctx["correlation_id"],
+            correlation_source=exchange_ctx["correlation_source"],
+            provider=exchange_ctx["req_format"],
+            upstream_name=self._upstream_name,
+            upstream_url=_upstream_url(*target, ""),
+            method=method,
+            path=path,
+            request_headers=RequestHeaders(list(self.headers.items())),
+            query_credentials=tuple(query_credentials),
+            request_body=body,
+            request_json=copy.deepcopy(req_body),
+            request_events=copy.deepcopy(req_events),
+            identity=seeded,
+            outbound_headers=OutboundHeaders(self._build_fwd_headers(req_headers)),
+        )
+        run = _ExchangeRun(
+            exchange=exchange,
+            t0=t0,
+            client_headers=req_headers,
+            seeded_events=copy.deepcopy(req_events),
+            seeded_identity=seeded,
+            events=req_events,
+            ctx=exchange_ctx,
+            forward_path=path,
+            raw_path=raw_path,
+        )
+        self._run = run
+        return run
+
+    def _run_before_forward(self, run: _ExchangeRun) -> bool:
+        """Run ``before_forward`` and act on its answer. True means forward."""
+        exchange = run.exchange
+        writer = self.writer
+        run.entered = True  # after_exchange is owed from here
+        started = time.monotonic()
+        failure: Exception | None = None
+        reject: tuple[int, bytes, str] | None = None
+        try:
+            result = self.hooks.before_forward(exchange)
+            if result is not None:
+                reject = reject_response(result)
+        except Exception as exc:
+            failure = exc
+            log.exception("before_forward raised")
+        finally:
+            exchange._freeze_identity()
+            self._warn_if_slow("before_forward", started)
+
+        events, ctx, outbound = run.events, run.ctx, None
+        if failure is None:
+            try:
+                if exchange._identity_assigned:
+                    events, ctx = writer.build_request_events(
+                        path=run.ctx["path"],
+                        method=exchange.method,
+                        req_headers=run.client_headers,
+                        req_body=exchange.request_json,
+                        hook_mode=True,
+                        hook_identity=exchange.identity,
+                        exchange_id=exchange.exchange_id,
+                    )
+                if reject is None:
+                    outbound = self._final_outbound_headers(run)
+            except Exception as exc:
+                failure = exc
+                log.exception("A hook returned an unusable identity or headers")
+        if failure is not None:
+            self._hook_failed(run, failure)
+            return False
+
+        run.events, run.ctx = events, ctx
+        if reject is not None:
+            status, encoded, reason = reject
+            hook = {"action": "reject", "status": status, "reason": reason}
+            self._mark_hook_blocked(events, hook)
+            self._write_best_effort(events, "Hook rejection audit was not durable")
+            run.outcome, run.status = "rejected", status
+            self._send_json_bytes(status, encoded)
+            return False
+
+        run.fwd_headers = outbound
+        if not exchange._drop_query_credentials:
+            run.forward_path = run.raw_path
+        # The request intent is durable before it leaves the process.
+        try:
+            writer.write(events)
+            ctx["_request_events_persisted"] = True
+        except AuditWriteError:
+            log.exception("Request-intent audit could not be persisted")
+            run.outcome, run.status = "not_forwarded", 503
+            self._send_json_error(
+                503,
+                "Request denied because its audit record could not be persisted",
+                {"audit_error": True},
+            )
+            return False
+        return True
+
+    def _final_outbound_headers(self, run: _ExchangeRun) -> dict[str, str]:
+        """The hook's headers plus the invariants Panoptes always re-applies."""
+        client = {k.lower(): (k, v) for k, v in run.client_headers.items()}
+        headers = {
+            name: value
+            for name, value in run.exchange.outbound_headers.as_dict().items()
+            if name.lower() not in STATIC_HOP_BY_HOP
+            and name.lower()
+            not in ("host", "content-length", "content-type", "accept-encoding")
+        }
+        if "content-type" in client:
+            name, value = client["content-type"]
+            headers[name] = value
+        headers["Accept-Encoding"] = "identity"
+        return headers
+
+    def _hook_failed(self, run: _ExchangeRun, exc: BaseException) -> None:
+        """A failing hook never means "forward anyway"."""
+        exchange = run.exchange
+        exchange._settle(identity=run.seeded_identity)
+        events = copy.deepcopy(run.seeded_events)
+        run.events = events
+        self._mark_hook_blocked(
+            events, {"action": "error", "error_type": type(exc).__name__}
+        )
+        self._write_best_effort(events, "Hook error audit was not durable")
+        run.outcome, run.status = "hook_error", 502
+        self._send_json_error(502, "The request could not be processed")
+
+    @staticmethod
+    def _mark_hook_blocked(events: list[dict], hook: dict) -> None:
+        _mark_preflight_blocked(events)
+        for event in events:
+            event.setdefault("attributes", {})["hook"] = dict(hook)
+
+    def _write_best_effort(self, events: list[dict], message: str) -> None:
+        try:
+            self.writer.write(events)
+        except AuditWriteError:
+            log.exception(message)
+
+    def _send_json_bytes(self, status: int, encoded: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _warn_if_slow(self, hook: str, started: float) -> None:
+        elapsed = time.monotonic() - started
+        if elapsed > self.hook_slow_seconds:
+            log.warning(
+                "%s took %.1fs (hook_slow_seconds=%s); a slow hook holds a "
+                "request slot",
+                hook, elapsed, self.hook_slow_seconds,
+            )
+
+    def _set_outcome(self, outcome: str, status: int | None) -> None:
+        run = getattr(self, "_run", None)
+        if run is not None:
+            run.outcome, run.status = outcome, status
+
+    def _note_response(
+        self,
+        resp_events: list[dict],
+        resp_status: int,
+        *,
+        complete: bool,
+        exchange_ctx: dict,
+    ) -> None:
+        run = self._run
+        if run is None:
+            return
+        run.complete = complete
+        run.response_events = copy.deepcopy(resp_events)
+        run.ctx["cost_micros"] = exchange_ctx.get("cost_micros")
+
+    def _finish_run(self) -> None:
+        """Settle the exchange and call ``after_exchange`` exactly once."""
+        run = getattr(self, "_run", None)
+        if run is None or not run.entered or run.finished:
+            return
+        run.finished = True
+        exchange = run.exchange
+        report = run.report
+        outcome = run.outcome or "aborted"
+        usage: dict = {}
+        for event in run.response_events:
+            if event.get("event_type") == "model_response":
+                usage = {
+                    key: value
+                    for key, value in (event.get("cost") or {}).items()
+                    if key not in ("estimated_usd", "pricing_version")
+                    and value is not None
+                }
+                break
+        sent = report.request_sent and outcome not in (
+            "rejected", "hook_error", "not_forwarded"
+        )
+        status = run.status
+        provider_error = (
+            status is not None
+            and status >= 400
+            and report.answered
+            and not report.upstream_error
+        )
+        produced = (
+            report.answered
+            and not report.upstream_error
+            and status is not None
+            and status < 400
+            and report.body_bytes > 0
+        ) or (isinstance(usage.get("tokens_out"), int) and usage["tokens_out"] > 0)
+        exchange._settle(
+            outcome=outcome,
+            request_sent=sent,
+            produced_output=bool(produced),
+            status=status,
+            complete=bool(run.complete and outcome == "forwarded"),
+            response_events=run.response_events,
+            usage=usage,
+            estimated_usd_micros=run.ctx.get("cost_micros"),
+            provider_error=bool(provider_error),
+            duration_ms=int((time.monotonic() - run.t0) * 1000),
+        )
+        started = time.monotonic()
+        try:
+            self.hooks.after_exchange(exchange)
+        except Exception as exc:
+            log.exception("after_exchange raised")
+            try:
+                self.writer.write([self.writer.build_hook_error_event(run.ctx, exc)])
+            except Exception:
+                log.exception("Could not record the after_exchange failure")
+        finally:
+            self._warn_if_slow("after_exchange", started)
 
     def _deny_before_upstream(
         self,
@@ -2109,6 +2633,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
+        run = getattr(self, "_run", None)
+        if run is not None:
+            self._set_outcome(
+                "upstream_error" if run.report.upstream_error else "forwarded",
+                resp_status,
+            )
 
         if not writer:
             return
@@ -2141,6 +2671,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     inspection_error,
                     blocked=False,
                     truncated=audit_truncated,
+                )
+            if run is not None:
+                self._note_response(
+                    resp_events,
+                    resp_status,
+                    complete=(
+                        run.report.answered
+                        and not run.report.upstream_error
+                        and not audit_truncated
+                        and inspection_error is None
+                    ),
+                    exchange_ctx=exchange_ctx,
                 )
             # Post-flight policy is audit-only here because bytes already left
             # the proxy. Blocking-policy configurations take the buffered path
@@ -2248,6 +2790,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             )
         except UpstreamBodyTooLarge as exc:
             duration_ms = int((time.monotonic() - t0) * 1000)
+            self._set_outcome("upstream_error", 502)
             message = (
                 "Upstream response denied because it exceeded the "
                 f"{exc.limit}-byte inspection limit"
@@ -2291,6 +2834,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except ResponseInspectionError as exc:
                 inspection_error = str(exc)
 
+        parse_failed = inspection_error is not None
         inspection_required = _response_requires_inspection(
             writer, method, resp_status
         )
@@ -2342,6 +2886,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 if inspection_error:
                     _mark_inspection_failure(
                         resp_events, inspection_error, blocked=False
+                    )
+                run = getattr(self, "_run", None)
+                if run is not None:
+                    self._note_response(
+                        resp_events,
+                        resp_status,
+                        complete=(
+                            run.report.answered
+                            and not run.report.upstream_error
+                            and not parse_failed
+                        ),
+                        exchange_ctx=exchange_ctx,
                     )
                 # Post-flight policy check — response events only; request
                 # events were already checked (and violations recorded)
@@ -2477,21 +3033,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     }
 
         # Send response to client
-        self.send_response(resp_status)
-        filtered_headers = _decoded_body_headers(
-            dict(resp_headers_raw), streaming=False
-        )
-        filtered_headers = {
-            key: value
-            for key, value in filtered_headers.items()
-            if key.lower() != "content-length"
-        }
-        for key, val in filtered_headers.items():
-            self.send_header(key, val)
-        self.send_header("Content-Length", str(len(resp_body_bytes)))
-        self.end_headers()
-        if method != "HEAD":
-            self.wfile.write(resp_body_bytes)
+        run = getattr(self, "_run", None)
+        if run is not None:
+            self._set_outcome(
+                "upstream_error" if run.report.upstream_error else "forwarded",
+                resp_status,
+            )
+        try:
+            self.send_response(resp_status)
+            filtered_headers = _decoded_body_headers(
+                dict(resp_headers_raw), streaming=False
+            )
+            filtered_headers = {
+                key: value
+                for key, value in filtered_headers.items()
+                if key.lower() != "content-length"
+            }
+            for key, val in filtered_headers.items():
+                self.send_header(key, val)
+            self.send_header("Content-Length", str(len(resp_body_bytes)))
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(resp_body_bytes)
+        except OSError:
+            if run is None:
+                raise
+            # The upstream answered; a client that left changes nothing about
+            # what Panoptes read.
+            log.warning("Client disconnected before the response was written")
 
     def do_GET(self) -> None:
         self._serve_request("GET")
@@ -2519,7 +3088,14 @@ class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
     ) -> None:
         self.client_socket_timeout_seconds = client_socket_timeout_seconds
         self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        self._in_flight = 0
+        self._idle = threading.Condition()
         super().__init__(server_address, request_handler)
+
+    def wait_idle(self, timeout: float) -> bool:
+        """Wait until no request is being served. False if *timeout* passed."""
+        with self._idle:
+            return self._idle.wait_for(lambda: self._in_flight == 0, timeout)
 
     def get_request(self):
         request, client_address = super().get_request()
@@ -2541,17 +3117,25 @@ class _BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)
             return
+        with self._idle:
+            self._in_flight += 1
         try:
             super().process_request(request, client_address)
         except Exception:
-            self._request_slots.release()
+            self._request_done()
             raise
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._request_slots.release()
+            self._request_done()
+
+    def _request_done(self) -> None:
+        self._request_slots.release()
+        with self._idle:
+            self._in_flight -= 1
+            self._idle.notify_all()
 
 
 class ProxyServer:
@@ -2561,7 +3145,7 @@ class ProxyServer:
         self,
         host: str = "127.0.0.1",
         port: int = 8081,
-        db_path: str = ":memory:",
+        db_path: str | None = None,
         policies_dir: str | None = None,
         policy_failure_mode: str = "fail_open",
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
@@ -2572,14 +3156,43 @@ class ProxyServer:
         max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
         provider_keys: dict[str, str] | None = None,
         pricing: Any = None,
+        *,
+        hooks: ProxyHooks | None = None,
+        db: AuditDB | None = None,
+        chain: bool | None = None,
+        upstreams: dict[str, Upstream] | None = None,
+        disconnect_drain_seconds: float = DEFAULT_DISCONNECT_DRAIN_SECONDS,
+        hook_slow_seconds: float = DEFAULT_HOOK_SLOW_SECONDS,
     ) -> None:
         if not _is_loopback_bind_host(host):
             raise ValueError(
                 f"Refusing non-loopback proxy bind host {host!r}"
             )
+        if db is not None and db_path is not None:
+            raise ValueError("db and db_path are mutually exclusive")
+        if hooks is not None:
+            if not isinstance(hooks, ProxyHooks):
+                raise TypeError("hooks must be a ProxyHooks instance")
+            if provider_keys is not None or policies_dir:
+                raise ValueError(
+                    "hooks cannot be combined with credential injection or "
+                    "the policy engine; a hook replaces both"
+                )
+        for value, name in (
+            (disconnect_drain_seconds, "disconnect_drain_seconds"),
+            (hook_slow_seconds, "hook_slow_seconds"),
+        ):
+            if value < 0:
+                raise ValueError(f"{name} must not be negative")
+        self.upstreams = self._resolve_upstreams(upstreams)
+        self.hooks = hooks
+        self.chain = chain
+        self.disconnect_drain_seconds = disconnect_drain_seconds
+        self.hook_slow_seconds = hook_slow_seconds
         self.host = host
         self.port = port
-        self.db_path = db_path
+        self._external_db = db
+        self.db_path = db_path if db_path is not None else ":memory:"
         self.policies_dir = policies_dir
         self.policy_failure_mode = policy_failure_mode
         for value, name in (
@@ -2608,6 +3221,26 @@ class ProxyServer:
         self._tmp_db_path: str | None = None  # set when db_path == ":memory:"
         self.writer: AuditEventWriter | None = None
 
+    @staticmethod
+    def _resolve_upstreams(
+        upstreams: dict[str, Upstream] | None,
+    ) -> dict[str, tuple[str, Upstream]]:
+        """Validate ``upstreams`` and give each one its name."""
+        resolved: dict[str, tuple[str, Upstream]] = {}
+        known = {provider.name for provider in _providers.REGISTRY}
+        for protocol, upstream in (upstreams or {}).items():
+            if protocol not in known:
+                raise ValueError(
+                    f"Unknown wire protocol {protocol!r}; expected one of "
+                    f"{sorted(known)}"
+                )
+            if not isinstance(upstream, Upstream):
+                raise TypeError(
+                    f"upstreams[{protocol!r}] must be an Upstream"
+                )
+            resolved[protocol] = (upstream.name or protocol, upstream)
+        return resolved
+
     def start(self) -> int:
         """Start the proxy in a background thread. Returns the listening port."""
         # ProxyServer maps its ``:memory:`` convenience mode to a disposable
@@ -2622,7 +3255,10 @@ class ProxyServer:
             actual_db_path = self.db_path
 
         try:
-            self._db = AuditDB(actual_db_path)
+            if self._external_db is not None:
+                self._db = self._external_db  # the caller owns it
+            else:
+                self._db = AuditDB(actual_db_path, chain=self.chain)
             self._http_client = _upstream_client(120.0)
             self.writer = AuditEventWriter(
                 self._db,
@@ -2641,6 +3277,10 @@ class ProxyServer:
             _max_audit_stream_bytes = self.max_audit_stream_bytes
             _provider_keys = self.provider_keys
             _token_store = self.token_store
+            _hooks = self.hooks
+            _upstreams = self.upstreams
+            _drain = self.disconnect_drain_seconds
+            _slow = self.hook_slow_seconds
 
             class _ConfiguredHandler(ProxyHandler):
                 writer = _writer
@@ -2650,6 +3290,10 @@ class ProxyServer:
                 max_audit_stream_bytes = _max_audit_stream_bytes
                 provider_keys = _provider_keys
                 token_store = _token_store
+                hooks = _hooks
+                upstreams = _upstreams
+                disconnect_drain_seconds = _drain
+                hook_slow_seconds = _slow
 
             self._server = _BoundedThreadingHTTPServer(
                 (self.host, self.port),
@@ -2694,6 +3338,13 @@ class ProxyServer:
             ):
                 self._server.shutdown()
             self._server.server_close()
+            if not start_failed and not self._server.wait_idle(
+                _STOP_GRACE_SECONDS
+            ):
+                log.warning(
+                    "Stopping with exchanges still in flight after %ss",
+                    _STOP_GRACE_SECONDS,
+                )
             self._server = None
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -2702,7 +3353,8 @@ class ProxyServer:
             self._http_client.close()
             self._http_client = None
         if self._db is not None:
-            self._db.close()
+            if self._db is not self._external_db:
+                self._db.close()
             self._db = None
         self.writer = None
         self.token_store = None

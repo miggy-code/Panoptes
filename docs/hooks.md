@@ -1,16 +1,10 @@
 # Proxy hooks
 
-> **Not implemented yet.** `panoptes/hooks.py` does not exist and `ProxyServer`
-> takes no `hooks=` argument. This file is a **proposed contract**, written
-> before the code so it can be reviewed. It is not frozen and nothing may build
-> on it until the draft banner below is removed.
->
-> **Status: draft for approval.** Decided: `after_exchange` is owed for every
+> **Status: implemented**, in `panoptes/hooks.py` and `ProxyServer`. The
+> contract below was approved before the code was written; changing it is a
+> breaking change to every embedder. Decided: `after_exchange` is owed for every
 > entered exchange; every exchange has a `correlation_id`; one hooks object per
-> proxy. Proposed in this revision, for approval: the embeddable entry point,
-> the `after_exchange` guarantees, streaming and disconnect behaviour, atomic
-> identity with a recorded source, explicit query-credential dropping,
-> `exchange_id` as the join key, upstream precedence, and `produced_output`.
+> proxy.
 
 The Panoptes reverse proxy observes model-API traffic: it forwards each request,
 parses it and the response, prices the usage and records events. It never
@@ -53,7 +47,13 @@ pass-through: no hook code runs, nothing new is buffered, and behaviour is
 unchanged.
 
 `stop()` waits for in-flight exchanges, so every entered exchange still gets
-its `after_exchange` on an orderly shutdown (bounded by the socket timeout).
+its `after_exchange` on an orderly shutdown (bounded by the upstream timeout,
+120 seconds; it logs a warning if exchanges are still running after that).
+
+A hooked proxy cannot also do credential injection (`provider_keys`) or run the
+policy engine (`policies_dir`): `ProxyServer` raises `ValueError`. A hook is the
+replacement for both. The constructor arguments are `hooks`, `db`, `chain`,
+`upstreams`, `pricing`, `disconnect_drain_seconds` and `hook_slow_seconds`.
 
 ## What a hook may and may not do
 
@@ -179,6 +179,9 @@ assertions**, nothing more. A hook that authenticates the caller replaces it
 wholesale, and the exchange is joined to that run, not to whatever the client
 claimed. `session_id` stays required and its type is frozen as `str`.
 
+A hook-set identity whose `run_id` is `None` records no `run_id` on its events:
+Panoptes never invents one.
+
 Panoptes reads `exchange.identity` once, when `before_forward` returns, and
 records every event of the exchange, request and response alike, under it,
 including the events of a rejected exchange. After a **hook error**, the
@@ -248,8 +251,8 @@ value either way.
 | `status` | the HTTP status Panoptes answered the client with (or would have, if the client had already gone), or `None` if none was produced |
 | `complete` | a plain `bool`: `True` only if the whole upstream response was read and parsed, so `usage` is final. `False` whenever that is not known: a broken relay, a truncated audit capture, an upstream drop, no response. Never `None` |
 | `response_events` | the response events recorded (`model_response`, `tool_call`) as deep copies; empty if none |
-| `usage` | token counts from the `model_response` event's `cost` (`tokens_in`, `tokens_out`, and cache/reasoning counts where the provider reports them), or `{}` |
-| `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. Rounding is described in [api.md](api.md#pricing) |
+| `usage` | the token counts the provider reported in the `model_response` event's `cost` (`tokens_in`, `tokens_out`, and cache/reasoning counts), leaving out any it did not report; `{}` if none |
+| `estimated_usd_micros` | the exact priced cost of the response in whole micro-dollars (an `int`), or `None` if unpriced: no rate table, an unknown model, or missing token counts. Panoptes never guesses a rate. `0` for a provider error (an error reply is not billed). Rounding is described in [api.md](api.md#pricing) |
 | `provider_error` | `True` if the upstream answered with a 4xx or 5xx |
 | `duration_ms` | proxy-measured wall time for the exchange |
 
@@ -358,6 +361,9 @@ either way. Draining holds the request slot, so the bound is the cost cap.
 
 A buffered (non-streamed) response is read in full before it is written, so a
 client that disconnects before the write has no effect on `complete`.
+
+Draining is part of hook support: a proxy with no hooks ends the relay when the
+client leaves, as it always has.
 
 ## Upstreams
 

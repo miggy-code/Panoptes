@@ -52,8 +52,18 @@ All notable changes to Panoptes are recorded here. Releases follow
 - The proxy gives every exchange a `correlation_id` (the client's
   `X-Panoptes-Correlation-Id`, else the exchange id) and records
   `attributes.correlation_source` and `attributes.exchange_id` on its events.
-- `docs/api.md`, the supported Python API, and `docs/hooks.md`, a design for
-  proxy hooks that is **not implemented yet**.
+- Proxy hooks (`panoptes.hooks`, `docs/hooks.md`): `ProxyServer(hooks=...)` calls
+  `before_forward` (reject, set the identity, set outbound headers, drop query
+  credentials) and `after_exchange` (settle: outcome, `request_sent`,
+  `produced_output`, `complete`, usage, `estimated_usd_micros`) for every
+  entered exchange. A hook never forces buffering; a client that leaves
+  mid-stream is drained for up to `disconnect_drain_seconds`. A hooked proxy
+  cannot also use credential injection or the policy engine.
+- `ProxyServer(db=..., chain=..., upstreams={"openai": Upstream(url, name=...)})`
+  and `ProxyServer.stop()` now waits for in-flight exchanges. `upstreams=`
+  overrides the `PANOPTES_UPSTREAM_*` variables. `db_path` now defaults to
+  `None` (an in-memory proxy database) and is mutually exclusive with `db`.
+- `docs/api.md`, the supported Python API.
 - `panoptes token issue --max-requests N` caps how many proxied requests a token
   may authorize. Each request presenting a live token spends one unit atomically,
   including requests the provider later rejects. Once spent, the proxy answers
