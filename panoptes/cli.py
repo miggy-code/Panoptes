@@ -9,7 +9,6 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-import time
 
 from panoptes import __version__
 from panoptes.db import AuditDB
@@ -71,8 +70,6 @@ def _display_text(value, limit=180):
 
 def cmd_doctor(args):
     """Inspect local setup without changing audit data or contacting a provider."""
-    from panoptes.credentials import CredentialConfigError, load_provider_keys
-
     failed = False
     print("Panoptes doctor — requested configuration (read-only)")
     print("Running proxy settings, client routing, and direct egress are not verified.\n")
@@ -124,16 +121,6 @@ def cmd_doctor(args):
     print(f"[INFO] Requested proxy mode: {mode} ({args.policy_failure_mode})")
     print("[INFO] Local tool blocking requires a host pre-tool authorizer that honors denials")
 
-    if args.inject_credentials:
-        try:
-            keys = load_provider_keys(args.credentials_file)
-            print(f"[OK] Credentials: configured for {', '.join(sorted(keys))}; values hidden")
-            print("[INFO] Agents must present Panoptes session tokens when injection is enabled")
-        except (CredentialConfigError, UnicodeError) as exc:
-            print(f"[ERROR] Credentials: {_display_text(str(exc), limit=1200)}")
-            failed = True
-    else:
-        print("[WARN] Credential injection disabled; client-held provider keys permit bypass")
     if failed:
         raise SystemExit(2)
 
@@ -337,79 +324,6 @@ def cmd_checkpoint(args):
         )
         raise SystemExit(1)
     print(json.dumps(db.get_chain_checkpoint(), indent=2, sort_keys=True))
-
-
-# ── Token subcommands ─────────────────────────────────────────────────────────
-
-
-def _format_epoch(value) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value)) if value else "-"
-
-
-def cmd_token_issue(args):
-    """Issue a Panoptes session token. Only the token goes to stdout."""
-    from panoptes.credentials import SessionTokenStore
-    from panoptes.schema import ValidationError
-
-    store = SessionTokenStore(AuditDB(args.db_path))
-    try:
-        token, record = store.issue(
-            args.agent, args.session, args.ttl, args.max_requests,
-            max_usd=args.max_usd, reserve_usd=args.reserve_usd,
-        )
-    except ValidationError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
-    print(
-        f"Issued token {record['token_id']} for {record['agent_type']} "
-        f"session {record['session_id']}, expires "
-        f"{_format_epoch(record['expires_at'])}",
-        file=sys.stderr,
-    )
-    print(token)
-
-
-def cmd_token_revoke(args):
-    """Revoke a Panoptes session token by id."""
-    from panoptes.credentials import SessionTokenStore
-
-    store = SessionTokenStore(_open_existing_db(args.db_path, read_only=False))
-    if not store.revoke(args.token_id):
-        print(f"No live token with id: {args.token_id}", file=sys.stderr)
-        raise SystemExit(1)
-    print(f"Revoked token {args.token_id}")
-
-
-def cmd_token_list(args):
-    """List Panoptes session tokens without their values."""
-    from panoptes.credentials import SessionTokenStore
-
-    db = _open_existing_db(args.db_path)
-    try:
-        tokens = SessionTokenStore(db).list_tokens()
-    finally:
-        db.close()
-    if not tokens:
-        print("No tokens issued.")
-        return
-    now = time.time()
-    for t in tokens:
-        if t["revoked_at"] is not None:
-            state = "revoked"
-        elif now >= t["expires_at"]:
-            state = "expired"
-        else:
-            state = "live"
-        print(
-            f"{t['token_id']} | {t['agent_type']} | {t['session_id']} | "
-            f"expires {_format_epoch(t['expires_at'])} | {state} | "
-            f"requests {t['requests_used']}/{t['max_requests'] if t['max_requests'] is not None else 'unlimited'}"
-            + (
-                f" | usd {t['usd_used_micros'] / 1e6:.6f}/{t['max_usd_micros'] / 1e6:.6f}"
-                if t["max_usd_micros"] is not None
-                else ""
-            )
-        )
 
 
 # ── Policy subcommands ────────────────────────────────────────────────────────
@@ -631,21 +545,8 @@ def main(argv=None):
         ),
     )
     gate_opts.add_argument(
-        "--inject-credentials",
-        action="store_true",
-        help=(
-            "Hold provider API keys in Panoptes and require a Panoptes session "
-            "token from agents (keys from PANOPTES_<PROVIDER>_API_KEY or "
-            "--credentials-file)"
-        ),
-    )
-    gate_opts.add_argument(
         "--pricing",
-        help="Versioned JSON rate table; prices responses and settles dollar-capped tokens",
-    )
-    gate_opts.add_argument(
-        "--credentials-file",
-        help="Owner-only (0600) YAML mapping of provider name to API key",
+        help="Versioned JSON rate table; annotates responses with an estimated cost",
     )
 
     parser = argparse.ArgumentParser(
@@ -739,46 +640,6 @@ def main(argv=None):
         parents=[db_opts],
     )
 
-    # --- token ---
-    token_parser = subparsers.add_parser(
-        "token", help="Panoptes session tokens for credential injection"
-    )
-    token_subs = token_parser.add_subparsers(dest="token_command")
-    token_issue = token_subs.add_parser(
-        "issue", help="Issue a session token (printed once)", parents=[db_opts]
-    )
-    token_issue.add_argument("--agent", required=True, help="Agent type, e.g. claude_code")
-    token_issue.add_argument("--session", required=True, help="Session ID")
-    token_issue.add_argument(
-        "--ttl",
-        type=int,
-        default=8 * 60 * 60,
-        help="Lifetime in seconds (default: 28800)",
-    )
-    token_issue.add_argument(
-        "--max-requests",
-        type=int,
-        default=None,
-        help="Cap on proxied requests this token may authorize (default: unlimited)",
-    )
-    token_issue.add_argument(
-        "--max-usd",
-        default=None,
-        help="Dollar cap for this token; needs --reserve-usd and a proxy started with --pricing",
-    )
-    token_issue.add_argument(
-        "--reserve-usd",
-        default=None,
-        help="Most one request may cost; held at admission, replaced by the priced cost",
-    )
-    token_revoke = token_subs.add_parser(
-        "revoke", help="Revoke a session token", parents=[db_opts]
-    )
-    token_revoke.add_argument("token_id", help="Token ID printed by 'token issue'")
-    token_subs.add_parser(
-        "list", help="List session tokens without their values", parents=[db_opts]
-    )
-
     # --- policy ---
     policy_parser = subparsers.add_parser("policy", help="Policy management commands")
     policy_subs = policy_parser.add_subparsers(dest="policy_command")
@@ -821,8 +682,6 @@ def main(argv=None):
 
     if args.command == "session" and not 1 <= args.limit <= 10000:
         parser.error("--limit must be between 1 and 10000")
-    if args.command in {"proxy", "doctor"} and args.credentials_file and not args.inject_credentials:
-        parser.error("--credentials-file requires --inject-credentials")
 
     # Resolve policies_dir defaults where needed
     if hasattr(args, "policies_dir") and not args.policies_dir:
@@ -850,15 +709,6 @@ def main(argv=None):
             except PricingError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 raise SystemExit(2)
-        provider_keys = None
-        if args.inject_credentials:
-            from panoptes.credentials import CredentialConfigError, load_provider_keys
-
-            try:
-                provider_keys = load_provider_keys(args.credentials_file)
-            except CredentialConfigError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                raise SystemExit(2)
 
         start_proxy(
             port=args.port,
@@ -869,20 +719,8 @@ def main(argv=None):
             policy_failure_mode=args.policy_failure_mode,
             client_socket_timeout_seconds=args.client_timeout,
             max_concurrent_requests=args.max_concurrent_requests,
-            provider_keys=provider_keys,
             pricing=pricing,
         )
-    elif args.command == "token":
-        token_commands = {
-            "issue": cmd_token_issue,
-            "revoke": cmd_token_revoke,
-            "list": cmd_token_list,
-        }
-        handler = token_commands.get(args.token_command)
-        if handler:
-            handler(args)
-        else:
-            token_parser.print_help()
     elif args.command == "policy":
         policy_commands = {
             "check": cmd_policy_check,

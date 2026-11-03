@@ -9,7 +9,7 @@ provenance or cryptographic proof of the reported identity or execution.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Tuple
 
 from .schema import ALLOWED_EVENT_TYPES
@@ -137,14 +137,6 @@ PROXY_CAPABILITIES = CaptureCapabilities(
         "Observes model API traffic and model-issued tool instructions; it does not "
         "observe or intercept arbitrary local tool execution."
     ),
-)
-
-
-# Credential-injection mode: agent type and session come from a Panoptes
-# session token the proxy issued and resolved, not from client headers.
-PROXY_TOKEN_CAPABILITIES = replace(
-    PROXY_CAPABILITIES,
-    identity_assurance="panoptes_session_token",
 )
 
 

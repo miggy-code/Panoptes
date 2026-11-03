@@ -322,24 +322,18 @@ def doctor_policies(tmp_path):
     return policies
 
 
-def test_doctor_checks_setup_without_writes_or_exposing_keys(
+def test_doctor_checks_setup_without_writing(
     tmp_path, doctor_policies, monkeypatch, capsys,
 ):
-    from panoptes.credentials import PROVIDER_KEY_ENV
-
     db_path = tmp_path / "audit.db"
     _write_events(db_path, "recent-event")
     before = db_path.read_bytes()
     mode = db_path.stat().st_mode
-    for variable in PROVIDER_KEY_ENV.values():
-        monkeypatch.delenv(variable, raising=False)
-    key = "sk-proj-fake-doctor-provider-key-0123456789"
-    monkeypatch.setenv("PANOPTES_OPENAI_API_KEY", key)
     monkeypatch.setattr(AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events"))
 
     main([
         "doctor", "--db-path", str(db_path), "--policies-dir", str(doctor_policies),
-        "--inject-credentials", "--policy-failure-mode", "fail_closed",
+        "--policy-failure-mode", "fail_closed",
     ])
 
     captured = capsys.readouterr()
@@ -348,36 +342,26 @@ def test_doctor_checks_setup_without_writes_or_exposing_keys(
     assert "[OK] Policies: 1 loaded; snapshot" in captured.out
     assert "model-API policy gate" in captured.out
     assert "buffered before delivery" in captured.out
-    assert "[OK] Credentials: configured for openai" in captured.out
     assert "client routing, and direct egress are not verified" in captured.out
-    assert key not in captured.out + captured.err
     assert db_path.read_bytes() == before
     assert db_path.stat().st_mode == mode
 
 
 def test_doctor_reports_all_setup_failures_without_creating_paths(tmp_path, monkeypatch, capsys):
-    from panoptes.credentials import PROVIDER_KEY_ENV
-
-    for variable in PROVIDER_KEY_ENV.values():
-        monkeypatch.delenv(variable, raising=False)
     db_path = tmp_path / "missing.db"
     policies = tmp_path / "missing-policies"
     with pytest.raises(SystemExit) as exc:
-        main([
-            "doctor", "--db-path", str(db_path), "--policies-dir", str(policies),
-            "--inject-credentials",
-        ])
+        main(["doctor", "--db-path", str(db_path), "--policies-dir", str(policies)])
     assert exc.value.code == 2
     output = capsys.readouterr().out
     assert "[ERROR] Database" in output
     assert "[ERROR] Policies" in output
-    assert "[ERROR] Credentials" in output
     assert "policy configuration invalid; fail_open" in output
     assert not db_path.exists()
     assert not policies.exists()
 
 
-def test_doctor_observation_mode_and_unsafe_credentials_file(tmp_path, capsys):
+def test_doctor_observation_mode(tmp_path, capsys):
     db_path = tmp_path / "audit.db"
     AuditDB(str(db_path)).close()
     policies = tmp_path / "policies"
@@ -388,21 +372,6 @@ def test_doctor_observation_mode_and_unsafe_credentials_file(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "model-API observation" in output
     assert "[WARN] Capture: no recorded activity" in output
-    assert "Credential injection disabled" in output
-
-    credentials = tmp_path / "credentials.yaml"
-    credentials.write_text("openai: sk-proj-fake-doctor-provider-key-0123456789\n")
-    credentials.chmod(0o644)
-    before = credentials.read_bytes()
-    with pytest.raises(SystemExit) as exc:
-        main([*argv, "--inject-credentials", "--credentials-file", str(credentials)])
-    assert exc.value.code == 2
-    output = capsys.readouterr().out
-    assert "[ERROR] Credentials:" in output
-    assert "chmod 600" in output
-    assert "sk-proj-" not in output
-    assert credentials.read_bytes() == before
-    assert credentials.stat().st_mode & 0o777 == 0o644
 
 
 def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys):
@@ -479,3 +448,25 @@ def test_session_partial_selection_json_and_empty_session(tmp_path, capsys):
     data = json.loads(capsys.readouterr().out)
     assert data["events"] == [] and data["matching_count"] == 0
     assert data["partial"] is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["token", "list"],
+    ["proxy", "--inject-credentials"],
+    ["doctor", "--credentials-file", "keys.yaml"],
+])
+def test_the_gateway_commands_and_options_are_gone(argv, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+def test_credential_injection_is_not_part_of_the_package():
+    import importlib.util
+
+    from panoptes.proxy import ProxyServer
+
+    assert importlib.util.find_spec("panoptes.credentials") is None
+    with pytest.raises(TypeError):
+        ProxyServer(port=0, provider_keys={"openai": "k"})

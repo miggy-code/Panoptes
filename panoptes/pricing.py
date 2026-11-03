@@ -2,8 +2,7 @@
 
 Panoptes never guesses a price. A response is priced only when the operator supplied a
 rate table that names the model and the provider reported the token counts the formula
-needs. Everything else is reported as unpriced, and a dollar-capped token is charged its
-full per-request reservation for it.
+needs. Everything else is reported as unpriced.
 """
 
 from __future__ import annotations

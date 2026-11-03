@@ -748,7 +748,7 @@ def test_proxy_server_rejects_bad_configuration(tmp_path):
     with pytest.raises(TypeError):
         ProxyServer(port=0, hooks=object())
     with pytest.raises(ValueError):
-        ProxyServer(port=0, hooks=ProxyHooks(), provider_keys={"openai": "k"})
+        ProxyServer(port=0, hooks=ProxyHooks(), policies_dir="/nonexistent")
     with pytest.raises(ValueError):
         ProxyServer(port=0, hooks=ProxyHooks(), policies_dir=str(tmp_path))
     if True:
@@ -903,7 +903,6 @@ def test_usage_is_empty_when_no_response_arrived(make_proxy, upstream, monkeypat
 @pytest.mark.parametrize("option", [
     {"policy_failure_mode": "fail_closed"},
     {"policies_dir": "/nonexistent"},
-    {"provider_keys": {"anthropic": "k"}},
 ])
 def test_hooks_refuse_every_legacy_gating_option(option):
     with pytest.raises(ValueError, match="hooks cannot be combined"):

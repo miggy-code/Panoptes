@@ -21,10 +21,8 @@ import uuid
 from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import AuditDB
 from panoptes.schema import (
-    normalize_event,
     redact_secrets,
     utcnow_iso as _utcnow_iso,
-    validate_event,
     validate_identifier,
 )
 
