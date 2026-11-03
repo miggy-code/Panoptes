@@ -5,6 +5,7 @@ storage. Schema conformance alone does not establish execution or identity
 assurance; those guarantees come from adapter provenance.
 """
 
+import json
 import math
 import re
 import unicodedata
@@ -13,14 +14,26 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── Schema version ────────────────────────────────────────────────────────────
-SCHEMA_VERSION = 4
+# v5 opens the vocabulary: ``agent.type`` and ``user.auth_method`` are validated
+# identifiers rather than members of a fixed list, ``run_id`` and ``user`` are
+# optional, and events gain ``attributes``, ``correlation_id`` and
+# ``agent.parent_run_id``. Events that declare ``context.schema_version`` 1-4
+# are still validated and normalized under the rules they were written for, so
+# stored history and replays of it stay valid.
+SCHEMA_VERSION = 5
+LEGACY_SCHEMA_VERSION = 4
 
 # ── Allowed values ────────────────────────────────────────────────────────────
-ALLOWED_AGENT_TYPES = frozenset({
+# Adapters Panoptes ships knowledge of. This is informational: any validated
+# identifier is a legal agent type, and nothing in the store enforces this set.
+KNOWN_AGENT_TYPES = frozenset({
     "claude_code", "codex", "hermes", "antigravity", "cursor",
     "gemini_cli", "agentgate", "unknown",
 })
 
+# Built-in event types. A producer outside Panoptes names its own events with a
+# namespaced type, ``<namespace>.<name>`` (for example ``agentgate.allow``);
+# see ``is_valid_event_type``. The built-in set stays closed.
 ALLOWED_EVENT_TYPES = frozenset({
     "model_request", "model_response", "tool_call", "tool_result",
     "decision_point", "policy_violation",
@@ -31,7 +44,8 @@ ALLOWED_OUTCOME_STATUSES = frozenset({
     "success", "error", "blocked", "timeout", "pending", "warned",
 })
 
-ALLOWED_AUTH_METHODS = frozenset({
+# The auth methods v1-v4 accepted. v5 accepts any validated identifier.
+LEGACY_AUTH_METHODS = frozenset({
     "api_key", "oauth", "cli",
 })
 _LEGACY_EVENT_TYPES = frozenset({
@@ -49,19 +63,29 @@ _EVENT_TYPES_BY_SCHEMA_VERSION = {
     2: _LEGACY_EVENT_TYPES,
     3: _LEGACY_EVENT_TYPES,
     4: ALLOWED_EVENT_TYPES,
+    5: ALLOWED_EVENT_TYPES,
 }
 _OUTCOME_STATUSES_BY_SCHEMA_VERSION = {
     1: _LEGACY_OUTCOME_STATUSES,
     2: _LEGACY_OUTCOME_STATUSES,
     3: _LEGACY_OUTCOME_STATUSES,
     4: ALLOWED_OUTCOME_STATUSES,
+    5: ALLOWED_OUTCOME_STATUSES,
 }
+# Closed agent-type lists for the versions that had one (v5 is open).
 _AGENT_TYPES_BY_SCHEMA_VERSION = {
     1: _LEGACY_AGENT_TYPES,
     2: _LEGACY_AGENT_TYPES,
     3: _LEGACY_AGENT_TYPES,
-    4: ALLOWED_AGENT_TYPES,
+    4: KNOWN_AGENT_TYPES,
 }
+# ``<namespace>.<name>[.<name>...]``, lower-case, so a custom type can never
+# collide with a built-in one (none contains a dot).
+_NAMESPACED_EVENT_TYPE_RE = re.compile(
+    r"^[a-z][a-z0-9_]{0,63}(?:\.[a-z0-9][a-z0-9_]{0,63})+$"
+)
+MAX_EVENT_TYPE_LENGTH = 128
+MAX_ATTRIBUTES_BYTES = 64 * 1024
 MAX_IDENTIFIER_LENGTH = 256
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
@@ -385,6 +409,66 @@ def validate_identifier(value: Any, field: str = "identifier") -> None:
         raise ValidationError(f"{field} must not contain secret material")
 
 
+def is_valid_event_type(
+    event_type: Any, schema_version: int = SCHEMA_VERSION
+) -> bool:
+    """Whether *event_type* is legal under the given schema version.
+
+    Every version accepts its built-in set. From v5, a namespaced type
+    ``<namespace>.<name>`` (lower-case, at most 128 characters) is also legal,
+    so another producer can record its own events without Panoptes widening
+    the built-in vocabulary. Earlier versions had no such extension.
+    """
+    if not isinstance(event_type, str):
+        return False
+    if event_type in _EVENT_TYPES_BY_SCHEMA_VERSION.get(schema_version, ()):
+        return True
+    return (
+        schema_version >= 5
+        and len(event_type) <= MAX_EVENT_TYPE_LENGTH
+        and _NAMESPACED_EVENT_TYPE_RE.match(event_type) is not None
+    )
+
+
+def _resolve_schema_version(context: Any) -> int:
+    """The schema version an event declares (default: the current one)."""
+    version = (
+        context.get("schema_version", SCHEMA_VERSION)
+        if isinstance(context, dict) else SCHEMA_VERSION
+    )
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version < 1
+        or version > SCHEMA_VERSION
+    ):
+        raise ValidationError(
+            f"context.schema_version must be between 1 and {SCHEMA_VERSION}"
+        )
+    return version
+
+
+def _validate_optional_identifier(value: Any, field: str) -> None:
+    if value is not None:
+        validate_identifier(value, field)
+
+
+def _validate_attributes(attributes: Any) -> None:
+    """Shape and size of the open ``attributes`` object."""
+    if attributes is None:
+        return
+    if not isinstance(attributes, dict):
+        raise ValidationError("attributes must be a dict")
+    _validate_json_value(attributes, "attributes")
+    size = len(
+        json.dumps(attributes, ensure_ascii=False).encode("utf-8", "replace")
+    )
+    if size > MAX_ATTRIBUTES_BYTES:
+        raise ValidationError(
+            f"attributes exceeds the maximum of {MAX_ATTRIBUTES_BYTES} bytes"
+        )
+
+
 def _validate_capture_metadata(
     capture: Any,
     *,
@@ -446,7 +530,10 @@ def _validate_capture_metadata(
             raise ValidationError(
                 "context.capture.observed_events must be a list of event types"
             )
-        unknown_event_types = set(observed_events) - ALLOWED_EVENT_TYPES
+        unknown_event_types = {
+            event_type for event_type in observed_events
+            if not is_valid_event_type(event_type)
+        }
         if unknown_event_types:
             raise ValidationError(
                 "context.capture.observed_events contains unknown event types: "
@@ -592,35 +679,53 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
     agent = event.get("agent", {})
     if not isinstance(agent, dict):
         raise ValidationError("'agent' must be a dict")
-    missing_agent = {"type", "session_id", "run_id"} - set(agent.keys())
-    if missing_agent:
-        raise ValidationError(f"Missing agent fields: {missing_agent}")
-
     context = event.get("context", {})
     if not isinstance(context, dict):
         raise ValidationError("'context' must be a dict")
+    schema_version = _resolve_schema_version(context)
+    legacy = schema_version < 5
+
+    # run_id became optional in v5; earlier events must carry one.
+    required_agent = {"type", "session_id"} | ({"run_id"} if legacy else set())
+    missing_agent = required_agent - set(agent.keys())
+    if missing_agent:
+        raise ValidationError(f"Missing agent fields: {missing_agent}")
+
     capture = context.get("capture")
     if capture is not None:
         _validate_capture_metadata(capture, require_assertion_marker=True)
-    schema_version = context.get("schema_version", SCHEMA_VERSION)
-    if (
-        isinstance(schema_version, bool)
-        or not isinstance(schema_version, int)
-        or schema_version < 1
-        or schema_version > SCHEMA_VERSION
-    ):
-        raise ValidationError(
-            f"context.schema_version must be between 1 and {SCHEMA_VERSION}"
-        )
 
-    allowed_agent_types = _AGENT_TYPES_BY_SCHEMA_VERSION[schema_version]
-    if agent.get("type") not in allowed_agent_types:
-        raise ValidationError(
-            f"Invalid agent type '{agent.get('type')}' for event schema "
-            f"version {schema_version}. Allowed: {sorted(allowed_agent_types)}"
+    if legacy:
+        allowed_agent_types = _AGENT_TYPES_BY_SCHEMA_VERSION[schema_version]
+        if agent.get("type") not in allowed_agent_types:
+            raise ValidationError(
+                f"Invalid agent type '{agent.get('type')}' for event schema "
+                f"version {schema_version}. Allowed: "
+                f"{sorted(allowed_agent_types)}"
+            )
+        validate_identifier(agent.get("run_id"), "agent.run_id")
+        if agent.get("parent_run_id") is not None:
+            raise ValidationError(
+                "agent.parent_run_id requires context.schema_version 5"
+            )
+        for field in ("correlation_id", "attributes"):
+            # A stored legacy row read back carries these empty; only a value
+            # is a v5 feature.
+            if event.get(field):
+                raise ValidationError(
+                    f"{field} requires context.schema_version 5"
+                )
+    else:
+        validate_identifier(agent.get("type"), "agent.type")
+        _validate_optional_identifier(agent.get("run_id"), "agent.run_id")
+        _validate_optional_identifier(
+            agent.get("parent_run_id"), "agent.parent_run_id"
         )
-    for field in ("session_id", "run_id"):
-        validate_identifier(agent.get(field), f"agent.{field}")
+        _validate_optional_identifier(
+            event.get("correlation_id"), "correlation_id"
+        )
+        _validate_attributes(event.get("attributes"))
+    validate_identifier(agent.get("session_id"), "agent.session_id")
 
     event_id = event.get("event_id")
     if event_id is not None:
@@ -649,11 +754,16 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
             raise ValidationError("timestamp is outside the representable range") from exc
 
     # event_type
-    allowed_event_types = _EVENT_TYPES_BY_SCHEMA_VERSION[schema_version]
-    if event.get("event_type") not in allowed_event_types:
+    if not is_valid_event_type(event.get("event_type"), schema_version):
+        allowed_event_types = _EVENT_TYPES_BY_SCHEMA_VERSION[schema_version]
+        namespaced = (
+            "; or a namespaced '<namespace>.<name>' type"
+            if schema_version >= 5 else ""
+        )
         raise ValidationError(
             f"Invalid event_type '{event.get('event_type')}' for event schema "
-            f"version {schema_version}. Allowed: {sorted(allowed_event_types)}"
+            f"version {schema_version}. Allowed: "
+            f"{sorted(allowed_event_types)}{namespaced}"
         )
 
     # outcome
@@ -713,19 +823,25 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     warnings: List[str] = []
     _validate_required_fields(event)
 
-    # Validate user if present
+    # Validate user if present. From v5 a user is optional and so are both
+    # of its fields; earlier events required a known auth method.
     user = event.get("user", {})
     if user is not None and not isinstance(user, dict):
         raise ValidationError("'user' must be a dict")
+    legacy = _resolve_schema_version(event.get("context")) < 5
     if user:
         user_id = user.get("id")
         if user_id is not None:
             validate_identifier(user_id, "user.id")
-        if user.get("auth_method") not in ALLOWED_AUTH_METHODS:
-            raise ValidationError(
-                f"Unknown auth_method '{user.get('auth_method')}'. "
-                f"Allowed: {sorted(ALLOWED_AUTH_METHODS)}"
-            )
+        auth_method = user.get("auth_method")
+        if legacy:
+            if auth_method not in LEGACY_AUTH_METHODS:
+                raise ValidationError(
+                    f"Unknown auth_method '{auth_method}'. "
+                    f"Allowed: {sorted(LEGACY_AUTH_METHODS)}"
+                )
+        else:
+            _validate_optional_identifier(auth_method, "user.auth_method")
 
     # Validate cost if present
     cost = event.get("cost", {})
@@ -786,6 +902,7 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
         "outcome",
         "context",
         "cost",
+        "attributes",
         "raw_request",
         "raw_response",
     ):
@@ -861,13 +978,16 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
         "outcome",
         "context",
         "cost",
+        "attributes",
         "raw_request",
         "raw_response",
     ):
         value = raw_event.get(field)
         if value is not None:
             _validate_json_value(value, field, budget=json_budget)
-    for field in ("agent", "user", "action", "outcome", "context", "cost"):
+    for field in (
+        "agent", "user", "action", "outcome", "context", "cost", "attributes"
+    ):
         value = raw_event.get(field)
         if value is not None and not isinstance(value, dict):
             raise ValidationError(f"'{field}' must be a dict")
@@ -880,24 +1000,45 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     validate_identifier(event_id, "event_id")
 
     agent = raw_event.get("agent", {}) or {}
+    raw_context = raw_event.get("context", {}) or {}
+    schema_version = _resolve_schema_version(raw_context)
+    legacy = schema_version < 5
     session_id = (
         agent["session_id"]
         if "session_id" in agent
         else uuid.uuid4().hex
     )
-    run_id = agent["run_id"] if "run_id" in agent else uuid.uuid4().hex
     validate_identifier(session_id, "agent.session_id")
-    validate_identifier(run_id, "agent.run_id")
+    if legacy:
+        run_id = agent["run_id"] if "run_id" in agent else uuid.uuid4().hex
+        validate_identifier(run_id, "agent.run_id")
+        parent_run_id = None
+    else:
+        # v5 does not invent a run: an event outside any run has none.
+        run_id = agent.get("run_id")
+        parent_run_id = agent.get("parent_run_id")
+        validate_identifier(agent.get("type", "unknown"), "agent.type")
+        _validate_optional_identifier(run_id, "agent.run_id")
+        _validate_optional_identifier(parent_run_id, "agent.parent_run_id")
+    correlation_id = raw_event.get("correlation_id")
+    _validate_optional_identifier(correlation_id, "correlation_id")
+    attributes = raw_event.get("attributes")
+    _validate_attributes(attributes)
 
     user = raw_event.get("user", {}) or {}
-    user_id = user["id"] if "id" in user else "local_user"
-    validate_identifier(user_id, "user.id")
-    auth_method = user.get("auth_method", "cli")
-    if auth_method not in ALLOWED_AUTH_METHODS:
-        raise ValidationError(
-            f"Unknown auth_method '{auth_method}'. "
-            f"Allowed: {sorted(ALLOWED_AUTH_METHODS)}"
-        )
+    if legacy:
+        user_id = user["id"] if "id" in user else "local_user"
+        auth_method = user.get("auth_method", "cli")
+        if auth_method not in LEGACY_AUTH_METHODS:
+            raise ValidationError(
+                f"Unknown auth_method '{auth_method}'. "
+                f"Allowed: {sorted(LEGACY_AUTH_METHODS)}"
+            )
+    else:
+        user_id = user.get("id")
+        auth_method = user.get("auth_method")
+        _validate_optional_identifier(auth_method, "user.auth_method")
+    _validate_optional_identifier(user_id, "user.id")
 
     action = raw_event.get("action", {}) or {}
     parameters = action.get("parameters")
@@ -925,7 +1066,6 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
         for item in tool_names:
             validate_identifier(item, "action.tool_names[]")
 
-    raw_context = raw_event.get("context", {}) or {}
     if raw_context.get("capture") is not None:
         _validate_capture_metadata(raw_context["capture"])
 
@@ -938,26 +1078,43 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     event["timestamp"] = _normalize_timestamp(raw_event.get("timestamp"))
 
     # --- agent ---
-    redacted_agent = redact_secrets({
+    agent_fields = {
         **agent,
         "type": agent.get("type", "unknown"),
         "version": agent.get("version"),
         "session_id": session_id,
         "run_id": run_id,
-    })
+    }
+    if not legacy:
+        agent_fields["parent_run_id"] = parent_run_id
+    redacted_agent = redact_secrets(agent_fields)
     # These validated structural values are deliberately not content-redacted.
     redacted_agent["session_id"] = session_id
     redacted_agent["run_id"] = run_id
+    if not legacy:
+        redacted_agent["type"] = agent_fields["type"]
+        redacted_agent["parent_run_id"] = parent_run_id
     event["agent"] = redacted_agent
 
     # --- user ---
-    redacted_user = redact_secrets({
-        **user,
-        "id": user_id,
-        "auth_method": auth_method,
-    })
-    redacted_user["id"] = user_id
+    if legacy:
+        user_fields = {**user, "id": user_id, "auth_method": auth_method}
+    else:
+        # No default identity: absent stays absent.
+        user_fields = {
+            key: value for key, value in user.items()
+            if not (key in ("id", "auth_method") and value is None)
+        }
+    redacted_user = redact_secrets(user_fields)
+    if "id" in user_fields:
+        redacted_user["id"] = user_id
+    if "auth_method" in user_fields:
+        redacted_user["auth_method"] = auth_method
     event["user"] = redacted_user
+
+    # --- correlation and open attributes (v5) ---
+    event["correlation_id"] = correlation_id
+    event["attributes"] = redact_secrets(attributes) if attributes else None
 
     # --- event_type ---
     event_type = raw_event.get("event_type", "unknown")
@@ -1054,6 +1211,80 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     return event
 
 
+# ── Strict ingest ─────────────────────────────────────────────────────────────
+
+class IdentifierRewriteError(ValidationError):
+    """Raised by strict ingest when redaction would alter an identifier field."""
+
+
+# Fields that name something and so must be stored exactly as given. Most are
+# already refused outright when they look secret-bearing; ``action.target``
+# and ``agent.version`` are not, and are otherwise redacted in place. A path
+# ending in ``[]`` applies to every element of a list.
+STRICT_IDENTIFIER_PATHS = (
+    "event_id",
+    "correlation_id",
+    "agent.type",
+    "agent.version",
+    "agent.session_id",
+    "agent.run_id",
+    "agent.parent_run_id",
+    "user.id",
+    "user.auth_method",
+    "action.tool_name",
+    "action.call_id",
+    "action.target",
+    "action.tool_names[]",
+)
+
+_MISSING = object()
+
+
+def _values_at(root: Any, path: str) -> List[Any]:
+    """Every value *path* reaches in *root*; absent keys reach nothing."""
+    nodes = [root]
+    for part in path.split("."):
+        each = part.endswith("[]")
+        key = part[:-2] if each else part
+        reached: List[Any] = []
+        for node in nodes:
+            value = node.get(key, _MISSING) if isinstance(node, dict) else _MISSING
+            if value is _MISSING:
+                continue
+            if each:
+                if isinstance(value, list):
+                    reached.extend(value)
+            else:
+                reached.append(value)
+        nodes = reached
+    return nodes
+
+
+def check_strict_identifiers(
+    raw_event: Dict[str, Any],
+    normalized: Dict[str, Any],
+    extra_paths: Tuple[str, ...] = (),
+) -> None:
+    """Refuse an event whose identifier fields normalization changed.
+
+    Redaction is right for free text and wrong for an identifier: a rewritten
+    id silently names a different thing, and two distinct secret-shaped ids
+    would collapse into one. Only *changes* are refused, so an absent field,
+    or a default Panoptes fills in, is not an error. The error names the field
+    and never its value.
+    """
+    for path in STRICT_IDENTIFIER_PATHS + tuple(extra_paths):
+        before = _values_at(raw_event, path)
+        if not before:
+            continue
+        after = _values_at(normalized, path)
+        if before != after:
+            raise IdentifierRewriteError(
+                f"strict ingest: redaction would rewrite identifier {path}; "
+                "the event was not stored"
+            )
+
+
 # ── Helper: extract flattened fields for SQLite indexing ──────────────────────
 
 def extract_index_fields(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -1073,6 +1304,8 @@ def extract_index_fields(event: Dict[str, Any]) -> Dict[str, Any]:
         "agent_type": agent.get("type"),
         "session_id": agent.get("session_id"),
         "run_id": agent.get("run_id"),
+        "parent_run_id": agent.get("parent_run_id"),
+        "correlation_id": event.get("correlation_id"),
         "tool_name": action.get("tool_name"),
         "data_accessed": ",".join(action.get("data_accessed", []) or []),
         "call_id": call_id,

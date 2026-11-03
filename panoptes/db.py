@@ -16,6 +16,7 @@ from .schema import (
     SCHEMA_VERSION,
     ValidationError,
     _redact_capture_metadata,
+    check_strict_identifiers,
     extract_index_fields,
     normalize_event,
     redact_secrets,
@@ -55,6 +56,11 @@ CREATE TABLE IF NOT EXISTS events (
     raw_request     TEXT,
     raw_response    TEXT,
 
+    -- v5: correlation and lineage, plus the open attributes object
+    correlation_id  TEXT,
+    parent_run_id   TEXT,
+    attributes      TEXT,
+
     -- Tamper-evidence hash chain (v3; populated atomically on every insert)
     prev_hash       TEXT,
     event_hash      TEXT
@@ -85,6 +91,14 @@ CREATE_INDICES = [
     # idx_events_call_id is created after ensuring the call_id column exists.
 ]
 
+# v5 index columns are added by migration on older databases, so these are
+# created only after the columns are known to exist.
+CREATE_V5_INDICES = [
+    "CREATE INDEX IF NOT EXISTS idx_events_correlation_id ON events(correlation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_events_parent_run_id  ON events(parent_run_id)",
+]
+_V5_COLUMNS = ("correlation_id", "parent_run_id", "attributes")
+
 CREATE_CALL_ID_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_events_call_id ON events(call_id)"
 )
@@ -104,12 +118,16 @@ INSERT INTO events (
     event_id, timestamp, agent_type, session_id, run_id,
     event_type, tool_name, data_accessed, call_id,
     agent, user_info, action, outcome, context, cost,
-    raw_request, raw_response, prev_hash, event_hash
+    raw_request, raw_response,
+    correlation_id, parent_run_id, attributes,
+    prev_hash, event_hash
 ) VALUES (
     ?, ?, ?, ?, ?,
     ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?
+    ?, ?,
+    ?, ?, ?,
+    ?, ?
 )
 """
 
@@ -121,9 +139,16 @@ _EVENT_PAYLOAD_COLUMNS = (
     "agent", "user_info", "action", "outcome", "context", "cost",
     "raw_request", "raw_response",
 )
+# Columns added by schema v5. They enter the hashed payload only when set, so
+# a row without them hashes exactly as it did under v4 and every pre-v5 chain
+# keeps verifying, while altering, adding or stripping a v5 field still breaks
+# the hash.
+_V5_PAYLOAD_COLUMNS = _V5_COLUMNS
+_ALL_PAYLOAD_COLUMNS = _EVENT_PAYLOAD_COLUMNS + _V5_PAYLOAD_COLUMNS
 _EVENT_JSON_COLUMNS = frozenset({
     "agent", "user_info", "action", "outcome", "context", "cost",
 })
+_OPTIONAL_JSON_COLUMNS = frozenset({"attributes"})
 
 _CHAIN_FORMAT_VERSION = "1"
 _CHAIN_ALGORITHM = "sha256"
@@ -140,6 +165,12 @@ _CHAIN_META_KEYS = frozenset({
 })
 
 
+# Recorded in chain_meta when a database was deliberately created without a
+# hash chain. Without it, a v4+ database that has no chain metadata is treated
+# as one whose chain was stripped, and refused.
+_CHAIN_OFF_KEY = "chain_disabled"
+
+
 class EventConflictError(ValueError):
     """Raised when an event_id is reused for a different canonical event."""
 
@@ -150,6 +181,10 @@ class ChainIntegrityError(RuntimeError):
 
 class UnsupportedSchemaVersionError(RuntimeError):
     """Raised when a database was created by a newer Panoptes schema."""
+
+
+class NotAnAuditDatabaseError(ValueError):
+    """Raised when a path is not an initialized Panoptes audit database."""
 
 
 def _serialize(value: Any) -> str:
@@ -209,6 +244,8 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
         "cost": _deserialize(row["cost"]),
         "raw_request": row["raw_request"],
         "raw_response": row["raw_response"],
+        "correlation_id": row["correlation_id"],
+        "attributes": _deserialize(row["attributes"]) or {},
     }
 
 
@@ -244,20 +281,32 @@ def _build_params(normalized: Dict[str, Any], flat: Dict[str, Any]) -> tuple:
         _serialize(normalized["cost"]),
         _raw_payload_text(normalized.get("raw_request")),
         _raw_payload_text(normalized.get("raw_response")),
+        _as_sql_text(flat.get("correlation_id")),
+        _as_sql_text(flat.get("parent_run_id")),
+        _serialize(normalized["attributes"]) if normalized.get("attributes") else None,
     )
 
 
 def _canonical_payload_from_values(values: tuple) -> Dict[str, Any]:
-    """Build the canonical event payload from values destined for SQLite."""
-    payload: Dict[str, Any] = dict(zip(_EVENT_PAYLOAD_COLUMNS, values))
+    """Build the canonical event payload from values destined for SQLite.
+
+    v5 columns that are unset are left out entirely, which is what makes a
+    v5 writer's hash of a field-less event identical to v4's.
+    """
+    payload: Dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values))
     for column in _EVENT_JSON_COLUMNS:
         payload[column] = json.loads(payload[column])
+    for column in _V5_PAYLOAD_COLUMNS:
+        if payload[column] is None:
+            del payload[column]
+        elif column in _OPTIONAL_JSON_COLUMNS:
+            payload[column] = json.loads(payload[column])
     return payload
 
 
 def _canonical_payload_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     """Build the canonical event payload from a stored SQLite row."""
-    values = tuple(row[column] for column in _EVENT_PAYLOAD_COLUMNS)
+    values = tuple(row[column] for column in _ALL_PAYLOAD_COLUMNS)
     return _canonical_payload_from_values(values)
 
 
@@ -269,9 +318,11 @@ def _rewritten_json_column(row: sqlite3.Row) -> Optional[str]:
     where Python keeps the last) reads a different value in queries and
     aggregates. Each JSON column must be byte-identical to its serialization.
     """
-    for column in _EVENT_PAYLOAD_COLUMNS:
-        if column in _EVENT_JSON_COLUMNS:
+    for column in _EVENT_PAYLOAD_COLUMNS + ("attributes",):
+        if column in _EVENT_JSON_COLUMNS or column in _OPTIONAL_JSON_COLUMNS:
             raw = row[column]
+            if raw is None:
+                continue
             if raw != _serialize(json.loads(raw)):
                 return column
     return None
@@ -367,8 +418,10 @@ def _initialize_chain(conn: sqlite3.Connection) -> Dict[str, Any]:
     return _checkpoint_from_meta(values)
 
 
-def _load_chain_for_append(conn: sqlite3.Connection) -> Dict[str, Any]:
+def _load_chain_for_append(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     """Load and minimally validate the chain head while holding a write lock.
+
+    Returns ``None`` for a database deliberately created without a chain.
 
     Appends are on the ingestion hot path.  Full-table count/link validation
     belongs to ``verify_chain()``; doing it before every insert makes capture
@@ -378,6 +431,8 @@ def _load_chain_for_append(conn: sqlite3.Connection) -> Dict[str, Any]:
     that the indexed last event still anchors the recorded head.
     """
     meta = _read_chain_meta(conn)
+    if not meta and _chain_disabled(conn):
+        return None
     checkpoint = _checkpoint_from_meta(meta) if meta else _initialize_chain(conn)
     if (
         checkpoint["format_version"] != _CHAIN_FORMAT_VERSION
@@ -489,7 +544,10 @@ def _restrict_database_files(path: str) -> None:
         _restrict_file_permissions(candidate)
 
 
-_FILTER_FIELDS = ("agent_type", "session_id", "run_id", "event_type", "tool_name")
+_FILTER_FIELDS = (
+    "agent_type", "session_id", "run_id", "parent_run_id", "correlation_id",
+    "event_type", "tool_name",
+)
 MAX_QUERY_LIMIT = 10_000
 MAX_QUERY_OFFSET = 10_000_000
 
@@ -508,7 +566,9 @@ def _validate_page_value(
     return value
 
 
-def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
+def _build_filter_clause(
+    filters: Dict[str, Any], existing: Optional[frozenset] = None
+) -> Tuple[str, List[Any]]:
     """Build a WHERE clause + params from the shared filter semantics.
 
     Supports equality filters (_FILTER_FIELDS), since/until timestamp
@@ -520,6 +580,10 @@ def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
 
     for field in _FILTER_FIELDS:
         if filters.get(field) is not None:
+            if existing is not None and field not in existing:
+                # An older file has no such column, so nothing can match.
+                conditions.append("0")
+                continue
             conditions.append(f"{field} = ?")
             params.append(filters[field])
 
@@ -537,7 +601,137 @@ def _build_filter_clause(filters: Dict[str, Any]) -> Tuple[str, List[Any]]:
     return where_clause, params
 
 
-def _ensure_schema(db: "AuditDB") -> None:
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _chain_disabled(conn: sqlite3.Connection) -> bool:
+    """Whether this database was deliberately created without a hash chain."""
+    return conn.execute(
+        "SELECT 1 FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,)
+    ).fetchone() is not None
+
+
+def _unchained_checkpoint(legacy_events: int) -> Dict[str, Any]:
+    """The checkpoint of a database that carries no hash chain."""
+    return {
+        "chain": "absent",
+        "initialized": False,
+        "format_version": _CHAIN_FORMAT_VERSION,
+        "algorithm": _CHAIN_ALGORITHM,
+        "anchor": None,
+        "head": None,
+        "event_count": 0,
+        "legacy_event_count": legacy_events,
+        "started_at": None,
+        "first_event_id": None,
+        "last_event_id": None,
+        "coverage": "none",
+        "checkpoint_scope": "database_internal",
+        "external_anchor_required": True,
+    }
+
+
+def _absent_chain_report(legacy_events: int, error: str) -> Dict[str, Any]:
+    """The verification result for a database that carries no hash chain.
+
+    ``valid`` is never true: nothing was verified, and an empty or unchained
+    log must not read as one whose integrity was checked.
+    """
+    return {
+        **_unchained_checkpoint(legacy_events),
+        "valid": False,
+        "checked_events": 0,
+        "broken_event_id": None,
+        "error": error,
+    }
+
+
+def _settle_chain_mode(
+    conn: sqlite3.Connection, chain: Optional[bool], schema_version: int
+) -> None:
+    """Decide, once per open and inside the schema transaction, chained or not.
+
+    ``chain=None`` follows the database: an existing one keeps its mode and a
+    new one is chained. ``True`` requires a chain (starting one at this
+    boundary on an unchained database, with the existing rows explicitly
+    outside it). ``False`` creates an unchained database, and is refused on a
+    chained one: a chain is never dropped by opening a file differently.
+    """
+    meta = _read_chain_meta(conn)
+    disabled = _chain_disabled(conn)
+    if meta and disabled:
+        raise ChainIntegrityError(
+            "Database records both a hash chain and a disabled chain"
+        )
+    if meta:
+        _checkpoint_from_meta(meta)
+        if chain is False:
+            raise ChainIntegrityError(
+                "Refusing to open a chained database with chain=False; "
+                "a hash chain cannot be dropped by reopening the file"
+            )
+        return
+    if disabled:
+        if conn.execute(
+            "SELECT 1 FROM events WHERE prev_hash IS NOT NULL "
+            "OR event_hash IS NOT NULL LIMIT 1"
+        ).fetchone():
+            raise ChainIntegrityError(
+                "Database is marked unchained but holds hash-chained events"
+            )
+        if chain is True:
+            conn.execute("DELETE FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,))
+            _initialize_chain(conn)
+        return
+    if schema_version >= 4:
+        # Every released Panoptes (schema v4) recorded its boundary in the
+        # transaction that created or migrated it, and a deliberate opt-out
+        # leaves a marker. Re-anchoring now would demote the whole history to
+        # unverified legacy rows.
+        raise ChainIntegrityError(
+            "Hash-chain metadata is missing from a chained database"
+        )
+    if chain is False:
+        conn.execute(
+            "INSERT INTO chain_meta (key, value) VALUES (?, ?)",
+            (_CHAIN_OFF_KEY, "1"),
+        )
+    else:
+        _initialize_chain(conn)
+
+
+_RANGE_FILTER_FIELDS = ("since", "until", "data_accessed")
+_QUERY_FILTER_NAMES = frozenset(
+    _FILTER_FIELDS + _RANGE_FILTER_FIELDS + ("limit", "offset")
+)
+_AGGREGATE_FILTER_NAMES = frozenset(_FILTER_FIELDS + _RANGE_FILTER_FIELDS)
+
+
+def _reject_unknown_filters(filters: Dict[str, Any], allowed: frozenset) -> None:
+    """A misspelled filter must fail, not silently match every event."""
+    unknown = sorted(set(filters) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unknown filter(s) {unknown}. Allowed: {sorted(allowed)}"
+        )
+
+
+def _aliased_columns(columns: Tuple[str, ...], existing: frozenset) -> str:
+    """A SELECT list that yields NULL for a column an older database lacks.
+
+    A read-only open never migrates, so a v4 file has no v5 columns. Selecting
+    them as NULL lets every reader treat all schema versions uniformly.
+    """
+    return ", ".join(
+        column if column in existing else f"NULL AS {column}"
+        for column in columns
+    )
+
+
+def _ensure_schema(db: "AuditDB", chain: Optional[bool] = None) -> None:
     """Create tables and indices if they don't exist; migrate if needed.
 
     Migration path:
@@ -550,6 +744,9 @@ def _ensure_schema(db: "AuditDB") -> None:
                            retroactively), plus chain_meta.
       v3 → v4: drop the legacy call_id uniqueness constraint. call_id is a
                            correlation key; every distinct event is retained.
+      v4 → v5: add the nullable correlation_id, parent_run_id and attributes
+                           columns. Existing rows keep NULL there, which hashes
+                           exactly as before, so their chain still verifies.
     """
     with db._connection() as conn:
         # Schema changes and the chain boundary must be observed atomically by
@@ -601,6 +798,14 @@ def _ensure_schema(db: "AuditDB") -> None:
             if "event_hash" not in col_names:
                 conn.execute("ALTER TABLE events ADD COLUMN event_hash TEXT")
 
+        # v4 → v5: nullable columns only; no row is rewritten.
+        col_names = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+        for column in _V5_COLUMNS:
+            if column not in col_names:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {column} TEXT")
+        for idx_sql in CREATE_V5_INDICES:
+            conn.execute(idx_sql)
+
         # Remove the obsolete uniqueness constraint before correcting legacy
         # call IDs: multiple target-derived keys can legitimately converge on
         # one explicit provider call ID.
@@ -626,18 +831,7 @@ def _ensure_schema(db: "AuditDB") -> None:
 
         # Establish the boundary at migration/open time, not at some later
         # first insert. Existing rows remain explicitly outside chain coverage.
-        chain_meta = _read_chain_meta(conn)
-        if chain_meta:
-            _checkpoint_from_meta(chain_meta)
-        elif current >= 4:
-            # Every released Panoptes (schema v4) recorded its boundary in the
-            # transaction that created or migrated it. Re-anchoring now would
-            # demote the whole history to unverified legacy rows.
-            raise ChainIntegrityError(
-                "Hash-chain metadata is missing from a chained database"
-            )
-        else:
-            _initialize_chain(conn)
+        _settle_chain_mode(conn, chain, current)
 
         if current < SCHEMA_VERSION:
             conn.execute(
@@ -648,19 +842,37 @@ def _ensure_schema(db: "AuditDB") -> None:
 
 
 def _check_read_only_schema(db: "AuditDB") -> None:
-    """Refuse a read-only open of a database that would need migrating."""
+    """Refuse a read-only open of a file that is not a readable audit log.
+
+    Any schema version up to the current one is readable without migrating:
+    columns a file lacks read as NULL. Only a newer file, or one that is not a
+    Panoptes log at all, is refused.
+    """
     with db._connection() as conn:
         try:
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if not {"events", "schema_version"} <= tables:
+                raise NotAnAuditDatabaseError(
+                    f"Not an initialized Panoptes audit database: {db._db_path}"
+                )
             row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-        except sqlite3.OperationalError as exc:
-            raise UnsupportedSchemaVersionError(
-                "Database has no Panoptes schema version; it is not initialized"
+        except sqlite3.DatabaseError as exc:
+            raise NotAnAuditDatabaseError(
+                f"Not a Panoptes audit database: {db._db_path} ({exc})"
             ) from exc
         current = row[0] if row and row[0] is not None else 0
-        if current != SCHEMA_VERSION:
+        if current == 0:
+            raise NotAnAuditDatabaseError(
+                f"Panoptes audit database has no schema version: {db._db_path}"
+            )
+        if current > SCHEMA_VERSION:
             raise UnsupportedSchemaVersionError(
-                f"Database schema version {current} differs from supported "
-                f"version {SCHEMA_VERSION}; open it with a writer to migrate"
+                f"Database schema version {current} is newer than supported "
+                f"version {SCHEMA_VERSION}; upgrade Panoptes to read it"
             )
 
 
@@ -675,12 +887,25 @@ class AuditDB:
         "event_type", "tool_name", "data_accessed", "call_id",
         "agent", "user_info", "action", "outcome", "context", "cost",
         "raw_request", "raw_response",
+        "correlation_id", "parent_run_id", "attributes",
     ]
 
     def __init__(
-        self, db_path: str = "~/.panoptes/audit.db", *, read_only: bool = False
+        self,
+        db_path: str = "~/.panoptes/audit.db",
+        *,
+        read_only: bool = False,
+        chain: Optional[bool] = None,
     ):
         """Open (creating and migrating) an audit database.
+
+        ``chain`` selects the local tamper-evidence hash chain. ``None``
+        (default) follows the database: an existing one keeps its mode and a
+        new one is chained. ``True`` requires a chain, starting one on an
+        unchained database at this boundary. ``False`` creates an unchained
+        database; it is refused (``ChainIntegrityError``) on a chained one,
+        because a chain must never be dropped silently. An unchained database
+        verifies as ``chain: "absent"``, never as valid.
 
         ``read_only=True`` opens an existing, current-version database over
         SQLite ``mode=ro`` connections: it never creates, migrates, re-anchors,
@@ -689,6 +914,11 @@ class AuditDB:
         self._db_path = os.path.expanduser(db_path)
         self._is_memory = self._db_path == ":memory:"
         self._read_only = read_only
+        if chain is not None and not isinstance(chain, bool):
+            raise ValueError("chain must be True, False or None")
+        if read_only and chain is not None:
+            raise ValueError("A read-only audit database cannot select a chain")
+        self._chain = chain
         if read_only and self._is_memory:
             raise ValueError("A read-only audit database needs a file path")
         if read_only:
@@ -704,6 +934,7 @@ class AuditDB:
             self._keeper_conn: Optional[sqlite3.Connection] = None
             try:
                 _check_read_only_schema(self)
+                self._refresh_columns()
             except Exception:
                 self.close()
                 raise
@@ -741,10 +972,47 @@ class AuditDB:
                 _restrict_database_files(self._db_path)
 
             # Run migrations / create tables
-            _ensure_schema(self)
+            _ensure_schema(self, chain)
+            self._refresh_columns()
         except Exception:
             self.close()
             raise
+
+    def _refresh_columns(self) -> None:
+        """Record which event columns this file has and build SELECT lists."""
+        with self._connection() as conn:
+            self._existing_columns = frozenset(
+                row[1] for row in conn.execute("PRAGMA table_info(events)")
+            )
+        self._select_cols = _aliased_columns(
+            tuple(self._EVENT_COLUMNS), self._existing_columns
+        )
+        self._payload_select = _aliased_columns(
+            _ALL_PAYLOAD_COLUMNS, self._existing_columns
+        )
+
+    @classmethod
+    def open_readonly(cls, db_path: str) -> "AuditDB":
+        """Open an existing audit database for reading, changing nothing.
+
+        No file is created, no schema is migrated, no hash chain is started or
+        re-anchored, no file mode changes and nothing is written, so inspecting
+        evidence cannot alter it. Every schema version up to the current one
+        is readable as it stands; columns an older file lacks read as empty.
+        ``verify_chain()`` and ``verify_checkpoint()`` work on the result;
+        inserting raises ``sqlite3.OperationalError``.
+
+        Raises ``FileNotFoundError`` for a missing path,
+        ``NotAnAuditDatabaseError`` (a ``ValueError``) for a file that is not
+        an initialized Panoptes log, and ``UnsupportedSchemaVersionError`` for
+        a log from a newer Panoptes.
+        """
+        path = os.path.expanduser(db_path)
+        if path == ":memory:":
+            raise ValueError("A read-only audit database needs a file path")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"audit database not found: {path}")
+        return cls(path, read_only=True)
 
     # ── Thread-safe connection management ─────────────────────────────────
 
@@ -806,10 +1074,24 @@ class AuditDB:
 
     # ── Insert ────────────────────────────────────────────────────────────
 
-    def insert_events(self, events: List[Dict[str, Any]]) -> List[str]:
+    def insert_events(
+        self,
+        events: List[Dict[str, Any]],
+        *,
+        strict: bool = False,
+        strict_paths: Tuple[str, ...] = (),
+    ) -> List[str]:
         """Validate, normalize, and insert a batch of events in one transaction.
 
         Returns a list of event_ids in the same order as *events*.
+
+        ``strict=True`` raises ``IdentifierRewriteError`` (a ``ValidationError``)
+        instead of storing an event whose identifier fields redaction would
+        alter; free text is still redacted. The identifier fields are
+        ``schema.STRICT_IDENTIFIER_PATHS`` plus any dotted *strict_paths* the
+        caller names (``attributes.rule_ids[]`` for every list element).
+        Naming ``strict_paths`` implies strict. The check runs before any
+        write, so a refused event leaves the batch and the chain untouched.
 
         Idempotency is intentionally limited to an identical canonical payload
         with the same stable event_id. Raw inputs changed by redaction cannot be
@@ -842,6 +1124,8 @@ class AuditDB:
                     event.get("event_id"), warnings,
                 )
             normalized = normalize_event(event)
+            if strict or strict_paths:
+                check_strict_identifiers(event, normalized, tuple(strict_paths))
             # Normalization is part of the trust boundary too. Revalidate its
             # output so a classifier/defaulting regression cannot smuggle a
             # non-schema or non-JSON value into the immutable audit trail.
@@ -860,7 +1144,8 @@ class AuditDB:
                 conn.execute("BEGIN IMMEDIATE")
                 event_ids: List[str] = []
                 checkpoint: Optional[Dict[str, Any]] = None
-                payload_columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                chain_loaded = False
+                payload_columns = ", ".join(_ALL_PAYLOAD_COLUMNS)
 
                 for normalized, flat, input_requires_redaction in prepared:
                     # Defense in depth while schema adapters transition away from
@@ -898,8 +1183,15 @@ class AuditDB:
                         event_ids.append(existing["event_id"])
                         continue
 
-                    if checkpoint is None:
+                    if not chain_loaded:
                         checkpoint = _load_chain_for_append(conn)
+                        chain_loaded = True
+
+                    if checkpoint is None:
+                        # Deliberately unchained database: no hash, no head.
+                        conn.execute(_INSERT_SQL, values + (None, None))
+                        event_ids.append(event_id)
+                        continue
 
                     prev_hash = checkpoint["head"]
                     digest = _event_hash(prev_hash, payload)
@@ -921,16 +1213,24 @@ class AuditDB:
                 conn.rollback()
                 raise
 
-    def insert_event(self, event: Dict[str, Any]) -> str:
+    def insert_event(
+        self,
+        event: Dict[str, Any],
+        *,
+        strict: bool = False,
+        strict_paths: Tuple[str, ...] = (),
+    ) -> str:
         """Validate, normalize, and insert a single event. Returns the event_id.
 
         Delegates to insert_events for a single-element batch so that both
         methods share the same code path (validation, normalization, conflict,
-        rollback on error).
+        rollback on error). See ``insert_events`` for ``strict``.
 
         Raises ValidationError if required fields are missing or invalid.
         """
-        return self.insert_events([event])[0]
+        return self.insert_events(
+            [event], strict=strict, strict_paths=strict_paths
+        )[0]
 
     # ── Tamper-evidence hash chain ────────────────────────────────────────
 
@@ -946,6 +1246,11 @@ class AuditDB:
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN")
+                if not self._chain_storage_present(conn):
+                    # A file that predates the chain has no columns to count.
+                    total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                    conn.commit()
+                    return _unchained_checkpoint(total)
                 meta = _read_chain_meta(conn)
                 if meta:
                     checkpoint = _checkpoint_from_meta(meta)
@@ -962,26 +1267,19 @@ class AuditDB:
                         raise ChainIntegrityError(
                             "Hashed events exist but hash-chain metadata is missing"
                         )
-                    checkpoint = {
-                        "initialized": False,
-                        "format_version": _CHAIN_FORMAT_VERSION,
-                        "algorithm": _CHAIN_ALGORITHM,
-                        "anchor": None,
-                        "head": None,
-                        "event_count": 0,
-                        "legacy_event_count": legacy_count,
-                        "started_at": None,
-                        "first_event_id": None,
-                        "last_event_id": None,
-                        "coverage": "none",
-                        "checkpoint_scope": "database_internal",
-                        "external_anchor_required": True,
-                    }
+                    checkpoint = _unchained_checkpoint(legacy_count)
                 conn.commit()
                 return checkpoint
             except Exception:
                 conn.rollback()
                 raise
+
+    def _chain_storage_present(self, conn: sqlite3.Connection) -> bool:
+        """Whether this file has the columns and table a hash chain lives in."""
+        return (
+            {"prev_hash", "event_hash"} <= self._existing_columns
+            and _has_table(conn, "chain_meta")
+        )
 
     def verify_chain(self) -> Dict[str, Any]:
         """Verify links, canonical event hashes, head, count, and boundary.
@@ -989,12 +1287,29 @@ class AuditDB:
         Returns a structured result instead of raising for detected tampering,
         so callers can report the first broken event. Operational SQLite errors
         still propagate.
+
+        ``result["chain"]`` is ``"intact"`` (verified, ``valid`` is true),
+        ``"broken"`` (tampering or corruption found, ``valid`` is false) or
+        ``"absent"`` (the database carries no hash chain, so nothing was
+        verified; ``valid`` is false). An unchained or empty-chain log is
+        never reported valid.
         """
+        result = self._verify_chain()
+        result.setdefault("chain", "intact" if result.get("valid") else "broken")
+        return result
+
+    def _verify_chain(self) -> Dict[str, Any]:
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN")
-                meta = _read_chain_meta(conn)
                 total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+                if not self._chain_storage_present(conn):
+                    conn.commit()
+                    return _absent_chain_report(
+                        total,
+                        "No hash chain: this database predates the hash chain",
+                    )
+                meta = _read_chain_meta(conn)
                 partial_count = conn.execute(
                     """
                     SELECT COUNT(*) FROM events
@@ -1009,32 +1324,24 @@ class AuditDB:
                 legacy_count = total - chained_count - partial_count
 
                 if not meta:
-                    result = {
-                        "valid": total == 0,
-                        "initialized": False,
-                        "format_version": _CHAIN_FORMAT_VERSION,
-                        "algorithm": _CHAIN_ALGORITHM,
-                        "anchor": None,
-                        "head": None,
-                        "event_count": 0,
-                        "legacy_event_count": legacy_count,
-                        "started_at": None,
-                        "first_event_id": None,
-                        "last_event_id": None,
-                        "coverage": "none",
-                        "checkpoint_scope": "database_internal",
-                        "external_anchor_required": True,
-                        "checked_events": 0,
-                        "broken_event_id": None,
-                        "error": (
-                            "Hashed events exist without hash-chain metadata"
-                            if partial_count or chained_count
-                            else "Events exist but the hash chain is not initialized"
-                            if total else None
-                        ),
-                    }
+                    if partial_count or chained_count:
+                        # Hashes without metadata: the chain was stripped.
+                        error = "Hashed events exist without hash-chain metadata"
+                        report = {**_absent_chain_report(legacy_count, error),
+                                  "chain": "broken"}
+                    elif _chain_disabled(conn):
+                        report = _absent_chain_report(
+                            legacy_count,
+                            "No hash chain: this database was created unchained",
+                        )
+                    else:
+                        report = _absent_chain_report(
+                            legacy_count,
+                            "Events exist but the hash chain is not initialized"
+                            if total else "No hash chain has been started",
+                        )
                     conn.commit()
-                    return result
+                    return report
 
                 try:
                     checkpoint = _checkpoint_from_meta(meta)
@@ -1077,7 +1384,7 @@ class AuditDB:
                     conn.commit()
                     return fail("Unchained event count changed after chain start")
 
-                columns = ", ".join(_EVENT_PAYLOAD_COLUMNS)
+                columns = self._payload_select
                 rows = conn.execute(
                     f"SELECT {columns}, prev_hash, event_hash FROM events "
                     "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
@@ -1365,11 +1672,16 @@ class AuditDB:
         """Query events with optional filters.
 
         Supported filters:
-            agent_type, session_id, run_id, event_type, tool_name,
-            since, until (ISO8601 timestamps), data_accessed (partial match),
-            limit (default 100), offset (default 0)
+            agent_type, session_id, run_id, parent_run_id, correlation_id,
+            event_type, tool_name, since, until (ISO8601 timestamps),
+            data_accessed (partial match), limit (default 100), offset
+            (default 0). An unknown filter name raises ValueError.
+
+        Returns newest first. Use ``iter_events`` to stream a whole log in
+        write order.
         """
-        where_clause, params = _build_filter_clause(filters)
+        _reject_unknown_filters(filters, _QUERY_FILTER_NAMES)
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
 
         # Pagination
         limit = _validate_page_value(
@@ -1385,7 +1697,7 @@ class AuditDB:
             maximum=MAX_QUERY_OFFSET,
         )
 
-        columns_str = ", ".join(self._EVENT_COLUMNS)
+        columns_str = self._select_cols
         # rowid is the transactional ingestion order for this append-only table
         # and makes pagination deterministic when events share a timestamp.
         sql = (
@@ -1400,6 +1712,89 @@ class AuditDB:
 
         return [_row_to_event(r) for r in rows]
 
+    _ITER_ORDERS = {
+        # name: (sort columns, descending)
+        "rowid": (("rowid",), False),
+        "-rowid": (("rowid",), True),
+        "timestamp": (("timestamp", "rowid"), False),
+        "-timestamp": (("timestamp", "rowid"), True),
+    }
+
+    def iter_events(
+        self,
+        *,
+        agent_type: Optional[str] = None,
+        event_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        parent_run_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        data_accessed: Optional[str] = None,
+        order: str = "rowid",
+        batch_size: int = 500,
+    ) -> Iterator[Dict[str, Any]]:
+        """Stream matching events, with no row cap, as canonical event dicts.
+
+        ``order`` is ``"rowid"`` (the order events were written, which is the
+        order the hash chain follows), ``"timestamp"``, or either with a
+        leading ``"-"`` for newest first. Filters match ``query()``.
+
+        Events are fetched in keyset-paginated batches, each in its own
+        short read, so a long iteration holds no transaction open and cannot
+        block a writer. Events appended while iterating in ascending order
+        are included; an event is never yielded twice. Nothing is yielded
+        for a filter on a column an older read-only file lacks.
+        """
+        if order not in self._ITER_ORDERS:
+            raise ValueError(
+                f"Unknown order {order!r}. Allowed: {sorted(self._ITER_ORDERS)}"
+            )
+        batch_size = _validate_page_value(
+            batch_size, "batch_size", minimum=1, maximum=MAX_QUERY_LIMIT
+        )
+        filters = {
+            name: value for name, value in (
+                ("agent_type", agent_type), ("event_type", event_type),
+                ("session_id", session_id), ("run_id", run_id),
+                ("parent_run_id", parent_run_id),
+                ("correlation_id", correlation_id), ("tool_name", tool_name),
+                ("since", since), ("until", until),
+                ("data_accessed", data_accessed),
+            ) if value is not None
+        }
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
+        columns, descending = self._ITER_ORDERS[order]
+        direction = "DESC" if descending else "ASC"
+        compare = "<" if descending else ">"
+        sort_by = ", ".join(f"{column} {direction}" for column in columns)
+        cursor_columns = ", ".join(columns)
+        if columns == ("rowid",):
+            cursor: Tuple[Any, ...] = (2**63 - 1,) if descending else (-1,)
+        else:
+            cursor = ("\U0010ffff", 2**63 - 1) if descending else ("", -1)
+        placeholders = ", ".join("?" for _ in columns)
+        join = " AND " if where_clause else "WHERE "
+        sql = (
+            f"SELECT rowid AS _rowid, {self._select_cols} FROM events "
+            f"{where_clause}{join}({cursor_columns}) {compare} ({placeholders}) "
+            f"ORDER BY {sort_by} LIMIT ?"
+        )
+        while True:
+            with self._connection() as conn:
+                rows = conn.execute(sql, [*params, *cursor, batch_size]).fetchall()
+            for row in rows:
+                yield _row_to_event(row)
+            if len(rows) < batch_size:
+                return
+            last = rows[-1]
+            cursor = (
+                (last["_rowid"],) if columns == ("rowid",)
+                else (last["timestamp"], last["_rowid"])
+            )
+
     # ── Aggregation ───────────────────────────────────────────────────────
 
     # Whitelisted GROUP BY dimensions → SQL expressions. Callers pass names,
@@ -1408,6 +1803,8 @@ class AuditDB:
         "agent_type": "agent_type",
         "session_id": "session_id",
         "run_id": "run_id",
+        "parent_run_id": "parent_run_id",
+        "correlation_id": "correlation_id",
         "event_type": "event_type",
         "tool_name": "tool_name",
         "data_accessed": "data_accessed",
@@ -1455,12 +1852,14 @@ class AuditDB:
             metrics:  metric names (see _AGG_METRICS). Defaults to ["count"].
             order_by: a selected dimension or metric name to sort on.
                       Defaults to the first metric.
-            filters:  agent_type, session_id, run_id, event_type, tool_name,
-                      since, until, data_accessed — same semantics as query().
+            filters:  agent_type, session_id, run_id, parent_run_id,
+                      correlation_id, event_type, tool_name, since, until,
+                      data_accessed — same semantics as query().
 
         Returns one dict per group with dimension and metric names as keys.
         Raises ValueError for unknown dimension/metric/order_by names.
         """
+        _reject_unknown_filters(filters, _AGGREGATE_FILTER_NAMES)
         metrics = metrics or ["count"]
         limit = _validate_page_value(
             limit,
@@ -1489,16 +1888,20 @@ class AuditDB:
                 f"dimensions or metrics: {list(group_by) + metrics}"
             )
 
+        def dimension_sql(name: str) -> str:
+            expr = self._AGG_DIMENSIONS[name]
+            return expr if expr in self._existing_columns or not expr.isidentifier() else "NULL"
+
         select_parts = [
-            f'{self._AGG_DIMENSIONS[d]} AS "{d}"' for d in group_by
+            f'{dimension_sql(d)} AS "{d}"' for d in group_by
         ] + [
             f'{self._AGG_METRICS[m]} AS "{m}"' for m in metrics
         ]
 
         # WHERE clause — same filter semantics as query()
-        where_clause, params = _build_filter_clause(filters)
+        where_clause, params = _build_filter_clause(filters, self._existing_columns)
         group_clause = (
-            "GROUP BY " + ", ".join(self._AGG_DIMENSIONS[d] for d in group_by)
+            "GROUP BY " + ", ".join(dimension_sql(d) for d in group_by)
             if group_by else ""
         )
         direction = "DESC" if descending else "ASC"
@@ -1544,7 +1947,7 @@ class AuditDB:
         with self._connection() as conn:
             # 1. Get the anchor event
             cur = conn.execute(
-                f"SELECT {', '.join(self._EVENT_COLUMNS)} FROM events WHERE event_id = ?",
+                f"SELECT {self._select_cols} FROM events WHERE event_id = ?",
                 (event_id,),
             )
             row = cur.fetchone()
@@ -1564,7 +1967,7 @@ class AuditDB:
                 if run_id:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND (call_id = ? OR run_id = ?)
@@ -1575,7 +1978,7 @@ class AuditDB:
                 else:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND call_id = ?
@@ -1591,7 +1994,7 @@ class AuditDB:
                     turn_high = turn + 1
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND json_extract(context, '$.turn_number') IS NOT NULL
@@ -1604,7 +2007,7 @@ class AuditDB:
                 else:
                     cur = conn.execute(
                         f"""
-                        SELECT {', '.join(self._EVENT_COLUMNS)}
+                        SELECT {self._select_cols}
                         FROM events
                         WHERE session_id = ?
                           AND julianday(timestamp)

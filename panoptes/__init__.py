@@ -20,6 +20,7 @@ from .db import (
     AuditDB,
     ChainIntegrityError,
     EventConflictError,
+    NotAnAuditDatabaseError,
     UnsupportedSchemaVersionError,
 )
 from .policy import (
@@ -29,7 +30,9 @@ from .policy import (
     PolicyResult,
 )
 from .schema import (
+    KNOWN_AGENT_TYPES,
     SCHEMA_VERSION,
+    IdentifierRewriteError,
     ValidationError,
     normalize_event,
     redact_secrets,
@@ -50,6 +53,9 @@ __all__ = [
     "EventConflictError",
     "HERMES_AUTHORIZER_CAPABILITIES",
     "HERMES_CAPABILITIES",
+    "IdentifierRewriteError",
+    "KNOWN_AGENT_TYPES",
+    "NotAnAuditDatabaseError",
     "POLICY_ENGINE_SEMANTICS_VERSION",
     "Policy",
     "PolicyEngine",

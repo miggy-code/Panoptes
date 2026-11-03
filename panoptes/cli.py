@@ -57,7 +57,7 @@ def _open_existing_db(db_path: str, *, read_only: bool = True) -> AuditDB:
         raise SystemExit(2)
     try:
         return AuditDB(expanded, read_only=read_only)
-    except (sqlite3.Error, RuntimeError) as exc:
+    except (sqlite3.Error, RuntimeError, ValueError) as exc:
         print(f"Cannot open audit database {expanded}: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 

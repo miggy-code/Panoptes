@@ -7,6 +7,7 @@ import pytest
 from panoptes import __version__
 from panoptes.cli import main
 from panoptes.db import AuditDB
+from panoptes.schema import SCHEMA_VERSION
 from panoptes.policy import PolicyResult
 
 
@@ -341,7 +342,7 @@ def test_doctor_checks_setup_without_writes_or_exposing_keys(
     ])
 
     captured = capsys.readouterr()
-    assert "[OK] Database: schema 4, 1 events" in captured.out
+    assert f"[OK] Database: schema {SCHEMA_VERSION}, 1 events" in captured.out
     assert "Last audit event: 2026-07-17" in captured.out
     assert "[OK] Policies: 1 loaded; snapshot" in captured.out
     assert "model-API policy gate" in captured.out
