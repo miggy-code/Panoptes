@@ -23,12 +23,6 @@ from .db import (
     NotAnAuditDatabaseError,
     UnsupportedSchemaVersionError,
 )
-from .policy import (
-    POLICY_ENGINE_SEMANTICS_VERSION,
-    Policy,
-    PolicyEngine,
-    PolicyResult,
-)
 from .schema import (
     KNOWN_AGENT_TYPES,
     SCHEMA_VERSION,
@@ -39,6 +33,30 @@ from .schema import (
     validate_event,
     validate_identifier,
 )
+
+# The policy engine pulls in PyYAML; load it only when it is asked for, so
+# ``from panoptes import AuditDB`` stays light.
+_LAZY_POLICY_EXPORTS = frozenset({
+    "POLICY_ENGINE_SEMANTICS_VERSION",
+    "Policy",
+    "PolicyEngine",
+    "PolicyResult",
+})
+
+
+def __getattr__(name: str):
+    if name in _LAZY_POLICY_EXPORTS:
+        from . import policy
+
+        value = getattr(policy, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _LAZY_POLICY_EXPORTS)
+
 
 try:
     __version__ = version("panoptes-observe")

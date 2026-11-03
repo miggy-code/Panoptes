@@ -22,6 +22,10 @@ All notable changes to Panoptes are recorded here. Releases follow
     modules are removed.
   - Custom events use a namespaced type `<namespace>.<name>`; the built-in
     event types stay closed.
+- `httpx` is no longer a base dependency. The proxy needs the new `[proxy]`
+  extra (`pip install 'panoptes-observe[proxy]'`); `panoptes proxy` says so when
+  it is missing. The store, schema, hooks types and Hermes ingest need no HTTP
+  client.
 - `AuditDB.query()` and `aggregate()` raise `ValueError` on an unknown filter
   name. Before, a misspelled filter silently matched every event.
 - `verify_chain()` results carry `chain`: `intact`, `broken`, `partial` or
@@ -63,6 +67,11 @@ All notable changes to Panoptes are recorded here. Releases follow
   and `ProxyServer.stop()` now waits for in-flight exchanges. `upstreams=`
   overrides the `PANOPTES_UPSTREAM_*` variables. `db_path` now defaults to
   `None` (an in-memory proxy database) and is mutually exclusive with `db`.
+- Model-request events carry `declared_tools`, `system_prompt_sha256` and
+  `history_sha256` (hashes and names only, no prompt text).
+- `import panoptes` no longer loads the policy engine or PyYAML; the policy names
+  are still importable from `panoptes`. The package ships `py.typed`, and the
+  threaded server shared by the proxy and Hermes ingest is `panoptes._server`.
 - `docs/api.md`, the supported Python API.
 - `panoptes token issue --max-requests N` caps how many proxied requests a token
   may authorize. Each request presenting a live token spends one unit atomically,

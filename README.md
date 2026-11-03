@@ -39,16 +39,17 @@ operational weight of a distributed observability stack.
 
 ## Quick Start
 
-Install Panoptes as an isolated command-line application:
+Install Panoptes as an isolated command-line application. The proxy needs the
+`proxy` extra; the store and the CLI's query commands do not:
 
 ```bash
-pipx install panoptes-observe
+pipx install 'panoptes-observe[proxy]'
 ```
 
 Or use `uv`:
 
 ```bash
-uv tool install panoptes-observe
+uv tool install 'panoptes-observe[proxy]'
 ```
 
 The distribution is named `panoptes-observe`; the installed command remains
@@ -57,7 +58,7 @@ The distribution is named `panoptes-observe`; the installed command remains
 ```bash
 git clone https://github.com/miggy-code/Panoptes.git
 cd Panoptes
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev]"   # includes the proxy extra's httpx
 ```
 
 ### Capture model API traffic

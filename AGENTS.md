@@ -96,7 +96,7 @@ result. Install: `python -m panoptes.install_hermes_plugin`
 
 ```bash
 cd /path/to/Panoptes
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev]"   # includes the proxy extra's httpx
 python -m pytest -q
 ```
 

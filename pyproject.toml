@@ -9,7 +9,6 @@ description = "Adapter-based agent observability, local audit trails, and policy
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "httpx>=0.27,<1",
     "PyYAML>=6,<7",
 ]
 license = "Apache-2.0"
@@ -31,8 +30,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
+proxy = [
+    "httpx>=0.27,<1",
+]
 dev = [
     "pytest>=8,<9",
+    "httpx>=0.27,<1",
 ]
 release = [
     "build>=1.2,<2",
@@ -53,4 +56,4 @@ panoptes = "panoptes.cli:main"
 include = ["panoptes*"]
 
 [tool.setuptools.package-data]
-panoptes = ["default_policies/*.yaml"]
+panoptes = ["default_policies/*.yaml", "py.typed"]

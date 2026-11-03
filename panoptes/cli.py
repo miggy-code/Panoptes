@@ -829,7 +829,17 @@ def main(argv=None):
         args.policies_dir = DEFAULT_POLICIES_DIR
 
     if args.command == "proxy":
-        from panoptes.proxy import start_proxy
+        try:
+            from panoptes.proxy import start_proxy
+        except ModuleNotFoundError as exc:
+            if exc.name != "httpx":
+                raise
+            print(
+                "Error: the proxy needs httpx. Install it with: "
+                "pip install 'panoptes-observe[proxy]'",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
         pricing = None
         if getattr(args, "pricing", None):
