@@ -255,6 +255,13 @@ authenticated workload identities, and are removed before upstream forwarding.
 In credential-injection mode the session token supplies both values instead,
 and the headers are ignored.
 
+Every proxied exchange gets a `run_id` and a `correlation_id`. The correlation
+id is the client's `X-Panoptes-Correlation-Id` when it sends a valid one (a
+client assertion, not proof of anything) and otherwise the exchange's own id;
+`attributes.correlation_source` says which. Events also carry
+`attributes.exchange_id`, which is unique per request even when a client reuses
+its correlation id.
+
 ### Audit schema
 
 ```json
@@ -264,9 +271,12 @@ and the headers are ignored.
   "agent": {
     "type": "claude_code",
     "session_id": "abc123",
-    "run_id": "run456"
+    "run_id": "run456",
+    "parent_run_id": null
   },
   "event_type": "tool_call",
+  "correlation_id": "c0ffee",
+  "attributes": {"exchange_id": "…", "correlation_source": "proxy"},
   "action": {
     "tool_name": "terminal",
     "parameters": {"command": "kubectl get pods -n prod"},
@@ -287,6 +297,30 @@ and the headers are ignored.
   "cost": {"tokens_in": 800, "tokens_out": 150}
 }
 ```
+
+**Schema v5** (this release) opens the vocabulary and removes invented
+defaults:
+
+- `agent.type` and `user.auth_method` are any validated identifier. The adapters
+  Panoptes ships (`claude_code`, `codex`, `hermes`, …) are a list of known
+  names, not an enforced set.
+- `run_id` is optional and never invented by the store, and `agent.parent_run_id`
+  links a child agent to its parent. `session_id` is still required.
+- `user` is optional. There is **no default user**: an event without one stores
+  an empty `user`, where earlier versions filled in `local_user` and `cli`.
+- `correlation_id` is a first-class, indexed field, and `attributes` is an open,
+  size-bounded JSON object redacted like `context`.
+- Another producer names its events `<namespace>.<name>` (for example
+  `agentgate.allow`); the built-in event types stay a closed set.
+- An event that declares `context.schema_version` 1 to 4 keeps the rules of that
+  version, and v1–v4 databases migrate in place with their hash chains still
+  verifying.
+
+The Python API for writing, strict ingest, read-only reading, `iter_events` and
+the optional hash chain is in [docs/api.md](docs/api.md). By default a new
+database is hash-chained and an existing one keeps its mode; `AuditDB(path,
+chain=False)` creates one without a chain, which then verifies as `absent`,
+never as valid.
 
 Before an event reaches disk, Panoptes validates its identifiers, timestamps,
 outcomes, and costs; redacts common secret forms; and derives heuristic

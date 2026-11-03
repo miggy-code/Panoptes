@@ -40,7 +40,10 @@ log = AuditDB.open_readonly("~/.panoptes/audit.db")   # reads, changes nothing
   `correlation_id`, `user.id`, `user.auth_method`, `tool_name`, `call_id`,
   `event_id`) are non-empty strings of at most 256 characters with no control
   characters and no secret-shaped content. Otherwise `ValidationError` is
-  raised; an identifier is refused, never rewritten.
+  raised: these are refused, not rewritten. Other fields that name something,
+  notably `action.target` and `agent.version`, are **not** refused: a secret
+  inside them is redacted in place and the event is stored changed. Use
+  [strict ingest](#strict-ingest) to refuse that instead.
 - **`agent.type` and `user.auth_method` are open.** `KNOWN_AGENT_TYPES` lists
   the adapters Panoptes ships; it is informational and not enforced.
 - **Event types.** The built-in set is closed: `model_request`,
@@ -112,8 +115,14 @@ everything.
 `order` (`"rowid"` = the order events were written and chained, `"-rowid"`,
 `"timestamp"`, `"-timestamp"`) and `batch_size`. It reads in keyset-paginated
 batches, each its own short read, so it holds no transaction open and cannot
-block a writer. In ascending order an event appended during iteration is
-included, and no event is yielded twice.
+block a writer. No event is yielded twice.
+
+Only `"rowid"` order is safe against concurrent appends: an event appended
+during iteration always sorts after the cursor, so it is included. In
+`"timestamp"` order (either direction) an event inserted mid-iteration with a
+timestamp the cursor has already passed is **skipped**, and one inserted at or
+after the cursor is included. Iterate by `"rowid"` to read a log that is still
+being written.
 
 **Event dicts** from reads have the shape above plus `raw_request` and
 `raw_response`. For rows an older schema wrote, `correlation_id` is `None` and
@@ -121,13 +130,28 @@ included, and no event is yielded twice.
 
 ## Read-only open
 
-`AuditDB.open_readonly(path)` never creates a file, migrates a schema, starts or
-re-anchors a hash chain, changes file mode or writes. Any schema version up to
-the current one is readable as it stands; columns an older file lacks read as
-empty. It raises `FileNotFoundError` (missing path), `NotAnAuditDatabaseError`
-(a `ValueError`: not an initialized Panoptes log) or
-`UnsupportedSchemaVersionError` (written by a newer Panoptes). Inserting raises
-`sqlite3.OperationalError`.
+`AuditDB.open_readonly(path)` never modifies the database file, migrates a
+schema, starts or re-anchors a hash chain, or changes a file mode. Any schema
+version up to the current one is readable as it stands; columns an older file
+lacks read as empty.
+
+**It can create files beside the database.** SQLite needs `-wal` and `-shm`
+files to read a database in WAL mode (the mode Panoptes creates), and a
+read-only handle cannot remove them when it closes. After a read-only open of a
+cleanly closed database you may find an empty `audit.db-wal` and a
+`audit.db-shm` next to it. They hold no data and are safe to delete when no
+process has the database open; the next writer reuses and then removes them.
+Where the directory is not writable:
+
+- a database that already has its `-wal`/`-shm` files can still be read;
+- one that does not, raises `ReadOnlyMediaError` (a `RuntimeError`) saying so.
+  Copy the database, with any `-wal` file, to a writable directory.
+
+Other errors: `FileNotFoundError` (missing path), `NotAnAuditDatabaseError` (a
+`ValueError`: not an initialized Panoptes log, or not a database at all),
+`UnsupportedSchemaVersionError` (written by a newer Panoptes). Operational
+failures such as a locked file keep their own `sqlite3.OperationalError`.
+Inserting raises `sqlite3.OperationalError`.
 
 ## Hash chain
 
@@ -144,17 +168,36 @@ chain metadata was deleted is refused rather than re-anchored. An unchained
 database records that choice, so stripping a chain is distinguishable from
 never having one.
 
-`verify_chain()` always reports `result["chain"]`:
+`verify_chain()` always reports `result["chain"]`, and a read-only handle gives
+the same answer as a read-write one for the same file:
 
-- `"intact"`: verified end to end; `valid` is `True`.
-- `"broken"`: tampering or corruption; `valid` is `False`, with `error` and
-  `broken_event_id`.
-- `"absent"`: the database carries no chain, so nothing was verified; `valid`
-  is **always `False`**.
+| `chain` | `valid` | Meaning |
+|---|---|---|
+| `"intact"` | `True` | verified end to end |
+| `"broken"` | `False` | tampering or corruption, or a chain missing from a database that must have one: schema 4+ with no chain metadata, or a "no chain" marker beside a live chain. `error` and `broken_event_id` say where |
+| `"partial"` | `False` | the chain is sound but covers no event while events exist outside it (`event_count == 0` and `legacy_event_count > 0`). A chain stripped and restarted looks like this |
+| `"absent"` | `False` | the database carries no chain and is not expected to (created unchained, or older than the chain); nothing was verified |
 
-`get_chain_checkpoint()` and `verify_checkpoint(checkpoint)` are unchanged. The
-chain is local tamper evidence: a checkpoint stored outside the database is
-needed to detect a rewrite of the whole history.
+`valid` is never `True` for a log that was not actually verified. An empty
+chained database is `"intact"`. A chain covering some events beside older
+legacy ones is `"intact"` with `coverage: "partial"`, which is disclosed.
+
+`get_chain_checkpoint()` returns the chain head with `chain: "present"`, or
+`chain: "absent"` and `initialized: False` for an unchained database. It raises
+`ChainIntegrityError` for the same inconsistent states `verify_chain` calls
+`"broken"`. `verify_checkpoint(checkpoint)` is unchanged and ignores the extra
+key in a stored checkpoint.
+
+**What the chain does not protect against.** The chain, its metadata and the
+"created unchained" marker all live in the same SQLite file, so anyone who can
+write the file can delete the chain, null the hashes and add the marker (or
+re-chain the rewritten history). The result is detected when it leaves
+`event_count == 0` with events outside the chain (`"partial"`), but a
+well-formed rewrite of the whole history is not detectable from the file alone.
+To detect that, store a checkpoint (`get_chain_checkpoint()`: `head`,
+`event_count`, `anchor`) **outside the database**, in a store the writer cannot
+alter, and verify with `verify_checkpoint`. Do that periodically if the log is
+evidence.
 
 ## Pricing
 
@@ -221,4 +264,5 @@ applies the same rule to a dollar amount (positive, finite), and
 | `EventConflictError` | `event_id` reused for a different payload |
 | `ChainIntegrityError` | a chain is corrupt, stripped, or would be dropped |
 | `UnsupportedSchemaVersionError` | the log is from a newer Panoptes |
+| `ReadOnlyMediaError` | a WAL database cannot be read because its directory is not writable and it lacks `-wal`/`-shm` files |
 | `NotAnAuditDatabaseError` | the path is not an initialized Panoptes log |

@@ -5,8 +5,55 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Breaking
+
+- **Event schema v5.** A database migrates in place on its first writable open
+  (nullable columns only; every v1–v4 hash chain still verifies). Once
+  migrated, an older Panoptes refuses it. An event that declares
+  `context.schema_version` 1–4 keeps the rules of that version.
+  - A missing user is no longer filled in as `local_user` / `cli`. `user` is
+    optional and stored as `{}` when absent.
+  - `run_id` is optional and is no longer invented when absent (the proxy still
+    assigns one per exchange). `session_id` stays required.
+  - `agent.type` and `user.auth_method` are open validated identifiers. The
+    closed lists are now `KNOWN_AGENT_TYPES` (informational, not enforced) and
+    `LEGACY_AUTH_METHODS` (the v1–v4 rule). `ALLOWED_AGENT_TYPES` and
+    `ALLOWED_AUTH_METHODS` remain as deprecated aliases until the gateway
+    modules are removed.
+  - Custom events use a namespaced type `<namespace>.<name>`; the built-in
+    event types stay closed.
+- `AuditDB.query()` and `aggregate()` raise `ValueError` on an unknown filter
+  name. Before, a misspelled filter silently matched every event.
+- `verify_chain()` results carry `chain`: `intact`, `broken`, `partial` or
+  `absent`. A log with no hash chain is never `valid`. A chain that covers no
+  event while events exist outside it (`event_count 0`, `legacy_event_count >
+  0`), such as a legacy database that was just opened and never written to, is
+  now `partial` and not valid; it was `valid` before. A schema 4+ database
+  without chain metadata is `broken`, not "not initialized".
+- `AuditDB(path, read_only=True)` now opens any schema version up to the current
+  one instead of refusing a database that needs migrating.
+
 ### Added
 
+- `AuditDB.open_readonly(path)`: reads a log without migrating, re-anchoring,
+  re-permissioning or writing the database. It can leave empty `-wal`/`-shm`
+  files beside a WAL database; a WAL database in an unwritable directory raises
+  `ReadOnlyMediaError`.
+- Strict ingest: `insert_event(..., strict=True, strict_paths=...)` raises
+  `IdentifierRewriteError` before any write when redaction would change an
+  identifier field, instead of storing it altered.
+- `AuditDB.iter_events(...)`: streams every matching event in write or timestamp
+  order with keyset paging and no row cap.
+- Optional hash chain: `AuditDB(path, chain=None | True | False)`. An unchained
+  database verifies as `absent`; a chained one refuses `chain=False`.
+- Event fields `attributes` (open, size-bounded JSON), `agent.parent_run_id`
+  and a first-class indexed `correlation_id`. `query`, `iter_events` and
+  `aggregate` filter on `parent_run_id` and `correlation_id`.
+- The proxy gives every exchange a `correlation_id` (the client's
+  `X-Panoptes-Correlation-Id`, else the exchange id) and records
+  `attributes.correlation_source` and `attributes.exchange_id` on its events.
+- `docs/api.md`, the supported Python API, and `docs/hooks.md`, a design for
+  proxy hooks that is **not implemented yet**.
 - `panoptes token issue --max-requests N` caps how many proxied requests a token
   may authorize. Each request presenting a live token spends one unit atomically,
   including requests the provider later rejects. Once spent, the proxy answers
