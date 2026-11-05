@@ -184,6 +184,41 @@ CACHE_RATES = {
 }
 
 
+@pytest.mark.parametrize(
+    "split",
+    [
+        {"ephemeral_5m_input_tokens": "bad", "ephemeral_1h_input_tokens": None},
+        {"ephemeral_5m_input_tokens": "4", "ephemeral_1h_input_tokens": "0"},
+        {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": -1},
+        {"ephemeral_5m_input_tokens": True, "ephemeral_1h_input_tokens": 0},
+        "4/0",
+    ],
+)
+def test_an_unreadable_reply_split_leaves_the_response_unpriced(split):
+    """Extraction drops unreadable counts; the writes must not then look unsplit and be
+    priced at the 5-minute rate."""
+    from panoptes.providers.anthropic import AnthropicProvider
+
+    usage = AnthropicProvider().extract_usage({"usage": {
+        "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 4,
+        "cache_creation": split,
+    }})
+    assert usage.get("cache_creation_split_invalid") is True
+    assert PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) is None
+
+
+def test_a_readable_reply_split_is_priced():
+    from panoptes.providers.anthropic import AnthropicProvider
+
+    usage = AnthropicProvider().extract_usage({"usage": {
+        "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 4,
+        "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 0},
+    }})
+    assert "cache_creation_split_invalid" not in usage
+    # 1 uncached input + 4 five-minute writes at 1.25 + 1 output at 5.
+    assert PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) == 11_000_000
+
+
 def test_cache_writes_are_priced_at_their_own_rates():
     table = PricingTable.from_dict(CACHE_RATES)
     # 3 uncached + 10 read + 4 written (1 of them 1-hour) = 17 prompt tokens.

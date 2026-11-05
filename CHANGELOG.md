@@ -22,7 +22,8 @@ All notable changes to Panoptes are recorded here. Releases follow
 - `cost.cache_creation_5m_input_tokens` and `cost.cache_creation_1h_input_tokens`:
   the TTL split of Anthropic cache writes (`usage.cache_creation`), from both
   buffered and streamed replies, with matching `AuditDB.aggregate` metrics. A split
-  that is partial or does not sum to `cache_creation_input_tokens` is unpriced.
+  that is partial, unreadable (`cost.cache_creation_split_invalid`) or does not sum
+  to `cache_creation_input_tokens` is unpriced.
 
 ### Fixed
 

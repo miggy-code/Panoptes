@@ -285,6 +285,9 @@ is `None` (unpriced) when:
   `cache_creation_5m_input_tokens` / `cache_creation_1h_input_tokens`), malformed,
   or does not sum to `cache_creation_input_tokens`, including a nonzero split with
   zero or absent writes;
+- the provider reported a TTL split Panoptes could not read (a count that is not a
+  non-negative integer, or a `cache_creation` that is not an object): its counts are
+  dropped and `cost.cache_creation_split_invalid` is `true`;
 - the response reports cache writes and the model has no rate for them:
   5-minute (or untyped) writes without `cache_write_per_million`, or 1-hour
   writes without `cache_write_1h_per_million`;

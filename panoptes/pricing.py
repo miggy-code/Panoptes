@@ -113,7 +113,7 @@ class PricingTable:
         if None in (cached, tool_prompt, writes) or cached + writes > tokens_in:
             return None
         split = _write_split(cost, writes)
-        if split is _INVALID:
+        if split is _INVALID or cost.get("cache_creation_split_invalid") is True:
             return None
         # A rate in USD per million tokens times a token count is exactly micro-dollars.
         micros = (
