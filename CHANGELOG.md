@@ -5,6 +5,12 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-04
+
+### Fixed
+
+- Capture per-message hashes for OpenAI chat requests before raw payload truncation, so Hermes request attribution can reconcile long requests. Hash lists are omitted for requests with over 1,024 messages.
+
 ## [0.2.0] - 2026-11-03
 
 ### Breaking
