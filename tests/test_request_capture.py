@@ -126,14 +126,13 @@ def test_the_event_carries_the_fields_and_no_text_in_them():
 
 
 def test_chat_message_hashes_survive_raw_request_truncation():
-    from panoptes.hermes_hooks import request_fingerprint
     messages = [{"role": "user", "content": "hello world " * 6000}]
     events, _ = AuditEventWriter(db=None).build_request_events(
         path="/v1/chat/completions", method="POST", req_headers={},
         req_body={"model": "m", "messages": messages})
     request = next(e for e in events if e["event_type"] == "model_request")
     assert request["raw_request"].endswith("...[truncated]")
-    assert request["action"]["message_hashes"] == request_fingerprint({"request_messages": messages})["messages"]
+    assert request["action"]["message_hashes"] == ["b886fe52ddceb949"]
     from panoptes.schema import normalize_event
     assert normalize_event(request)["action"]["message_hashes"] == request["action"]["message_hashes"]
 

@@ -50,6 +50,9 @@ jobs:
           /tmp/panoptes-release-wheel/bin/panoptes --version
           /tmp/panoptes-release-wheel/bin/python -c "from importlib.metadata import version; assert version('panoptes-observe')"
           /tmp/panoptes-release-wheel/bin/python -c "from importlib.resources import files; assert files('panoptes').joinpath('py.typed').is_file()"
+          /tmp/panoptes-release-wheel/bin/pip install 'pytest>=8,<9' 'httpx>=0.27,<1'
+          cp "$GITHUB_WORKSPACE/tests/test_request_capture.py" /tmp/test_panoptes_request_capture.py
+          /tmp/panoptes-release-wheel/bin/python -m pytest -q /tmp/test_panoptes_request_capture.py
 
       - name: Upload distributions
         uses: actions/upload-artifact@v5
