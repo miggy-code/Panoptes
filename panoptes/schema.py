@@ -853,7 +853,8 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     if isinstance(cost, dict):
         for field in ("tokens_in", "tokens_out", "estimated_usd", "reasoning_tokens",
                       "cached_input_tokens", "cache_creation_input_tokens",
-                      "cache_creation_1h_input_tokens", "tool_prompt_tokens"):
+                      "cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens",
+                      "tool_prompt_tokens"):
             value = cost.get(field)
             if value is None:
                 continue

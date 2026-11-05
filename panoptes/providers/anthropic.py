@@ -304,6 +304,8 @@ class AnthropicProvider(Provider):
                 "cache_creation_input_tokens": "cache_creation_input_tokens",
             }),
             **_optional_usage_counts(usage.get("cache_creation") if isinstance(usage, dict) else None, {
+                # Both halves of the TTL split are kept so pricing can check they sum to the total.
+                "ephemeral_5m_input_tokens": "cache_creation_5m_input_tokens",
                 "ephemeral_1h_input_tokens": "cache_creation_1h_input_tokens",
             }),
             **_optional_usage_counts(usage.get("output_tokens_details") if isinstance(usage, dict) else None, {

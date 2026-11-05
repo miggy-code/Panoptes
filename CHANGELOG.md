@@ -19,9 +19,16 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ### Added
 
-- `cost.cache_creation_1h_input_tokens`: the 1-hour TTL share of Anthropic cache
-  writes (`usage.cache_creation.ephemeral_1h_input_tokens`), from both buffered
-  and streamed replies, with matching `AuditDB.aggregate` metrics.
+- `cost.cache_creation_5m_input_tokens` and `cost.cache_creation_1h_input_tokens`:
+  the TTL split of Anthropic cache writes (`usage.cache_creation`), from both
+  buffered and streamed replies, with matching `AuditDB.aggregate` metrics. A split
+  that is partial or does not sum to `cache_creation_input_tokens` is unpriced.
+
+### Fixed
+
+- Pricing arithmetic is exact. Decimal's default 28-digit precision could round a
+  rate just above a whole micro-dollar down before the final ceiling (one token at
+  `1.0000000000000000000000000001` USD per million billed 1 micro-dollar, not 2).
 
 ## [0.2.0] - 2026-11-03
 

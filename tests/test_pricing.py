@@ -188,15 +188,16 @@ def test_cache_writes_are_priced_at_their_own_rates():
     table = PricingTable.from_dict(CACHE_RATES)
     # 3 uncached + 10 read + 4 written (1 of them 1-hour) = 17 prompt tokens.
     cost = {"tokens_in": 17, "tokens_out": 2, "cached_input_tokens": 10,
-            "cache_creation_input_tokens": 4, "cache_creation_1h_input_tokens": 1}
+            "cache_creation_input_tokens": 4, "cache_creation_5m_input_tokens": 3,
+            "cache_creation_1h_input_tokens": 1}
     # 3*1 + 10*0.1 + 3*1.25 + 1*2 + 2*5 = 19.75
     assert table.cost_micros("claude-test", cost) == 19_750_000
     # All writes 5-minute, reported with a zero 1-hour share.
     assert table.cost_micros(
-        "claude-5m-only", {**cost, "cache_creation_1h_input_tokens": 0}
+        "claude-5m-only", {**cost, "cache_creation_5m_input_tokens": 4, "cache_creation_1h_input_tokens": 0}
     ) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
     # A provider without a TTL breakdown (OpenAI-style cache_write_tokens).
-    no_split = {k: v for k, v in cost.items() if k != "cache_creation_1h_input_tokens"}
+    no_split = {k: v for k, v in cost.items() if not k.startswith(("cache_creation_5m", "cache_creation_1h"))}
     assert table.cost_micros("claude-5m-only", no_split) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
 
 
@@ -206,21 +207,35 @@ def test_cache_writes_are_priced_at_their_own_rates():
         # Cache writes and no write rate: never priced at the input rate.
         ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
         ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                                  "cache_creation_1h_input_tokens": 0}),
+                                  "cache_creation_5m_input_tokens": 4, "cache_creation_1h_input_tokens": 0}),
         ("gpt-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
         # 1-hour writes and no 1-hour rate.
         ("claude-5m-only", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                            "cache_creation_1h_input_tokens": 1}),
+                            "cache_creation_5m_input_tokens": 3, "cache_creation_1h_input_tokens": 1}),
         # A 1-hour rate exists but the response does not say which writes were 1-hour.
         ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
         # Inconsistent counts.
         ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cached_input_tokens": 3,
-                         "cache_creation_input_tokens": 3, "cache_creation_1h_input_tokens": 0}),
+                         "cache_creation_input_tokens": 3, "cache_creation_5m_input_tokens": 3,
+                         "cache_creation_1h_input_tokens": 0}),
         ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
                          "cache_creation_1h_input_tokens": 3}),
         ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": -1}),
         ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
-                         "cache_creation_1h_input_tokens": True}),
+                         "cache_creation_5m_input_tokens": 2, "cache_creation_1h_input_tokens": True}),
+        # A TTL split that does not sum to the total writes.
+        ("claude-test", {"tokens_in": 10, "tokens_out": 1, "cache_creation_input_tokens": 10,
+                         "cache_creation_5m_input_tokens": 9, "cache_creation_1h_input_tokens": 0}),
+        # A nonzero split with zero or absent total writes.
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 0,
+                         "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 1}),
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1,
+                         "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 1}),
+        # A partial split (one half missing).
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
+                         "cache_creation_1h_input_tokens": 1}),
+        ("claude-5m-only", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
+                            "cache_creation_5m_input_tokens": 4}),
     ],
 )
 def test_cache_writes_without_a_matching_rate_are_unpriced(model, cost):
@@ -361,6 +376,7 @@ def test_anthropic_cache_reads_and_writes_are_priced(anthropic_proxy, stream):
     assert cost["tokens_in"] == 17
     assert cost["cached_input_tokens"] == 10
     assert cost["cache_creation_input_tokens"] == 4
+    assert cost["cache_creation_5m_input_tokens"] == 3
     assert cost["cache_creation_1h_input_tokens"] == 1
     assert cost["tokens_out"] == 2
     # 3*1 + 10*0.1 + 3*1.25 + 1*2 + 2*5 = 19.75; at the input rate it was 18.0.
@@ -396,3 +412,18 @@ def test_openai_cached_tokens_price_unchanged(priced_proxy):
     assert usage == {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
     # 2 uncached * $1 + 2 cached * $0.5 + 1 output * $2, as before this change.
     assert PricingTable.from_dict(RATES).cost_micros("gpt-test", usage) == 5_000_000
+
+
+def test_pricing_is_exact_and_never_rounds_down_before_the_ceiling():
+    # 1 token at just over $1 per million is just over 1 micro-dollar: it must bill 2, not 1.
+    rate = "1.0000000000000000000000000001"
+    table = PricingTable.from_dict({"version": "exact-1", "source": "unit test", "currency": "USD", "models": {
+        "m": {"input_per_million": rate, "cached_input_per_million": rate, "output_per_million": rate,
+              "cache_write_per_million": rate, "cache_write_1h_per_million": rate}}})
+    assert table.cost_micros("m", {"tokens_in": 1, "tokens_out": 0}) == 2
+    assert table.cost_micros("m", {"tokens_in": 1, "tokens_out": 0, "cache_creation_input_tokens": 1,
+                                   "cache_creation_5m_input_tokens": 1, "cache_creation_1h_input_tokens": 0}) == 2
+    # Exact whole micro-dollars stay exact.
+    whole = PricingTable.from_dict({"version": "exact-2", "source": "unit test", "currency": "USD", "models": {
+        "m": {"input_per_million": "3", "cached_input_per_million": "0.3", "output_per_million": "15"}}})
+    assert whole.cost_micros("m", {"tokens_in": 10, "tokens_out": 2, "cached_input_tokens": 10}) == 3 + 30

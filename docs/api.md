@@ -250,7 +250,8 @@ Two rates are optional and, when present, follow the same rules:
   (`cost.cache_creation_input_tokens`). For Anthropic it is the 5-minute TTL
   write rate (1.25× input at the time of writing).
 - `cache_write_1h_per_million` prices the part of those writes the provider
-  reports as 1-hour TTL (`cost.cache_creation_1h_input_tokens`; Anthropic bills
+  reports as 1-hour TTL (`cost.cache_creation_1h_input_tokens`, with the 5-minute
+  part in `cost.cache_creation_5m_input_tokens`; Anthropic bills
   it at 2× input at the time of writing).
 
 Rates may be JSON numbers or strings and are read as exact decimals. A
@@ -262,6 +263,7 @@ malformed table raises `PricingError`. Models are matched by exact name.
 ```
 writes    = cache_creation_input_tokens
 writes_1h = cache_creation_1h_input_tokens      (part of writes)
+writes_5m = cache_creation_5m_input_tokens      (the rest; writes_5m + writes_1h = writes)
 billed_in = tokens_in - cached_input_tokens - writes + tool_prompt_tokens
 usd = (billed_in * input + cached_input_tokens * cached_input
        + (writes - writes_1h) * cache_write + writes_1h * cache_write_1h
@@ -278,8 +280,11 @@ is `None` (unpriced) when:
 
 - the model is not in the table, or `tokens_in` or `tokens_out` is missing or
   invalid;
-- `cached_input_tokens + cache_creation_input_tokens > tokens_in`, or
-  `cache_creation_1h_input_tokens > cache_creation_input_tokens`;
+- `cached_input_tokens + cache_creation_input_tokens > tokens_in`;
+- a TTL split is reported but is partial (only one of
+  `cache_creation_5m_input_tokens` / `cache_creation_1h_input_tokens`), malformed,
+  or does not sum to `cache_creation_input_tokens`, including a nonzero split with
+  zero or absent writes;
 - the response reports cache writes and the model has no rate for them:
   5-minute (or untyped) writes without `cache_write_per_million`, or 1-hour
   writes without `cache_write_1h_per_million`;
@@ -291,7 +296,8 @@ Panoptes never guesses a rate: cache writes are not priced at the input rate.
 A table without the optional rates prices every response without cache writes
 exactly as before.
 
-**Rounding.** The whole response is priced exactly in decimal, then rounded
+**Rounding.** The whole response is priced exactly (rates are converted to exact
+fractions, so no intermediate step rounds), then rounded
 **up** once to a whole micro-dollar (`ROUND_CEILING`): the figure never
 under-counts, and any response whose exact price is above zero costs at least
 one micro-dollar. `cost.estimated_usd` is that integer divided by
