@@ -3,6 +3,7 @@
 import http.server
 import json
 import threading
+import time
 
 import httpx
 import pytest
@@ -150,3 +151,248 @@ def test_pricing_file_loads_from_disk(tmp_path):
     assert PricingTable.load(str(path)).version == "test-rates-1"
     with pytest.raises(PricingError):
         PricingTable.load(str(tmp_path / "missing.json"))
+
+
+# --- Prompt-cache writes -----------------------------------------------------
+
+# $1 per uncached input token, $0.10 per cache read, $1.25 per 5-minute cache
+# write, $2 per 1-hour cache write, $5 per output token.
+CACHE_RATES = {
+    "version": "cache-rates-1",
+    "source": "unit test",
+    "currency": "USD",
+    "models": {
+        "claude-test": {
+            "input_per_million": 1_000_000,
+            "cached_input_per_million": 100_000,
+            "cache_write_per_million": 1_250_000,
+            "cache_write_1h_per_million": 2_000_000,
+            "output_per_million": 5_000_000,
+        },
+        "claude-5m-only": {
+            "input_per_million": 1_000_000,
+            "cached_input_per_million": 100_000,
+            "cache_write_per_million": 1_250_000,
+            "output_per_million": 5_000_000,
+        },
+        "claude-no-write-rate": {
+            "input_per_million": 1_000_000,
+            "cached_input_per_million": 100_000,
+            "output_per_million": 5_000_000,
+        },
+    },
+}
+
+
+def test_cache_writes_are_priced_at_their_own_rates():
+    table = PricingTable.from_dict(CACHE_RATES)
+    # 3 uncached + 10 read + 4 written (1 of them 1-hour) = 17 prompt tokens.
+    cost = {"tokens_in": 17, "tokens_out": 2, "cached_input_tokens": 10,
+            "cache_creation_input_tokens": 4, "cache_creation_1h_input_tokens": 1}
+    # 3*1 + 10*0.1 + 3*1.25 + 1*2 + 2*5 = 19.75
+    assert table.cost_micros("claude-test", cost) == 19_750_000
+    # All writes 5-minute, reported with a zero 1-hour share.
+    assert table.cost_micros(
+        "claude-5m-only", {**cost, "cache_creation_1h_input_tokens": 0}
+    ) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+    # A provider without a TTL breakdown (OpenAI-style cache_write_tokens).
+    no_split = {k: v for k, v in cost.items() if k != "cache_creation_1h_input_tokens"}
+    assert table.cost_micros("claude-5m-only", no_split) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+
+
+@pytest.mark.parametrize(
+    "model, cost",
+    [
+        # Cache writes and no write rate: never priced at the input rate.
+        ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
+        ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
+                                  "cache_creation_1h_input_tokens": 0}),
+        ("gpt-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
+        # 1-hour writes and no 1-hour rate.
+        ("claude-5m-only", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
+                            "cache_creation_1h_input_tokens": 1}),
+        # A 1-hour rate exists but the response does not say which writes were 1-hour.
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
+        # Inconsistent counts.
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cached_input_tokens": 3,
+                         "cache_creation_input_tokens": 3, "cache_creation_1h_input_tokens": 0}),
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
+                         "cache_creation_1h_input_tokens": 3}),
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": -1}),
+        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
+                         "cache_creation_1h_input_tokens": True}),
+    ],
+)
+def test_cache_writes_without_a_matching_rate_are_unpriced(model, cost):
+    table = PricingTable.from_dict({**CACHE_RATES, "models": {**CACHE_RATES["models"], **RATES["models"]}})
+    assert table.cost_micros(model, cost) is None
+
+
+def test_responses_without_cache_writes_price_as_before():
+    # An old table (no optional rates) still loads and prices reads and output.
+    table = PricingTable.from_dict(RATES)
+    assert "cache_write_per_million" not in table.models["gpt-test"]
+    assert table.cost_micros(
+        "gpt-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
+    ) == 5_000_000
+    assert table.cost_micros(
+        "gpt-test", {"tokens_in": 4, "tokens_out": 1, "cache_creation_input_tokens": 0}
+    ) == 6_000_000
+    # A write rate on the table changes nothing for a response without writes.
+    cache_table = PricingTable.from_dict(CACHE_RATES)
+    assert cache_table.cost_micros(
+        "claude-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
+    ) == 2_000_000 + 200_000 + 5_000_000
+
+
+@pytest.mark.parametrize("field", ["cache_write_per_million", "cache_write_1h_per_million"])
+@pytest.mark.parametrize("value", [-1, "nan", "abc", None])
+def test_malformed_optional_rates_are_rejected(field, value):
+    rate = {**RATES["models"]["gpt-test"], field: value}
+    with pytest.raises(PricingError):
+        PricingTable.from_dict({**RATES, "models": {"m": rate}})
+
+
+ANTHROPIC_BODY = {
+    "model": "claude-test",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hello"}],
+}
+ANTHROPIC_USAGE = {
+    "input_tokens": 3,
+    "cache_read_input_tokens": 10,
+    "cache_creation_input_tokens": 4,
+    "cache_creation": {"ephemeral_5m_input_tokens": 3, "ephemeral_1h_input_tokens": 1},
+    "output_tokens": 2,
+}
+ANTHROPIC_REPLY = {
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-test",
+    "content": [{"type": "text", "text": "hi"}],
+    "stop_reason": "end_turn",
+    "stop_sequence": None,
+    "usage": ANTHROPIC_USAGE,
+}
+
+
+def _sse(*events):
+    return b"".join(
+        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events
+    )
+
+
+# Anthropic streams report the prompt counts on message_start; message_delta
+# carries the final (cumulative) output count.
+ANTHROPIC_STREAM = _sse(
+    {"type": "message_start", "message": {
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+        "content": [], "stop_reason": None,
+        "usage": {**ANTHROPIC_USAGE, "output_tokens": 1}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+     "usage": {"output_tokens": 2}},
+    {"type": "message_stop"},
+)
+
+
+@pytest.fixture
+def anthropic_proxy(tmp_path, monkeypatch):
+    replies = {}
+
+    class _Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            content_type, payload = replies["stream" if body.get("stream") else "json"]
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Upstream)
+    threading.Thread(
+        target=upstream.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    ).start()
+    monkeypatch.setenv(
+        "PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{upstream.server_address[1]}"
+    )
+    server = ProxyServer(
+        port=0,
+        db_path=str(tmp_path / "audit.db"),
+        pricing=PricingTable.from_dict(CACHE_RATES),
+    )
+    port = server.start()
+    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=15)
+    yield server, client, replies
+    client.close()
+    server.stop()
+    upstream.shutdown()
+    upstream.server_close()
+
+
+def _model_response(server):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        found = [e for e in server.events if e["event_type"] == "model_response"]
+        if found:
+            return found[0]
+        time.sleep(0.02)
+    raise AssertionError("no model_response event was recorded")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_cache_reads_and_writes_are_priced(anthropic_proxy, stream):
+    server, client, replies = anthropic_proxy
+    replies["json"] = ("application/json", json.dumps(ANTHROPIC_REPLY).encode())
+    replies["stream"] = ("text/event-stream", ANTHROPIC_STREAM)
+
+    response = client.post("/v1/messages", json={**ANTHROPIC_BODY, "stream": stream})
+    assert response.status_code == 200
+
+    cost = _model_response(server)["cost"]
+    # tokens_in is the whole prompt: uncached + reads + writes, each counted once.
+    assert cost["tokens_in"] == 17
+    assert cost["cached_input_tokens"] == 10
+    assert cost["cache_creation_input_tokens"] == 4
+    assert cost["cache_creation_1h_input_tokens"] == 1
+    assert cost["tokens_out"] == 2
+    # 3*1 + 10*0.1 + 3*1.25 + 1*2 + 2*5 = 19.75; at the input rate it was 18.0.
+    assert cost["estimated_usd"] == 19.75
+    assert cost["pricing_version"] == "cache-rates-1"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_anthropic_cache_writes_without_a_rate_are_unpriced(anthropic_proxy, stream):
+    server, client, replies = anthropic_proxy
+    replies["json"] = ("application/json", json.dumps(ANTHROPIC_REPLY).encode())
+    replies["stream"] = ("text/event-stream", ANTHROPIC_STREAM)
+
+    response = client.post(
+        "/v1/messages",
+        json={**ANTHROPIC_BODY, "model": "claude-no-write-rate", "stream": stream},
+    )
+    assert response.status_code == 200
+    cost = _model_response(server)["cost"]
+    assert cost["cache_creation_input_tokens"] == 4
+    assert cost.get("estimated_usd") is None
+    assert "pricing_version" not in cost
+
+
+def test_openai_cached_tokens_price_unchanged(priced_proxy):
+    server, client = priced_proxy
+    from panoptes.providers.openai import OpenAIProvider
+
+    usage = OpenAIProvider().extract_usage({"usage": {
+        "prompt_tokens": 4, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": 2},
+    }})
+    assert usage == {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
+    # 2 uncached * $1 + 2 cached * $0.5 + 1 output * $2, as before this change.
+    assert PricingTable.from_dict(RATES).cost_micros("gpt-test", usage) == 5_000_000

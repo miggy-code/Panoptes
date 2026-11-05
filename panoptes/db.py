@@ -1923,6 +1923,8 @@ class AuditDB:
         "cached_input_tokens_reported": "COUNT(json_extract(cost, '$.cached_input_tokens'))",
         "cache_creation_input_tokens": "SUM(json_extract(cost, '$.cache_creation_input_tokens'))",
         "cache_creation_input_tokens_reported": "COUNT(json_extract(cost, '$.cache_creation_input_tokens'))",
+        "cache_creation_1h_input_tokens": "SUM(json_extract(cost, '$.cache_creation_1h_input_tokens'))",
+        "cache_creation_1h_input_tokens_reported": "COUNT(json_extract(cost, '$.cache_creation_1h_input_tokens'))",
         "tool_prompt_tokens": "SUM(json_extract(cost, '$.tool_prompt_tokens'))",
         "tool_prompt_tokens_reported": "COUNT(json_extract(cost, '$.tool_prompt_tokens'))",
         "error_count": "COALESCE(SUM(json_extract(outcome, '$.status') = 'error'), 0)",

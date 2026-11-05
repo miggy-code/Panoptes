@@ -26,7 +26,11 @@ _INPUT_USAGE_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
-_USAGE_FIELDS = _INPUT_USAGE_FIELDS + ("output_tokens", "output_tokens_details")
+# ``cache_creation`` splits cache_creation_input_tokens by TTL
+# (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens), which bill differently.
+_USAGE_FIELDS = _INPUT_USAGE_FIELDS + (
+    "cache_creation", "output_tokens", "output_tokens_details",
+)
 
 
 _SERVER_RESULT_TYPES = frozenset({
@@ -298,6 +302,9 @@ class AnthropicProvider(Provider):
             **_optional_usage_counts(usage, {
                 "cache_read_input_tokens": "cached_input_tokens",
                 "cache_creation_input_tokens": "cache_creation_input_tokens",
+            }),
+            **_optional_usage_counts(usage.get("cache_creation") if isinstance(usage, dict) else None, {
+                "ephemeral_1h_input_tokens": "cache_creation_1h_input_tokens",
             }),
             **_optional_usage_counts(usage.get("output_tokens_details") if isinstance(usage, dict) else None, {
                 "thinking_tokens": "reasoning_tokens",

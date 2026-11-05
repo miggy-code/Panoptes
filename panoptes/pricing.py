@@ -15,6 +15,9 @@ from typing import Any
 
 MICROS_PER_USD = 1_000_000
 RATE_FIELDS = ("input_per_million", "cached_input_per_million", "output_per_million")
+# Optional rates. A table without them still loads; a response that reports the
+# tokens they price is then unpriced rather than billed at a guessed rate.
+OPTIONAL_RATE_FIELDS = ("cache_write_per_million", "cache_write_1h_per_million")
 
 
 class PricingError(ValueError):
@@ -68,7 +71,9 @@ class PricingTable:
             if not isinstance(rate, dict):
                 raise PricingError(f"rate for {name} must be an object")
             parsed = {}
-            for field in RATE_FIELDS:
+            for field in RATE_FIELDS + OPTIONAL_RATE_FIELDS:
+                if field in OPTIONAL_RATE_FIELDS and field not in rate:
+                    continue
                 try:
                     value = Decimal(str(rate[field]))
                 except (KeyError, InvalidOperation):
@@ -84,21 +89,50 @@ class PricingTable:
     def cost_micros(self, model: str | None, cost: dict) -> int | None:
         """Price one response in micro-dollars, or None when it cannot be priced exactly.
 
-        Input is billed as ``tokens_in - cached + tool_prompt`` at the input rate, cached
-        tokens at the cached rate, and output (which already includes reasoning) at the
-        output rate. Absent optional counts are zero, which never under-counts.
+        ``tokens_in`` is the whole prompt: cache reads (``cached_input_tokens``) and
+        cache writes (``cache_creation_input_tokens``) are parts of it. Cache reads are
+        billed at the cached rate; cache writes at ``cache_write_per_million``, except
+        the ``cache_creation_1h_input_tokens`` part at ``cache_write_1h_per_million``;
+        the rest of the prompt plus ``tool_prompt_tokens`` at the input rate; output
+        (which already includes reasoning) at the output rate. Absent read and tool
+        counts are zero, which never under-counts. A response that reports cache
+        writes the table has no rate for is unpriced: Panoptes never guesses a rate.
         """
         rate = self.models.get(model or "")
         tokens_in, tokens_out = cost.get("tokens_in"), cost.get("tokens_out")
         if rate is None or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (tokens_in, tokens_out)):
             return None
         cached, tool_prompt = _count(cost, "cached_input_tokens"), _count(cost, "tool_prompt_tokens")
-        if cached is None or tool_prompt is None or cached > tokens_in:
+        writes = _count(cost, "cache_creation_input_tokens")
+        if None in (cached, tool_prompt, writes) or cached + writes > tokens_in:
             return None
-        billed_in = tokens_in - cached + tool_prompt
         usd = (
-            Decimal(billed_in) * rate["input_per_million"]
+            Decimal(tokens_in - cached - writes + tool_prompt) * rate["input_per_million"]
             + Decimal(cached) * rate["cached_input_per_million"]
             + Decimal(tokens_out) * rate["output_per_million"]
-        ) / Decimal(MICROS_PER_USD)
+        )
+        if writes:
+            write_cost = _cache_write_cost(rate, writes, cost)
+            if write_cost is None:
+                return None
+            usd += write_cost
+        usd /= Decimal(MICROS_PER_USD)
         return int((usd * MICROS_PER_USD).to_integral_value(rounding=ROUND_CEILING))
+
+
+def _cache_write_cost(rate: dict[str, Decimal], writes: int, cost: dict) -> Decimal | None:
+    """Cost of ``writes`` cache-write tokens in USD per million, or None when unknown."""
+    write_rate = rate.get("cache_write_per_million")
+    hour_rate = rate.get("cache_write_1h_per_million")
+    if cost.get("cache_creation_1h_input_tokens") is None:
+        # No TTL breakdown. With a separate 1-hour rate on the table the split
+        # changes the price and is unknown, so the response stays unpriced.
+        if write_rate is None or hour_rate is not None:
+            return None
+        return Decimal(writes) * write_rate
+    hour = _count(cost, "cache_creation_1h_input_tokens")
+    if hour is None or hour > writes:
+        return None
+    if (hour < writes and write_rate is None) or (hour and hour_rate is None):
+        return None
+    return Decimal(writes - hour) * (write_rate or 0) + Decimal(hour) * (hour_rate or 0)

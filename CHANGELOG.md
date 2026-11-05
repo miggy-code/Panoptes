@@ -5,6 +5,24 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Breaking
+
+- **Prompt-cache writes are priced at their own rate, or not at all.** A
+  response reporting `cost.cache_creation_input_tokens` was priced with those
+  tokens at the input rate, under-counting Anthropic cache writes (1.25× input
+  for the 5-minute TTL, 2× for the 1-hour TTL). Rate tables gain two optional
+  fields, `cache_write_per_million` and `cache_write_1h_per_million`. A response
+  with cache writes is unpriced when its model has no matching rate, so an
+  existing table now leaves such responses unpriced until the rate is added.
+  Responses without cache writes price exactly as before, and existing tables
+  still load.
+
+### Added
+
+- `cost.cache_creation_1h_input_tokens`: the 1-hour TTL share of Anthropic cache
+  writes (`usage.cache_creation.ephemeral_1h_input_tokens`), from both buffered
+  and streamed replies, with matching `AuditDB.aggregate` metrics.
+
 ## [0.2.0] - 2026-11-03
 
 ### Breaking
