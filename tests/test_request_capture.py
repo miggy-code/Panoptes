@@ -123,3 +123,23 @@ def test_the_event_carries_the_fields_and_no_text_in_them():
     derived = json.dumps({k: action[k] for k in (
         "system_prompt_sha256", "history_sha256", "declared_tools")})
     assert SECRET_TEXT not in derived and TURN_TEXT not in derived
+
+
+def test_chat_message_hashes_survive_raw_request_truncation():
+    messages = [{"role": "user", "content": "hello world " * 6000}]
+    events, _ = AuditEventWriter(db=None).build_request_events(
+        path="/v1/chat/completions", method="POST", req_headers={},
+        req_body={"model": "m", "messages": messages})
+    request = next(e for e in events if e["event_type"] == "model_request")
+    assert request["raw_request"].endswith("...[truncated]")
+    assert request["action"]["message_hashes"] == ["b886fe52ddceb949"]
+    from panoptes.schema import normalize_event
+    assert normalize_event(request)["action"]["message_hashes"] == request["action"]["message_hashes"]
+
+
+def test_chat_message_hashes_are_bounded():
+    messages = [{"role": "user", "content": "hello"}] * 1025
+    events, _ = AuditEventWriter(db=None).build_request_events(
+        path="/v1/chat/completions", method="POST", req_headers={},
+        req_body={"model": "m", "messages": messages})
+    assert "message_hashes" not in events[0]["action"]

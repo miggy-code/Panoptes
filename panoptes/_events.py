@@ -14,6 +14,7 @@ from typing import Any
 import panoptes.providers as _providers
 from panoptes.capture import PROXY_CAPABILITIES
 from panoptes.hooks import Identity
+from panoptes.hermes_hooks import request_fingerprint as hermes_request_fingerprint
 from panoptes.providers.base import (
     SSEParseError,
     _parse_sse_events,
@@ -489,6 +490,11 @@ class AuditEventWriter:
             **requested_tools,
             **provider.request_fingerprint(req_body),
         }
+        messages = req_body.get("messages") if isinstance(req_body, dict) else None
+        if path == "/v1/chat/completions" and isinstance(messages, list) and len(messages) <= 1024:
+            req_event["action"]["message_hashes"] = hermes_request_fingerprint(
+                {"request_messages": messages}
+            )["messages"]
         req_event["outcome"] = {"status": "success"}
         req_event["raw_request"] = _cap_raw(req_body)
         if (
