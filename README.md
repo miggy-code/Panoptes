@@ -392,7 +392,9 @@ Model response events retain `cost.tokens_in` and `cost.tokens_out` as totals.
 When reported by the provider, `cost.reasoning_tokens` records Gemini thought
 tokens, OpenAI reasoning tokens, or Anthropic thinking tokens; these are
 subsets of output tokens. `cost.cached_input_tokens` records cache reads, and
-Anthropic and OpenAI may also report `cost.cache_creation_input_tokens`. Gemini may
+Anthropic and OpenAI may also report cache writes as `cost.cache_creation_input_tokens`;
+Anthropic's 1-hour TTL share of those writes is `cost.cache_creation_1h_input_tokens`.
+Both reads and writes are parts of `cost.tokens_in`. Gemini may
 also report `cost.tool_prompt_tokens`, separate from its prompt token count.
 A missing breakdown means unavailable, not zero. Anthropic's thinking count
 is an estimate from re-tokenization, and providers' token counts and caching

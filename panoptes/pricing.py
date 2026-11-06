@@ -8,13 +8,18 @@ needs. Everything else is reported as unpriced.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any
 
 MICROS_PER_USD = 1_000_000
 RATE_FIELDS = ("input_per_million", "cached_input_per_million", "output_per_million")
+# Optional rates. A table without them still loads; a response that reports the
+# tokens they price is then unpriced rather than billed at a guessed rate.
+OPTIONAL_RATE_FIELDS = ("cache_write_per_million", "cache_write_1h_per_million")
 
 
 class PricingError(ValueError):
@@ -68,7 +73,9 @@ class PricingTable:
             if not isinstance(rate, dict):
                 raise PricingError(f"rate for {name} must be an object")
             parsed = {}
-            for field in RATE_FIELDS:
+            for field in RATE_FIELDS + OPTIONAL_RATE_FIELDS:
+                if field in OPTIONAL_RATE_FIELDS and field not in rate:
+                    continue
                 try:
                     value = Decimal(str(rate[field]))
                 except (KeyError, InvalidOperation):
@@ -84,21 +91,76 @@ class PricingTable:
     def cost_micros(self, model: str | None, cost: dict) -> int | None:
         """Price one response in micro-dollars, or None when it cannot be priced exactly.
 
-        Input is billed as ``tokens_in - cached + tool_prompt`` at the input rate, cached
-        tokens at the cached rate, and output (which already includes reasoning) at the
-        output rate. Absent optional counts are zero, which never under-counts.
+        ``tokens_in`` is the whole prompt: cache reads (``cached_input_tokens``) and
+        cache writes (``cache_creation_input_tokens``) are parts of it. Cache reads are
+        billed at the cached rate; cache writes at ``cache_write_per_million``, except
+        the ``cache_creation_1h_input_tokens`` part at ``cache_write_1h_per_million``;
+        the rest of the prompt plus ``tool_prompt_tokens`` at the input rate; output
+        (which already includes reasoning) at the output rate. Absent read and tool
+        counts are zero, which never under-counts. A response that reports cache
+        writes the table has no rate for, or a TTL split that is partial or does not
+        sum to the total, is unpriced: Panoptes never guesses.
+
+        The arithmetic is exact (rates are converted to fractions), and the result is
+        rounded up to a whole micro-dollar once, at the end.
         """
         rate = self.models.get(model or "")
         tokens_in, tokens_out = cost.get("tokens_in"), cost.get("tokens_out")
         if rate is None or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (tokens_in, tokens_out)):
             return None
         cached, tool_prompt = _count(cost, "cached_input_tokens"), _count(cost, "tool_prompt_tokens")
-        if cached is None or tool_prompt is None or cached > tokens_in:
+        writes = _count(cost, "cache_creation_input_tokens")
+        if None in (cached, tool_prompt, writes) or cached + writes > tokens_in:
             return None
-        billed_in = tokens_in - cached + tool_prompt
-        usd = (
-            Decimal(billed_in) * rate["input_per_million"]
-            + Decimal(cached) * rate["cached_input_per_million"]
-            + Decimal(tokens_out) * rate["output_per_million"]
-        ) / Decimal(MICROS_PER_USD)
-        return int((usd * MICROS_PER_USD).to_integral_value(rounding=ROUND_CEILING))
+        split = _write_split(cost, writes)
+        if split is _INVALID or cost.get("cache_creation_split_invalid") is True:
+            return None
+        # A rate in USD per million tokens times a token count is exactly micro-dollars.
+        micros = (
+            Fraction(tokens_in - cached - writes + tool_prompt) * Fraction(rate["input_per_million"])
+            + Fraction(cached) * Fraction(rate["cached_input_per_million"])
+            + Fraction(tokens_out) * Fraction(rate["output_per_million"])
+        )
+        if writes:
+            write_cost = _cache_write_cost(rate, writes, split)
+            if write_cost is None:
+                return None
+            micros += write_cost
+        return math.ceil(micros)
+
+
+_INVALID = object()
+
+
+def _write_split(cost: dict, writes: int) -> tuple[int, int] | None | object:
+    """The (5-minute, 1-hour) split of cache writes; None when no split is reported; _INVALID when
+    the split is partial, malformed, or does not sum to the total (including a nonzero split with no
+    writes)."""
+    present = [field in cost and cost[field] is not None for field in _SPLIT_FIELDS]
+    if not any(present):
+        return None
+    if not all(present):
+        return _INVALID
+    five, hour = (_count(cost, field) for field in _SPLIT_FIELDS)
+    if five is None or hour is None or five + hour != writes:
+        return _INVALID
+    return five, hour
+
+
+_SPLIT_FIELDS = ("cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens")
+
+
+def _cache_write_cost(rate: dict[str, Decimal], writes: int, split: tuple[int, int] | None) -> Fraction | None:
+    """Exact cost of ``writes`` cache-write tokens in micro-dollars, or None when unknown."""
+    write_rate = rate.get("cache_write_per_million")
+    hour_rate = rate.get("cache_write_1h_per_million")
+    if split is None:
+        # No TTL breakdown. With a separate 1-hour rate on the table the split
+        # changes the price and is unknown, so the response stays unpriced.
+        if write_rate is None or hour_rate is not None:
+            return None
+        return Fraction(writes) * Fraction(write_rate)
+    five, hour = split
+    if (five and write_rate is None) or (hour and hour_rate is None):
+        return None
+    return Fraction(five) * Fraction(write_rate or 0) + Fraction(hour) * Fraction(hour_rate or 0)

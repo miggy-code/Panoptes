@@ -26,7 +26,11 @@ _INPUT_USAGE_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
-_USAGE_FIELDS = _INPUT_USAGE_FIELDS + ("output_tokens", "output_tokens_details")
+# ``cache_creation`` splits cache_creation_input_tokens by TTL
+# (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens), which bill differently.
+_USAGE_FIELDS = _INPUT_USAGE_FIELDS + (
+    "cache_creation", "output_tokens", "output_tokens_details",
+)
 
 
 _SERVER_RESULT_TYPES = frozenset({
@@ -299,9 +303,15 @@ class AnthropicProvider(Provider):
                 "cache_read_input_tokens": "cached_input_tokens",
                 "cache_creation_input_tokens": "cache_creation_input_tokens",
             }),
+            **_optional_usage_counts(usage.get("cache_creation") if isinstance(usage, dict) else None, {
+                # Both halves of the TTL split are kept so pricing can check they sum to the total.
+                "ephemeral_5m_input_tokens": "cache_creation_5m_input_tokens",
+                "ephemeral_1h_input_tokens": "cache_creation_1h_input_tokens",
+            }),
             **_optional_usage_counts(usage.get("output_tokens_details") if isinstance(usage, dict) else None, {
                 "thinking_tokens": "reasoning_tokens",
             }),
+            **({"cache_creation_split_invalid": True} if _split_is_malformed(usage) else {}),
         }
 
     def reassemble_sse(
@@ -314,6 +324,23 @@ class AnthropicProvider(Provider):
         if not events:
             raise SSEParseError("Anthropic SSE response contained no JSON data events")
         return _reassemble_anthropic_sse(events)
+
+
+def _split_is_malformed(usage: Any) -> bool:
+    """True when ``usage.cache_creation`` reports a TTL split that cannot be read.
+
+    Unreadable counts are dropped like any other, but dropping a whole split would leave the
+    writes looking unsplit and priced at the 5-minute rate; this flag keeps them unpriced."""
+    if not isinstance(usage, dict) or usage.get("cache_creation") is None:
+        return False
+    split = usage["cache_creation"]
+    if not isinstance(split, dict):
+        return True
+    return any(
+        (value := split.get(key)) is not None
+        and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+        for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+    )
 
 
 def _reassemble_anthropic_sse(events: list[dict]) -> dict:

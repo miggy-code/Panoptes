@@ -5,6 +5,34 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Breaking
+
+- **Prompt-cache writes are priced at their own rate, or not at all.** A
+  response reporting `cost.cache_creation_input_tokens` was priced with those
+  tokens at the input rate, under-counting Anthropic cache writes (1.25× input
+  for the 5-minute TTL, 2× for the 1-hour TTL). Rate tables gain two optional
+  fields, `cache_write_per_million` and `cache_write_1h_per_million`. A response
+  with cache writes is unpriced when its model has no matching rate, so an
+  existing table now leaves such responses unpriced until the rate is added.
+  Responses without cache writes price exactly as before, and existing tables
+  still load.
+
+### Added
+
+- `cost.cache_creation_5m_input_tokens` and `cost.cache_creation_1h_input_tokens`:
+  the TTL split of Anthropic cache writes (`usage.cache_creation`), from both
+  buffered and streamed replies, with matching `AuditDB.aggregate` metrics. A split
+  that is partial, unreadable (`cost.cache_creation_split_invalid`) or does not sum
+  to `cache_creation_input_tokens` is unpriced.
+
+### Fixed
+
+- Pricing arithmetic is exact. Decimal's default 28-digit precision could round a
+  rate just above a whole micro-dollar down before the final ceiling (one token at
+  `1.0000000000000000000000000001` USD per million billed 1 micro-dollar, not 2).
+
 ## [0.2.2] - 2026-11-06
 
 ### Added
@@ -184,7 +212,10 @@ All notable changes to Panoptes are recorded here. Releases follow
 - Hermes lifecycle hooks and an optional synchronous tool authorizer.
 - Python 3.10–3.13 CI, distribution validation, and installed-wheel smoke tests.
 
-[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/miggy-code/Panoptes/compare/v0.2.1...v0.3.0
+[0.2.2]: https://github.com/miggy-code/Panoptes/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/miggy-code/Panoptes/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/miggy-code/Panoptes/releases/tag/v0.1.0
