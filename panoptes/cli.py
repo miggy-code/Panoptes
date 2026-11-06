@@ -308,6 +308,36 @@ def cmd_checkpoint(args):
 # ── Main CLI ──────────────────────────────────────────────────────────────────
 
 
+def cmd_export_otel(args):
+    """Export a bounded selection without touching capture or database writes."""
+    try:
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from panoptes.otel import ExportError, export_events
+    except ModuleNotFoundError:
+        print("Install OpenTelemetry output with: pip install 'panoptes-observe[otel]'", file=sys.stderr)
+        raise SystemExit(2)
+    db = _open_existing_db(args.db_path)
+    try:
+        filters = {"session_id": args.session_id, "since": args.since, "until": args.until}
+        events = db.query(**filters, limit=args.limit)
+        counts = db.aggregate(group_by=[], metrics=["count"], **filters)
+        matching = int(counts[0]["count"]) if counts else 0
+    finally:
+        db.close()
+    print(f"Selected {len(events)} of {matching} matching events (newest {args.limit}); metadata only", file=sys.stderr)
+    if not events:
+        return
+    exporter = OTLPSpanExporter(endpoint=args.endpoint, timeout=10)
+    try:
+        accepted = export_events(reversed(events), exporter)
+    except ExportError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1) from None
+    finally:
+        exporter.shutdown()
+    print(f"Receiver acknowledged {accepted} observations; this does not verify backend storage")
+
+
 def main(argv=None):
     """Entry point for the panoptes CLI."""
     # Shared options — inherited by subparsers via parents=[...]
@@ -331,6 +361,16 @@ def main(argv=None):
         version=f"%(prog)s {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    otel_parser = subparsers.add_parser(
+        "export-otel", help="Export newest committed observations via OTLP/HTTP (metadata only)",
+        parents=[db_opts],
+    )
+    otel_parser.add_argument("--endpoint", required=True, help="OTLP/HTTP traces URL, including /v1/traces")
+    otel_parser.add_argument("--session-id")
+    otel_parser.add_argument("--since")
+    otel_parser.add_argument("--until")
+    otel_parser.add_argument("--limit", type=int, default=1000, help="Newest events to export (1–10000)")
 
     # --- proxy ---
     proxy_parser = subparsers.add_parser(
@@ -414,7 +454,7 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
 
-    if args.command == "session" and not 1 <= args.limit <= 10000:
+    if args.command in ("session", "export-otel") and not 1 <= args.limit <= 10000:
         parser.error("--limit must be between 1 and 10000")
 
     if args.command == "proxy":
@@ -451,6 +491,7 @@ def main(argv=None):
         )
     else:
         commands = {
+            "export-otel": cmd_export_otel,
             "doctor": cmd_doctor,
             "query": cmd_query,
             "status": cmd_status,

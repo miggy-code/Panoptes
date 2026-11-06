@@ -728,6 +728,20 @@ def test_drain_is_bounded(make_proxy, upstream):
 # ---------------------------------------------------------------------------
 
 
+def test_start_twice_preserves_the_running_proxy(tmp_path, upstream):
+    server = ProxyServer(port=0, db_path=str(tmp_path / "audit.db"))
+    port = server.start()
+    try:
+        with pytest.raises(RuntimeError, match="already running"):
+            server.start()
+        response = httpx.post(
+            f"http://127.0.0.1:{port}/v1/messages", json=BODY, timeout=15
+        )
+        assert response.status_code == 200
+    finally:
+        server.stop()
+
+
 def test_upstreams_override_the_environment_and_name_the_upstream(
     tmp_path, monkeypatch, upstream
 ):
@@ -1120,3 +1134,59 @@ def test_a_connection_dropped_in_the_middle_of_the_body(
     assert ex.outcome == outcome and ex.upstream_status == 200
     assert (ex.request_sent, ex.produced_output, ex.complete) == (True, True, False)
     assert ex.usage == {} and ex.provider_error is False
+
+
+def test_concurrent_starts_own_one_listener_and_allow_restart(tmp_path, upstream):
+    from concurrent.futures import ThreadPoolExecutor
+
+    db = AuditDB(str(tmp_path / "shared.db"))
+    server = ProxyServer(port=0, db=db)
+    barrier = threading.Barrier(4)
+
+    def start():
+        barrier.wait(timeout=10)
+        try:
+            return server.start()
+        except RuntimeError:
+            return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            ports = list(pool.map(lambda _: start(), range(4)))
+        assert sum(port is not None for port in ports) == 1
+        port = next(port for port in ports if port is not None)
+        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+        server.stop()
+        server.stop()
+        assert db.query(event_type="model_request")
+        port = server.start()
+        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+    finally:
+        server.stop()
+        db.close()
+
+
+def test_reenter_and_repeated_settlement_do_not_repeat_hooks(tmp_path, upstream, monkeypatch):
+    from panoptes._hooked import HookedExchangeMixin
+
+    original = HookedExchangeMixin._finish_run
+    checked = threading.Event()
+
+    def repeated_finish(handler):
+        original(handler)
+        original(handler)
+        if handler._run is not None:
+            with pytest.raises(RuntimeError, match="already entered"):
+                handler._run.enter()
+            checked.set()
+
+    monkeypatch.setattr(HookedExchangeMixin, "_finish_run", repeated_finish)
+    hooks = Recorder()
+    server = ProxyServer(port=0, db_path=str(tmp_path / "a.db"), hooks=hooks)
+    try:
+        port = server.start()
+        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+        assert checked.wait(10)
+        assert len(hooks.before_calls) == len(hooks.after_calls) == 1
+    finally:
+        server.stop()
