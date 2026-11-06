@@ -1322,6 +1322,7 @@ class ProxyServer:
         self._http_client: httpx.Client | None = None
         self._tmp_db_path: str | None = None  # set when db_path == ":memory:"
         self.writer: AuditEventWriter | None = None
+        self._lifecycle_lock = threading.Lock()
 
     @staticmethod
     def _resolve_upstreams(
@@ -1345,6 +1346,12 @@ class ProxyServer:
 
     def start(self) -> int:
         """Start the proxy in a background thread. Returns the listening port."""
+        with self._lifecycle_lock:
+            return self._start()
+
+    def _start(self) -> int:
+        if self._server is not None:
+            raise RuntimeError("Proxy server is already running")
         # ProxyServer maps its ``:memory:`` convenience mode to a disposable
         # file. This is a proxy lifecycle choice; AuditDB itself also supports
         # shared in-memory databases.
@@ -1414,7 +1421,8 @@ class ProxyServer:
 
     def stop(self) -> None:
         """Stop the proxy server and release resources."""
-        self._cleanup_resources(start_failed=False)
+        with self._lifecycle_lock:
+            self._cleanup_resources(start_failed=False)
         log.info("Panoptes proxy stopped")
 
     def _cleanup_resources(self, *, start_failed: bool) -> None:
@@ -1436,7 +1444,8 @@ class ProxyServer:
                 )
             self._server = None
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                self._thread.join(timeout=5)
             self._thread = None
         if self._http_client is not None:
             self._http_client.close()

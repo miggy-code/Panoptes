@@ -1691,3 +1691,25 @@ def test_optional_provider_usage_breakdowns_and_streaming():
               b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":6}}}\n\n'
               b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
     assert AnthropicProvider().extract_usage(_reassemble_anthropic_sse(_parse_sse_events(stream)))["reasoning_tokens"] == 6
+
+
+def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
+    import threading
+
+    server = ProxyServer(port=0)
+    with monkeypatch.context() as patch:
+        def fail_start(thread):
+            raise RuntimeError("thread launch failed")
+        patch.setattr(threading.Thread, "start", fail_start)
+        with pytest.raises(RuntimeError, match="thread launch failed"):
+            server.start()
+    assert server._server is None
+    assert server._thread is None
+    assert server._http_client is None
+    assert server._db is None
+    assert server._tmp_db_path is None
+    assert server.writer is None
+    try:
+        assert server.start() > 0
+    finally:
+        server.stop()

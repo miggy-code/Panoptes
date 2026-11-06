@@ -33,6 +33,17 @@ All notable changes to Panoptes are recorded here. Releases follow
   rate just above a whole micro-dollar down before the final ceiling (one token at
   `1.0000000000000000000000000001` USD per million billed 1 micro-dollar, not 2).
 
+## [0.2.2] - 2026-11-06
+
+### Added
+
+- Add optional read-only OpenTelemetry export of bounded event selections over OTLP/HTTP.
+
+### Fixed
+
+- Serialize proxy start and stop operations, and preserve cleanup when thread startup fails.
+- Track hook callback settlement with an explicit lifecycle phase.
+
 ## [0.2.1] - 2026-11-04
 
 ### Fixed
@@ -203,6 +214,7 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 [Unreleased]: https://github.com/miggy-code/Panoptes/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/miggy-code/Panoptes/compare/v0.2.1...v0.3.0
+[0.2.2]: https://github.com/miggy-code/Panoptes/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/miggy-code/Panoptes/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/miggy-code/Panoptes/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/miggy-code/Panoptes/compare/v0.1.0...v0.1.1

@@ -115,6 +115,8 @@ port = server.start()        # non-blocking; server.stop() when done
 ```
 
 The full contract is in [docs/hooks.md](docs/hooks.md).
+Lifecycle and capture guarantees are summarized in
+[docs/lifecycle-invariants.md](docs/lifecycle-invariants.md).
 
 ### Install Hermes lifecycle hooks
 
@@ -401,3 +403,23 @@ semantics are not necessarily directly comparable.
 `AuditDB.aggregate` supports these breakdown names and their corresponding
 `_reported` counts. Sums are null when no events reported the metric; use the
 counts to assess coverage before comparing runs. Existing events are unchanged.
+
+### Optional OpenTelemetry output
+
+Export committed audit observations separately from capture:
+
+```bash
+pip install 'panoptes-observe[otel]'
+panoptes export-otel --db-path ~/.panoptes/audit.db \
+  --endpoint http://127.0.0.1:4318/v1/traces --limit 1000
+# Optional selection: --session-id SESSION --since ISO8601 --until ISO8601
+```
+
+This reads the newest selected events without modifying the database. It sends
+metadata only, including identifiers and capture fidelity; prompts, tool arguments,
+results and raw bodies are excluded. Each record is a zero-duration observation,
+not proof of tool execution. Export failures exit nonzero; earlier batches may
+have succeeded. Repeating export can produce duplicates at the receiver. Capture
+has no OTel dependency unless this extra is installed and the command is invoked.
+See the [architecture review and mapping](docs/architecture-review.md) for lifecycle
+changes, delivery limits and the exact privacy boundary.
