@@ -5,6 +5,17 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
+### Added
+
+- Add optional read-only OpenTelemetry export of bounded event selections over OTLP/HTTP.
+
+### Fixed
+
+- Serialize proxy start and stop operations, and preserve cleanup when thread startup fails.
+- Track hook callback settlement with an explicit lifecycle phase.
+
 ## [0.2.1] - 2026-11-04
 
 ### Fixed

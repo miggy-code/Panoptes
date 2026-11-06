@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from enum import Enum, auto
 import logging
 import socket
 import threading
@@ -118,6 +119,12 @@ class _ForwardReport:
     client_gone: bool = False
 
 
+class _HookPhase(Enum):
+    PREPARED = auto()
+    ENTERED = auto()
+    FINISHED = auto()
+
+
 @dataclasses.dataclass
 class _ExchangeRun:
     """Proxy-side state of one exchange that entered ``before_forward``."""
@@ -134,14 +141,24 @@ class _ExchangeRun:
     fwd_headers: dict | None = None
     forward_path: str | None = None
     raw_path: str = ""
-    entered: bool = False
-    finished: bool = False
+    phase: _HookPhase = _HookPhase.PREPARED
     outcome: str | None = None
     status: int | None = None
     complete: bool = False
     response_events: list = dataclasses.field(default_factory=list)
     usage: dict = dataclasses.field(default_factory=dict)
     cost_micros: int | None = None
+
+    def enter(self) -> None:
+        if self.phase is not _HookPhase.PREPARED:
+            raise RuntimeError("before_forward already entered")
+        self.phase = _HookPhase.ENTERED
+
+    def claim_finish(self) -> bool:
+        if self.phase is not _HookPhase.ENTERED:
+            return False
+        self.phase = _HookPhase.FINISHED
+        return True
 
 
 class HookedExchangeMixin:
@@ -211,7 +228,7 @@ class HookedExchangeMixin:
         """Run ``before_forward`` and act on its answer. True means forward."""
         exchange = run.exchange
         writer = self.writer
-        run.entered = True  # after_exchange is owed from here
+        run.enter()  # after_exchange is owed from here
         started = time.monotonic()
         failure: Exception | None = None
         reject: tuple[int, bytes, str] | None = None
@@ -382,9 +399,8 @@ class HookedExchangeMixin:
     def _finish_run(self) -> None:
         """Settle the exchange and call ``after_exchange`` exactly once."""
         run = getattr(self, "_run", None)
-        if run is None or not run.entered or run.finished:
+        if run is None or not run.claim_finish():
             return
-        run.finished = True
         exchange = run.exchange
         report = run.report
         outcome = run.outcome or "aborted"

@@ -329,3 +329,13 @@ def test_doctor_flags_a_database_with_no_recorded_activity(tmp_path, capsys):
     AuditDB(str(db_path)).close()
     main(["doctor", "--db-path", str(db_path)])
     assert "[WARN] Capture: no recorded activity" in capsys.readouterr().out
+
+
+def test_export_otel_missing_extra_explains_installation(monkeypatch, capsys):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", None)
+    with pytest.raises(SystemExit) as exc:
+        main(["export-otel", "--endpoint", "http://127.0.0.1:1/v1/traces"])
+    assert exc.value.code == 2
+    assert "panoptes-observe[otel]" in capsys.readouterr().err
