@@ -337,8 +337,8 @@ def _split_is_malformed(usage: Any) -> bool:
     if not isinstance(split, dict):
         return True
     return any(
-        (value := split.get(key)) is not None
-        and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+        isinstance(value := split.get(key), bool)
+        or not isinstance(value, int) or value < 0
         for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
     )
 

@@ -168,12 +168,16 @@ missing, mistyped, or empty `--db-path` exits with status 2 instead of creating
 a new database.
 
 `session` shows a chronological timeline with event status, tool or model,
-available duration, and event/run/call IDs. Model proposals remain distinct from
-reported execution outcomes. By default it selects up to 10,000 newest events;
+available duration, and event/run/exchange/correlation/call IDs. `evidence` uses
+the same timeline format for related records. Model proposals remain distinct from
+reported execution outcomes. By default `session` selects up to 10,000 newest events;
 `--limit` selects fewer. Partial timelines state the selected and matching
 counts. `--json` returns full stored events with those counts and a `partial`
 flag. Events written by an earlier version or by another producer may carry
 decision records; the timeline shows them as recorded.
+
+See [reviewing a retained evaluation-lab trial](docs/incident-review.md) for a
+read-only investigation using existing capture, execution, and recovery evidence.
 
 ### Check your setup
 
