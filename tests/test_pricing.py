@@ -191,18 +191,31 @@ CACHE_RATES = {
         {"ephemeral_5m_input_tokens": "4", "ephemeral_1h_input_tokens": "0"},
         {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": -1},
         {"ephemeral_5m_input_tokens": True, "ephemeral_1h_input_tokens": 0},
+        {"ephemeral_5m_input_tokens": None, "ephemeral_1h_input_tokens": None},
+        {"ephemeral_1h_input_tokens": None},
+        {},
         "4/0",
     ],
 )
-def test_an_unreadable_reply_split_leaves_the_response_unpriced(split):
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_unreadable_reply_split_leaves_the_response_unpriced(split, stream):
     """Extraction drops unreadable counts; the writes must not then look unsplit and be
     priced at the 5-minute rate."""
     from panoptes.providers.anthropic import AnthropicProvider
 
-    usage = AnthropicProvider().extract_usage({"usage": {
+    provider = AnthropicProvider()
+    reply = {"usage": {
         "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 4,
         "cache_creation": split,
-    }})
+    }}
+    if stream:
+        reply = provider.reassemble_sse(_sse(
+            {"type": "message_start", "message": reply},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+             "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ))
+    usage = provider.extract_usage(reply)
     assert usage.get("cache_creation_split_invalid") is True
     assert PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) is None
 

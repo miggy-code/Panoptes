@@ -207,7 +207,12 @@ def _print_timeline_event(event):
     )
 
     refs = [f"id={event['event_id']}", f"run={event['agent'].get('run_id', '-')}"]
-    for name, value in (("call", action.get("call_id")), ("source", context.get("source_event_id"))):
+    for name, value in (
+        ("exchange", (event.get("attributes") or {}).get("exchange_id")),
+        ("correlation", event.get("correlation_id")),
+        ("call", action.get("call_id")),
+        ("source", context.get("source_event_id")),
+    ):
         if value:
             refs.append(f"{name}={value}")
     print("  " + _display_text("  ".join(refs), limit=1200))
@@ -257,16 +262,18 @@ def _print_timeline_event(event):
 def cmd_evidence(args):
     """Show evidence chain for an event."""
     db = _open_existing_db(args.db_path)
-    chain = db.get_evidence_chain(args.event_id)
+    try:
+        chain = db.get_evidence_chain(args.event_id)
+    finally:
+        db.close()
     if not chain:
         print(f"No evidence chain found for event: {args.event_id}")
         return
 
-    print(f"Evidence chain for {args.event_id} ({len(chain)} steps):")
-    for i, e in enumerate(chain, 1):
-        outcome = e.get("outcome", {}) or {}
-        print(f"\n--- Step {i} ---")
-        print(f"[{e['event_type']}] {outcome.get('summary', 'no summary')}")
+    print(f"Evidence chain for {_display_text(args.event_id)} ({len(chain)} steps):")
+    print("Related recorded events; correlation does not prove causality or execution.")
+    for event in chain:
+        _print_timeline_event(event)
 
 
 def cmd_verify(args):

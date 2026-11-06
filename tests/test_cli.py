@@ -195,7 +195,11 @@ def test_verify_never_re_anchors_a_stripped_chain(tmp_path, capsys):
         AuditDB(str(db_path))
 
 
-def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys):
+@pytest.mark.parametrize("command, count_label", [
+    (["session", "s1"], "4 of 4 events"),
+    (["evidence", "proposal"], "4 steps"),
+])
+def test_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys, command, count_label):
     from panoptes.capture import PROXY_CAPABILITIES
 
     db_path = tmp_path / "audit.db"
@@ -215,6 +219,8 @@ def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_
         }
         event["outcome"] = {"status": status, "summary": "Run bash\n\x1b[31m sk-proj-fake-secret-01234567890123456789"}
         event["context"] = {"capture": PROXY_CAPABILITIES.as_context()}
+        event["attributes"] = {"exchange_id": "exchange-1"}
+        event["correlation_id"] = "correlation-1"
         if kind == "model_request":
             event["context"]["policy"] = "adapter-defined extension"
         if kind == "tool_call":
@@ -232,9 +238,9 @@ def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_
     db.close()
     before = db_path.read_bytes()
 
-    main(["session", "s1", "--db-path", str(db_path)])
+    main([*command, "--db-path", str(db_path)])
     output = capsys.readouterr().out
-    assert "4 of 4 events" in output
+    assert count_label in output
     assert output.index("id=request") < output.index("id=proposal") < output.index("id=decision") < output.index("id=result")
     assert "authorization bash  BLOCKED" in output
     assert "execution=not observed" in output
@@ -243,6 +249,7 @@ def test_session_timeline_keeps_order_correlations_and_execution_boundaries(tmp_
     assert "event policy=block [no-bash]" in output
     assert "command=echo hello" in output
     assert "call=call-1" in output and "source=proposal" in output and "run=r1" in output
+    assert "exchange=exchange-1" in output and "correlation=correlation-1" in output
     assert "inspection=incomplete" in output
     assert "\x1b" not in output
     assert "sk-proj-fake-secret" not in output
