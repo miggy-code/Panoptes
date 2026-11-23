@@ -1,13 +1,13 @@
 # Releasing Panoptes
 
-Panoptes is published to PyPI as `panoptes-observe`. The Python import package
-and installed command are both named `panoptes`.
+Panoptes is published to PyPI as `panoptes-observe`. The Python package and the
+command are both named `panoptes`.
 
 ## One-time PyPI setup
 
-1. Create a PyPI account, verify its email address, and enable two-factor
+1. Create a PyPI account. Verify its email address and turn on two-factor
    authentication.
-2. In PyPI's publishing settings, add a pending trusted publisher with these
+2. In the PyPI publishing settings, add a pending trusted publisher with these
    values:
 
    | Field | Value |
@@ -18,16 +18,16 @@ and installed command are both named `panoptes`.
    | Workflow | `release.yml` |
    | Environment | `pypi` |
 
-3. In the GitHub repository, create an environment named `pypi` and require
+3. In the GitHub repository, create an environment named `pypi`. Require
    approval before deployment.
 
-The first successful trusted-publishing run creates the PyPI project. No API
-token or repository secret is required.
+The first successful trusted-publishing run creates the PyPI project. You need
+no API token and no repository secret.
 
 ## Release checklist
 
-1. Update `version` in `pyproject.toml` and move the release notes from
-   `Unreleased` into a dated section in `CHANGELOG.md`.
+1. Update `version` in `pyproject.toml`. In `CHANGELOG.md`, move the notes from
+   `Unreleased` into a new dated section.
 2. Run the local release checks:
 
    ```bash
@@ -37,11 +37,11 @@ token or repository secret is required.
    ```
 
 3. Merge the release commit after CI passes.
-4. Create a GitHub release whose tag is exactly `v<version>`, such as
-   `v0.1.0`. Do not reuse a version already uploaded to PyPI.
-5. Approve the `pypi` environment deployment. The release workflow verifies
-   the tag, rebuilds and validates the artifacts, and publishes through OIDC.
-6. Verify the public package from a clean environment:
+4. Create a GitHub release with the tag `v<version>`, for example `v0.1.0`.
+   Use a new version number each time.
+5. Approve the `pypi` environment deployment. The release workflow checks the
+   tag, builds and validates the files again, and publishes through OIDC.
+6. Install the public package in a clean environment and check its version:
 
    ```bash
    python -m venv /tmp/panoptes-release-check
@@ -49,5 +49,5 @@ token or repository secret is required.
    /tmp/panoptes-release-check/bin/panoptes --version
    ```
 
-If publishing fails, fix the release process and publish a new version. PyPI
-release files are immutable and should never be silently replaced.
+PyPI release files cannot be replaced. If publishing fails, fix the release
+process and publish a new version.

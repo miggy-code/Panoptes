@@ -1,60 +1,85 @@
 # Lifecycle invariants
 
-These describe the current implementation, not a guarantee that every external
-provider or host follows a complete lifecycle. An audit event is an observation,
-not proof that a client-side tool executed.
+These rules describe the current implementation. They do not promise that every
+provider or host sends a complete lifecycle. An audit event is an observation.
+It is not proof that a client-side tool ran.
 
 ## Servers and exchanges
 
-- A `ProxyServer` owns at most one running listener. `start()` rejects a second
-  start; `stop()` releases owned resources, but does not close a caller-owned
-  database. A per-instance lock serializes start/stop operations, including startup
-  rollback.
-- The shared HTTP server admits a request only when a worker slot is available.
-  Each admitted worker releases its slot when it exits; shutdown waits only for
-  the configured grace period.
-- An exchange that enters `before_forward` is settled once and receives one
-  `after_exchange` call, including rejection and error paths. A prepared → entered
-  → finished phase owns that callback debt; completion is claimed before calling
-  consumer code. Requests rejected
-  before hook entry do not receive that callback. Hook identity freezes after
-  `before_forward`; later identity assignments have no effect.
-- In hook mode, request intent must be written before forwarding. A failed write
-  prevents forwarding. Hook rejection and hook errors are recorded best effort.
-- A response is complete for the hook only when the upstream answered, no upstream
-  error occurred, the body was read in full, inspection succeeded, and the
-  exchange was forwarded. A client disconnect can trigger a bounded drain in
-  hook mode; reaching a capture limit or drain timeout makes capture incomplete.
-  Client-facing and upstream statuses are separate observations.
+- **One listener per server.** A `ProxyServer` runs at most one listener.
+  A second `start()` fails. A lock on each instance serializes `start()` and
+  `stop()`, including the rollback after a failed start.
+- **Resource ownership.** `stop()` releases the resources that the server
+  opened. It does not close a database that the caller passed in.
+- **Request slots.** The HTTP server accepts a request only when a worker slot
+  is free. Each worker releases its slot when it ends.
+- **One `after_exchange` per entered exchange.** An exchange that enters
+  `before_forward` gets exactly one `after_exchange` call. This includes
+  rejections and errors. Panoptes marks the exchange finished before it calls
+  the hook. A request that Panoptes refuses before the hook gets no callback.
+- **Identity freezes.** Panoptes reads the identity when `before_forward`
+  returns. Later changes have no effect.
+- **Request intent comes first.** With hooks, Panoptes writes the request
+  events before it forwards the request. If that write fails, Panoptes does
+  not forward. Rejections and hook errors are recorded on a best-effort basis.
+- **A complete response.** For a hook, a response is complete only when all of
+  these are true: the upstream answered without an error, Panoptes read the
+  full body, inspection succeeded, and Panoptes forwarded the exchange.
+- **Client disconnects.** With hooks, a client disconnect can start a drain of
+  the upstream, with a time limit. If the drain hits its time or size limit,
+  the capture is incomplete.
+- **Two statuses.** The status sent to the client and the upstream status are
+  separate observations.
 
 ## Streams
 
-- SSE framing accumulates data until an event can be dispatched; malformed UTF-8,
-  JSON, or non-object event data is rejected. The parser also accepts compatible
-  streams that omit separators between independently complete JSON objects.
-- Anthropic content blocks are indexed: a block must start before its deltas and
-  stop once; unfinished or contradictory blocks fail inspection.
-- OpenAI Responses items and their argument or input fragments are tracked by
-  output index. Completion and final output are reconciled against prior action
-  evidence; conflicting or incomplete action evidence fails inspection. Chat
-  Completions and Gemini use their respective reconstruction rules.
-- Stream capture is bounded. A transport ending does not by itself prove that
-  every provider protocol terminal marker was observed.
+- **SSE framing.** The parser collects data until it has a full event. It
+  rejects malformed UTF-8, malformed JSON, and event data that is not a JSON
+  object. It also accepts compatible streams that put complete JSON objects
+  one after another without separators.
+- **Anthropic blocks.** Content blocks have an index. A block must start before
+  its deltas and stop once. An unfinished or contradictory block fails
+  inspection.
+- **OpenAI Responses items.** The parser tracks items and their argument
+  fragments by output index. It checks the final output against the earlier
+  fragments. Conflicting or incomplete evidence fails inspection.
+- **Other protocols.** Chat Completions and Gemini use their own reconstruction
+  rules.
+- **Bounded capture.** Stream capture has a size limit. The end of the
+  transport does not prove that Panoptes saw the provider's final marker.
 
 ## Hermes and storage
 
-- Hermes sessions track identity and turn count in memory. A step may create a
-  session even without a start; an end removes its tracked session. Duplicate
-  starts retain existing attribution, and the capacity bound can evict an
-  active session. Persistence is best effort, so lifecycle records can be absent.
-- Schema migration and chain-mode selection occur in a database transaction. A
-  chain started on existing unchained data begins at a boundary; it does not
-  retroactively cover earlier rows. A chained database cannot be opened with
-  the chain disabled. Local verification alone cannot detect a wholesale
-  history rewrite without an independently retained checkpoint.
-- A batch is validated and normalized before writing, then committed or rolled
-  back as a unit with its chain-head update. Only the same `event_id` and same
-  canonical payload are idempotent; `call_id` correlates observations and does
-  not deduplicate them.
-- Plugin installation replaces each owned file atomically, but the files are not
-  installed as one transaction. An interrupted install can require a rerun.
+- **Hermes sessions.** The plugin keeps session identity and turn count in
+  memory. A step can create a session without a start event. An end event
+  removes the session. A second start keeps the existing attribution. The
+  capacity limit can remove an active session. Writes are best-effort, so
+  some lifecycle records can be missing.
+- **Migrations.** Schema migration and chain-mode selection happen inside one
+  database transaction.
+- **Chains on old data.** A chain started on existing unchained data begins at
+  a boundary. It does not cover earlier rows.
+- **Chain mode is fixed.** You cannot open a chained database with the chain
+  turned off.
+- **Full rewrites.** Local verification cannot find a full rewrite of the
+  history. You need a checkpoint stored somewhere else.
+- **Batches.** Panoptes validates and normalizes a batch before it writes. It
+  commits or rolls back the batch and the chain-head update as one unit.
+- **Idempotency.** Only the same `event_id` with the same canonical payload is
+  idempotent. `call_id` links observations. It does not remove duplicates.
+- **Plugin installation.** The installer replaces each file atomically, but
+  not all files in one transaction. If an install stops partway, run it again.
+
+## Known limits
+
+- **Shutdown.** `stop()` waits for open requests only for the configured grace
+  period. After that, it closes its resources. A slow exchange can lose its
+  final capture.
+- **Stopping from a hook.** A hook that calls `stop()` waits for its own
+  request until the grace period ends. Let the server owner control the
+  lifecycle.
+- **Hermes attribution.** Hermes attribution lives in memory and has a size
+  limit. Missing callbacks or evicted sessions can leave gaps.
+- **Transactions.** Migrations and chain-head changes stay inside SQLite
+  transactions. Do not replace them with application flags. Do not attach
+  network calls to their commit.

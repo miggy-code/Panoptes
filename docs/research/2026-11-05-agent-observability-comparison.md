@@ -1,7 +1,7 @@
 # Research: Panoptes and mature agent observability tools
 
 **Date:** 2026-11-05
-**Status:** needs-discussion
+**Status:** decided. Panoptes stays a local audit trail and exports to established platforms. OpenTelemetry export shipped in 0.2.2 ([docs/otel-export.md](../otel-export.md)).
 **Recommendation:** Focus Panoptes on local, evidence-aware audit capture and interoperate with established observability platforms rather than recreating their full product suites.
 
 ## Question and criteria
@@ -32,7 +32,7 @@ Absence of a verified equivalent is not proof competitors lack the feature. Loca
 
 Langfuse offers nested application traces, a UI, OpenTelemetry integrations, evaluation, datasets, prompt management, dashboards, collaboration and platform APIs. Its gateway can capture model calls through a proxy. Phoenix offers local/self-hosted operation with a trace UI, OpenInference instrumentation, datasets, experiments, evaluation and prompt management. LangSmith provides tracing and online evaluators and integrates closely with the LangChain ecosystem. Availability, scale and commercial terms differ by edition and change over time.
 
-Panoptes lacks an equivalent integrated UI, general application-level distributed tracing, native OTel ingestion/export, evaluation and experiment workflow, prompt management, team access controls, managed hosting, and platform-scale analytics. Its proxy adds an inline operational dependency and only sees configured supported traffic; stable session identity is client- or hook-asserted. Cost annotations require a supplied rate table. No independent performance, reliability, security, adoption, or integration benchmark was performed.
+Panoptes lacks an equivalent integrated UI, general application-level distributed tracing, native OTel ingestion (export was added later, in 0.2.2), evaluation and experiment workflow, prompt management, team access controls, managed hosting, and platform-scale analytics. Its proxy adds an inline operational dependency and only sees configured supported traffic; stable session identity is client- or hook-asserted. Cost annotations require a supplied rate table. No independent performance, reliability, security, adoption, or integration benchmark was performed.
 
 ## Recommendation and follow-up
 
@@ -44,4 +44,3 @@ Lead with “local, evidence-aware agent audit trail,” not “Langfuse replace
 - [Langfuse observability data model](https://langfuse.com/docs/observability/data-model), [observability overview](https://langfuse.com/docs/observability/overview), [gateway tracing](https://langfuse.com/docs/gateway/features/tracing), [self-hosted feature comparison](https://langfuse.com/pricing-self-host).
 - [Phoenix overview](https://arize.com/docs/phoenix/), [self-hosting](https://arize.com/docs/phoenix/self-hosting/deploying-phoenix), [tracing](https://arize.com/docs/phoenix/learn/tracing/how-tracing-works).
 - [LangSmith online evaluation](https://docs.langchain.com/langsmith/online-evaluations-llm-as-judge), [deployment tracing](https://docs.langchain.com/langsmith/data-plane).
-- Context7 discovery attempted; no Context7 results were available during this review. Vendor documentation was used directly.

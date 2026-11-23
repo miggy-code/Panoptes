@@ -1,8 +1,8 @@
 # Panoptes Python API
 
-Panoptes records what agents and models did and lets you read it back. This is
-the supported Python surface for writing events, reading them back and checking
-the log. Nothing here needs raw SQL; the table layout is not part of the API.
+This is the supported Python API for writing events, reading them, and
+checking the log. You need no raw SQL. The table layout is not part of the
+API.
 
 ```python
 from panoptes import AuditDB
@@ -191,9 +191,9 @@ legacy ones is `"intact"` with `coverage: "partial"`, which is disclosed.
 
 `get_chain_checkpoint()` returns the chain head with `chain: "present"`, or
 `chain: "absent"` and `initialized: False` for an unchained database. It raises
-`ChainIntegrityError` for the same inconsistent states `verify_chain` calls
-`"broken"`. `verify_checkpoint(checkpoint)` is unchanged and ignores the extra
-key in a stored checkpoint.
+`ChainIntegrityError` for the same inconsistent states that `verify_chain` calls
+`"broken"`. `verify_checkpoint(checkpoint)` ignores the `chain` key in a stored
+checkpoint.
 
 **What the chain does not protect against.** The chain, its metadata and the
 "created unchained" marker all live in the same SQLite file, so anyone who can
@@ -209,12 +209,11 @@ evidence.
 ## Pricing
 
 Panoptes prices a response as an annotation (`cost.estimated_usd`,
-`cost.pricing_version`); it enforces nothing with it. A consumer that reserves
-or settles money against the same rate table (a consumer built on the hooks)
-relies on the
-format and the rounding below. They are **stable**: a change that alters a
-figure for an existing table is a breaking change, announced in the changelog
-and a version bump.
+`cost.pricing_version`). It enforces nothing with the price. A hook consumer
+can reserve or settle money with the same rate table, so it depends on the
+format and rounding below. They are **stable**. A change that alters a figure
+for an existing table is a breaking change, with a changelog entry and a
+version bump.
 
 **Rate table** (JSON, loaded with `PricingTable.load(path)` or
 `PricingTable.from_dict(obj)`):

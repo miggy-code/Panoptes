@@ -1,7 +1,7 @@
 # Research: OpenTelemetry and product priorities
 
 **Date:** 2026-11-05  
-**Status:** needs-discussion  
+**Status:** decided. The opt-in, read-only export shipped in 0.2.2 ([docs/otel-export.md](../otel-export.md)). A runnable investigation walkthrough is in [docs/investigating-a-session.md](../investigating-a-session.md).\
 **Recommendation:** Validate a narrow opt-in, post-capture OTLP trace export before adding ingestion or a live pipeline. Prioritize capture reliability and a usable incident-review path alongside it.
 
 ## Question and criteria
@@ -44,4 +44,3 @@ No implementation or adoption decision has been made; these are proposals, not f
 - [Panoptes API](../api.md), [README](../../README.md), [capture contracts](../../panoptes/capture.py).
 - [OpenTelemetry GenAI spans and content guidance](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md); [execute-tool span definition](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/model/gen-ai/spans.yaml).
 - [Langfuse OpenTelemetry integration](https://langfuse.com/integrations/native/opentelemetry); [Phoenix tracing](https://arize.com/docs/phoenix/learn/tracing/how-tracing-works).
-- Context7 discovery was attempted; no usable result was returned in this review. Official documentation was consulted directly.
