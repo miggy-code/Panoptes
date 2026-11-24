@@ -21,9 +21,12 @@ adapter → normalize → SQLite → read API / CLI
 | `panoptes/capture.py` | Capture fidelity metadata that each adapter attaches |
 | `panoptes/schema.py` | Event validation, normalization, data-access tags, secret redaction |
 | `panoptes/db.py` | SQLite storage, read API, evidence paths, local hash chain |
-| `panoptes/proxy.py` | Reverse proxy: routing, forwarding, server lifecycle |
+| `panoptes/proxy.py` | Reverse proxy: `ProxyServer`, its request handler, public errors and limits |
+| `panoptes/_request.py` | Private: reads, frames, and routes a client request |
+| `panoptes/_forward.py` | Private: sends a request upstream and reads or relays the reply |
+| `panoptes/_exchange.py` | Private: runs one exchange from admission to settlement |
+| `panoptes/_hooked.py` | Private: the hook lifecycle of an exchange |
 | `panoptes/_events.py` | Private: converts an exchange into audit events |
-| `panoptes/_hooked.py` | Private: hook machinery that the proxy handler mixes in |
 | `panoptes/hooks.py` | Public hook types; imports no HTTP client |
 | `panoptes/_server.py` | Bounded threaded HTTP server for the proxy and Hermes ingest |
 | `panoptes/_json.py` | Strict JSON decoding (rejects duplicate keys) for all input boundaries |

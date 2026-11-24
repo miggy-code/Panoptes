@@ -991,10 +991,10 @@ def test_a_client_that_left_does_not_turn_an_upstream_error_into_aborted(
     dead.close()
     monkeypatch.setenv("PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{port}")
 
-    def gone(self, status, message, extra=None):
+    def gone(self, status, headers, body):
         raise BrokenPipeError("client is gone")
 
-    monkeypatch.setattr(ProxyHandler, "_send_json_error", gone)
+    monkeypatch.setattr(ProxyHandler, "send_reply", gone)
     hooks = Recorder()
     _, client, _ = make_proxy(hooks)
     try:
@@ -1113,20 +1113,20 @@ def test_concurrent_starts_own_one_listener_and_allow_restart(tmp_path, upstream
 def test_reenter_and_repeated_settlement_do_not_repeat_hooks(
     tmp_path, upstream, monkeypatch
 ):
-    from panoptes._hooked import HookedExchangeMixin
+    from panoptes._hooked import HookedLifecycle
 
-    original = HookedExchangeMixin._finish_run
+    original = HookedLifecycle.finish
     checked = threading.Event()
 
-    def repeated_finish(handler):
-        original(handler)
-        original(handler)
-        if handler._run is not None:
+    def repeated_finish(lifecycle, exchange):
+        original(lifecycle, exchange)
+        original(lifecycle, exchange)
+        if lifecycle._run is not None:
             with pytest.raises(RuntimeError, match="already entered"):
-                handler._run.enter()
+                lifecycle._run.enter()
             checked.set()
 
-    monkeypatch.setattr(HookedExchangeMixin, "_finish_run", repeated_finish)
+    monkeypatch.setattr(HookedLifecycle, "finish", repeated_finish)
     hooks = Recorder()
     server = ProxyServer(port=0, db_path=str(tmp_path / "a.db"), hooks=hooks)
     try:
