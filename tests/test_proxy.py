@@ -9,6 +9,7 @@ Covers:
 
 import io
 import json
+import socket
 import time
 import uuid
 from email.message import Message
@@ -16,6 +17,7 @@ from email.message import Message
 import httpx
 import pytest
 
+from panoptes.db import AuditDB
 from panoptes.hooks import ProxyHooks
 from panoptes.providers import detect as detect_provider
 from panoptes.providers.anthropic import (
@@ -57,6 +59,67 @@ class _AuditDBStub:
 
     def query(self, _filters: dict | None = None) -> list[dict]:
         return list(self.events)
+
+
+# ---------------------------------------------------------------------------
+# A real proxy against the fake upstream (tests/fake_upstream.py)
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_BODY = {
+    "model": "claude-test",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "hello"}],
+}
+
+
+class _CountingHooks(ProxyHooks):
+    def __init__(self) -> None:
+        self.before: list = []
+        self.after: list = []
+
+    def before_forward(self, exchange):
+        self.before.append(exchange)
+
+    def after_exchange(self, exchange):
+        self.after.append(exchange)
+
+
+class _Proxy:
+    """A running proxy. ``recorded()`` stops it, so every write has landed."""
+
+    def __init__(self, db_path, hooks=None) -> None:
+        self.db_path = db_path
+        self.server = ProxyServer(port=0, db_path=str(db_path), hooks=hooks)
+        self.url = f"http://127.0.0.1:{self.server.start()}"
+
+    def recorded(self, event_type=None) -> list[dict]:
+        self.server.stop()
+        db = AuditDB.open_readonly(str(self.db_path))
+        try:
+            events = list(db.iter_events())
+        finally:
+            db.close()
+        return [e for e in events if event_type in (None, e["event_type"])]
+
+
+@pytest.fixture
+def proxy(tmp_path, upstream):
+    """Start a proxy against the fake upstream; hooks are optional."""
+    started: list[_Proxy] = []
+
+    def start(hooks=None) -> _Proxy:
+        started.append(_Proxy(tmp_path / f"audit-{len(started)}.db", hooks))
+        return started[-1]
+
+    yield start
+    for running in started:
+        running.server.stop()
+
+
+def _unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def test_provider_detection_prefers_routed_path_and_handles_malformed_messages():
@@ -1832,53 +1895,19 @@ def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
 # The exchange pipeline, against a real proxy and a fake upstream
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_BODY = {
-    "model": "claude-test",
-    "max_tokens": 8,
-    "messages": [{"role": "user", "content": "hello"}],
-}
-
-
-class _CountingHooks(ProxyHooks):
-    def __init__(self) -> None:
-        self.before: list = []
-        self.after: list = []
-
-    def before_forward(self, exchange):
-        self.before.append(exchange)
-
-    def after_exchange(self, exchange):
-        self.after.append(exchange)
-
-
-@pytest.fixture
-def proxy_url(tmp_path, upstream):
-    """Start a proxy (hooks optional) and return its base URL and database."""
-    servers = []
-
-    def start(hooks=None):
-        db_path = tmp_path / "audit.db"
-        server = ProxyServer(port=0, db_path=str(db_path), hooks=hooks)
-        servers.append(server)
-        return f"http://127.0.0.1:{server.start()}", db_path
-
-    yield start
-    for server in servers:
-        server.stop()
-
 
 @pytest.mark.parametrize("hooked", [False, True], ids=["observed", "hooked"])
 def test_a_request_whose_events_cannot_be_built_is_refused(
-    proxy_url, upstream, monkeypatch, hooked
+    proxy, upstream, monkeypatch, hooked
 ):
     def broken_fingerprint(self, body):
         raise RuntimeError("fingerprint bug")
 
     monkeypatch.setattr(AnthropicProvider, "request_fingerprint", broken_fingerprint)
     hooks = _CountingHooks() if hooked else None
-    base, _ = proxy_url(hooks)
+    running = proxy(hooks)
 
-    response = httpx.post(f"{base}/v1/messages", json=ANTHROPIC_BODY, timeout=10)
+    response = httpx.post(f"{running.url}/v1/messages", json=ANTHROPIC_BODY, timeout=10)
 
     # Forwarding it would leave the exchange unrecorded.
     assert response.status_code == 500
@@ -1886,3 +1915,76 @@ def test_a_request_whose_events_cannot_be_built_is_refused(
     assert upstream.requests == []
     if hooks is not None:
         assert hooks.before == hooks.after == []
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                strict=True, reason="the streamed path records this differently"
+            ),
+        ),
+    ],
+    ids=["buffered", "streamed"],
+)
+def test_an_unreachable_upstream_is_recorded_the_same_way_in_both_paths(
+    proxy, monkeypatch, stream
+):
+    monkeypatch.setenv(
+        "PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{_unused_port()}"
+    )
+    running = proxy()
+
+    response = httpx.post(
+        f"{running.url}/v1/messages",
+        json=dict(ANTHROPIC_BODY, stream=stream),
+        timeout=10,
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"error": "Bad Gateway"}
+    [recorded] = running.recorded("model_response")
+    assert recorded["action"]["status_code"] == 502
+    assert recorded["outcome"]["status"] == "error"
+    assert recorded["outcome"]["summary"] == "Server error HTTP 502"
+    # The gateway error is what happened, not an inspection limit.
+    assert "inspection_status" not in recorded["context"]["capture"]
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.xfail(
+                strict=True, reason="the streamed path records this differently"
+            ),
+        ),
+    ],
+    ids=["buffered", "streamed"],
+)
+def test_response_events_that_fail_to_build_leave_an_incomplete_record(
+    proxy, upstream, monkeypatch, stream
+):
+    def broken_extraction(self, resp_body, *, path=None):
+        raise RuntimeError("provider extraction exploded")
+
+    monkeypatch.setattr(AnthropicProvider, "extract_tool_calls", broken_extraction)
+    upstream.mode = "stream" if stream else "json"
+    running = proxy()
+
+    response = httpx.post(
+        f"{running.url}/v1/messages",
+        json=dict(ANTHROPIC_BODY, stream=stream),
+        timeout=10,
+    )
+
+    assert response.status_code == 200  # delivered: Panoptes only observes
+    [recorded] = running.recorded("model_response")
+    assert recorded["outcome"]["status"] == "error"
+    assert "Response event construction failed" in recorded["outcome"]["summary"]
+    assert recorded["context"]["capture"]["inspection_status"] == "incomplete"
