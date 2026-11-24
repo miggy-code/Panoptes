@@ -10,8 +10,9 @@ import math
 import re
 import unicodedata
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # ── Schema version ────────────────────────────────────────────────────────────
 # v5 opens the vocabulary: ``agent.type`` and ``user.auth_method`` are validated
@@ -28,38 +29,82 @@ SCHEMA_VERSION = 5
 # for v5 events. It is also the closed list that events declaring schema
 # version 1-4 are still checked against, so ``agentgate`` stays here: rows that
 # tool wrote under v4 must remain valid. Panoptes gives it no special handling.
-KNOWN_AGENT_TYPES = frozenset({
-    "claude_code", "codex", "hermes", "antigravity", "cursor",
-    "gemini_cli", "agentgate", "unknown",
-})
+KNOWN_AGENT_TYPES = frozenset(
+    {
+        "claude_code",
+        "codex",
+        "hermes",
+        "antigravity",
+        "cursor",
+        "gemini_cli",
+        "agentgate",
+        "unknown",
+    }
+)
 
 # Built-in event types. A producer outside Panoptes names its own events with a
 # namespaced type, ``<namespace>.<name>`` (for example ``acme.allow``);
 # see ``is_valid_event_type``. The built-in set stays closed.
-ALLOWED_EVENT_TYPES = frozenset({
-    "model_request", "model_response", "tool_call", "tool_result",
-    "decision_point", "policy_violation",
-    "agent_start", "agent_step", "agent_end",
-})
+ALLOWED_EVENT_TYPES = frozenset(
+    {
+        "model_request",
+        "model_response",
+        "tool_call",
+        "tool_result",
+        "decision_point",
+        "policy_violation",
+        "agent_start",
+        "agent_step",
+        "agent_end",
+    }
+)
 
-ALLOWED_OUTCOME_STATUSES = frozenset({
-    "success", "error", "blocked", "timeout", "pending", "warned",
-})
+ALLOWED_OUTCOME_STATUSES = frozenset(
+    {
+        "success",
+        "error",
+        "blocked",
+        "timeout",
+        "pending",
+        "warned",
+    }
+)
 
 # The auth methods v1-v4 accepted. v5 accepts any validated identifier.
-LEGACY_AUTH_METHODS = frozenset({
-    "api_key", "oauth", "cli",
-})
-_LEGACY_EVENT_TYPES = frozenset({
-    "model_request", "model_response", "tool_call", "tool_result",
-    "decision_point", "policy_violation",
-})
-_LEGACY_OUTCOME_STATUSES = frozenset({
-    "success", "error", "blocked", "timeout",
-})
-_LEGACY_AGENT_TYPES = frozenset({
-    "claude_code", "codex", "hermes", "antigravity", "unknown",
-})
+LEGACY_AUTH_METHODS = frozenset(
+    {
+        "api_key",
+        "oauth",
+        "cli",
+    }
+)
+_LEGACY_EVENT_TYPES = frozenset(
+    {
+        "model_request",
+        "model_response",
+        "tool_call",
+        "tool_result",
+        "decision_point",
+        "policy_violation",
+    }
+)
+_LEGACY_OUTCOME_STATUSES = frozenset(
+    {
+        "success",
+        "error",
+        "blocked",
+        "timeout",
+    }
+)
+_LEGACY_AGENT_TYPES = frozenset(
+    {
+        "claude_code",
+        "codex",
+        "hermes",
+        "antigravity",
+        "unknown",
+    }
+)
 _EVENT_TYPES_BY_SCHEMA_VERSION = {
     1: _LEGACY_EVENT_TYPES,
     2: _LEGACY_EVENT_TYPES,
@@ -100,57 +145,94 @@ _CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
 # ── Secret redaction ───────────────────────────────────────────────────────────
 
 # Keys whose values should always be redacted regardless of content
-_SENSITIVE_KEYS: frozenset = frozenset({
-    "password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
-    "api_secret", "auth", "authorization", "private_key", "access_key",
-    "access_token", "refresh_token", "credential", "credentials",
-})
+_SENSITIVE_KEYS: frozenset = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "api_secret",
+        "auth",
+        "authorization",
+        "private_key",
+        "access_key",
+        "access_token",
+        "refresh_token",
+        "credential",
+        "credentials",
+    }
+)
 
 # Patterns for detecting secrets inside string values
-_CONTENT_PATTERNS: List[Tuple[re.Pattern, str]] = [
+_CONTENT_PATTERNS: list[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
+] = [
     # Bearer tokens in Authorization header values
-    (re.compile(r'^Bearer\s+(\S{16,})$', re.IGNORECASE),
-     'Bearer [REDACTED]'),
-    (re.compile(r'Bearer\s+([A-Za-z0-9_\-\.=]{16,})', re.IGNORECASE),
-     r'Bearer [REDACTED]'),
+    (re.compile(r"^Bearer\s+(\S{16,})$", re.IGNORECASE), "Bearer [REDACTED]"),
+    (
+        re.compile(r"Bearer\s+([A-Za-z0-9_\-\.=]{16,})", re.IGNORECASE),
+        r"Bearer [REDACTED]",
+    ),
     # Basic auth
-    (re.compile(r'Basic\s+([A-Za-z0-9+/=]{8,})', re.IGNORECASE),
-     r'Basic [REDACTED]'),
+    (re.compile(r"Basic\s+([A-Za-z0-9+/=]{8,})", re.IGNORECASE), r"Basic [REDACTED]"),
     # Private keys (PEM)
-    (re.compile(r'-----BEGIN (?:RSA|EC|DSA|OPENSSH|ENCRYPTED)?\s*PRIVATE KEY-----.*?-----END (?:RSA|EC|DSA|OPENSSH|ENCRYPTED)?\s*PRIVATE KEY-----', re.DOTALL),
-     '[REDACTED PRIVATE KEY]'),
+    (
+        re.compile(
+            r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|ENCRYPTED)?\s*PRIVATE KEY-----.*?-----END (?:RSA|EC|DSA|OPENSSH|ENCRYPTED)?\s*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "[REDACTED PRIVATE KEY]",
+    ),
     # AWS-like key IDs
-    (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED AWS KEY ID]'),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED AWS KEY ID]"),
     # GitHub tokens
-    (re.compile(r'(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}'), '[REDACTED GITHUB TOKEN]'),
+    (
+        re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}"),
+        "[REDACTED GITHUB TOKEN]",
+    ),
     # Generic API keys (sk-..., key=... patterns) inside string values
-    (re.compile(r'(?:sk|api[_-]?key|apikey)\s*[:=]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?', re.IGNORECASE),
-     lambda m: m.group(0).replace(m.group(1), '[REDACTED]')),
+    (
+        re.compile(
+            r'(?:sk|api[_-]?key|apikey)\s*[:=]\s*["\']?([A-Za-z0-9_\-\.]{16,})["\']?',
+            re.IGNORECASE,
+        ),
+        lambda m: m.group(0).replace(m.group(1), "[REDACTED]"),
+    ),
     # OpenAI-style keys are commonly logged as bare values rather than key=value.
-    (re.compile(r'\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}\b'),
-     '[REDACTED API KEY]'),
+    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{16,}\b"), "[REDACTED API KEY]"),
     # Panoptes session tokens are live bearer credentials for injected keys.
-    (re.compile(r'\bpnpt_[A-Za-z0-9_\-]{20,}'), '[REDACTED PANOPTES TOKEN]'),
+    (re.compile(r"\bpnpt_[A-Za-z0-9_\-]{20,}"), "[REDACTED PANOPTES TOKEN]"),
     # Credentials embedded in database and other authority-bearing URLs.
-    (re.compile(
-        r'(?P<scheme>[a-z][a-z0-9+\-.]*://)'
-        r'(?P<userinfo>[^/\s:@]+(?::[^/\s@]*)?@)',
-        re.IGNORECASE,
-    ), lambda m: f"{m.group('scheme')}[REDACTED]@"),
+    (
+        re.compile(
+            r"(?P<scheme>[a-z][a-z0-9+\-.]*://)"
+            r"(?P<userinfo>[^/\s:@]+(?::[^/\s@]*)?@)",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m.group('scheme')}[REDACTED]@",
+    ),
     # Signed URLs and API credentials in query strings.
-    (re.compile(
-        r'(?P<prefix>[?&](?:api[_-]?key|key|token|access[_-]?token|'
-        r'signature|sig|x-amz-signature|x-goog-signature)=)'
-        r'[^&#\s]+',
-        re.IGNORECASE,
-    ), lambda m: f"{m.group('prefix')}[REDACTED]"),
+    (
+        re.compile(
+            r"(?P<prefix>[?&](?:api[_-]?key|key|token|access[_-]?token|"
+            r"signature|sig|x-amz-signature|x-goog-signature)=)"
+            r"[^&#\s]+",
+            re.IGNORECASE,
+        ),
+        lambda m: f"{m.group('prefix')}[REDACTED]",
+    ),
 ]
 
 _REDACT_REPLACEMENT = "[REDACTED]"
-_NON_SECRET_METADATA_KEYS = frozenset({
-    # This records how the caller authenticated; it is not itself a credential.
-    "auth_method",
-})
+_NON_SECRET_METADATA_KEYS = frozenset(
+    {
+        # This records how the caller authenticated; it is not itself a credential.
+        "auth_method",
+    }
+)
 _SAFE_CAPTURE_METADATA_VALUES = {
     # This fixed capability label is not an HTTP Authorization header. Only
     # known values receive that exception; arbitrary values under a
@@ -160,11 +242,11 @@ _SAFE_CAPTURE_METADATA_VALUES = {
 _CAPTURE_PROVENANCE = "adapter_asserted"
 
 # Compiled regex for camelCase splitting (used in key tokenization)
-_CAMEL_SPLIT_RE = re.compile(r'([a-z])([A-Z])')
-_DELIMITER_SPLIT_RE = re.compile(r'[_\-\s]+')
+_CAMEL_SPLIT_RE = re.compile(r"([a-z])([A-Z])")
+_DELIMITER_SPLIT_RE = re.compile(r"[_\-\s]+")
 
 
-def _tokenize_key(key: str) -> List[str]:
+def _tokenize_key(key: str) -> list[str]:
     """Tokenize a key name into lower-case word parts.
 
     Handles snake_case, kebab-case, space-separated, and camelCase names.
@@ -176,7 +258,7 @@ def _tokenize_key(key: str) -> List[str]:
         "AWS-SECRET-KEY"    → ["aws", "secret", "key"]
     """
     # Split camelCase boundaries before lowercasing
-    camel_split = _CAMEL_SPLIT_RE.sub(r'\1_\2', key)
+    camel_split = _CAMEL_SPLIT_RE.sub(r"\1_\2", key)
     parts = _DELIMITER_SPLIT_RE.split(camel_split)
     return [p.lower() for p in parts if p]
 
@@ -232,7 +314,7 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_string(value)
     if isinstance(value, dict):
-        redacted: Dict[str, Any] = {}
+        redacted: dict[str, Any] = {}
         for k, v in value.items():
             redacted_key = _redact_string(k) if isinstance(k, str) else k
             if redacted_key in redacted:
@@ -263,7 +345,7 @@ def _redact_capture_metadata(value: Any) -> Any:
     if not isinstance(value, dict):
         return redact_secrets(value)
 
-    redacted: Dict[Any, Any] = {}
+    redacted: dict[Any, Any] = {}
     for key, item in value.items():
         redacted_key = _redact_string(key) if isinstance(key, str) else key
         if redacted_key in redacted:
@@ -299,38 +381,50 @@ def _redact_capture_metadata(value: Any) -> Any:
 #   from panoptes.schema import DATA_ACCESS_CLASSIFIERS
 #   DATA_ACCESS_CLASSIFIERS.append((re.compile(r'\bstaging\b'), 'staging'))
 
-DATA_ACCESS_CLASSIFIERS: List[Tuple[re.Pattern, str]] = [
+DATA_ACCESS_CLASSIFIERS: list[tuple[re.Pattern, str]] = [
     # prod: production paths, namespaces, hostnames, or env names
-    (re.compile(
-        r'(?<![A-Za-z0-9])prod(?:uction)?(?![A-Za-z0-9])',
-        re.IGNORECASE,
-    ), 'prod'),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9])prod(?:uction)?(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        ),
+        "prod",
+    ),
     # secrets: credential files, private keys, secret-named paths/vars
-    (re.compile(
-        r'\.env\b|id_rsa|\.pem\b|\.key\b|/etc/passwd|/etc/shadow'
-        r'|credential|AWS_SECRET|/vault/',
-        re.IGNORECASE
-    ), 'secrets'),
+    (
+        re.compile(
+            r"\.env\b|id_rsa|\.pem\b|\.key\b|/etc/passwd|/etc/shadow"
+            r"|credential|AWS_SECRET|/vault/",
+            re.IGNORECASE,
+        ),
+        "secrets",
+    ),
     # infra: infrastructure orchestration CLI tools
-    (re.compile(r'\b(?:kubectl|helm|terraform|gcloud)\b', re.IGNORECASE), 'infra'),
+    (re.compile(r"\b(?:kubectl|helm|terraform|gcloud)\b", re.IGNORECASE), "infra"),
     # database: database clients and connection-string env vars
-    (re.compile(r'\b(?:psql|mysql|mongosh?|redis-cli)\b|DATABASE_URL', re.IGNORECASE), 'database'),
+    (
+        re.compile(
+            r"\b(?:psql|mysql|mongosh?|redis-cli)\b|DATABASE_URL", re.IGNORECASE
+        ),
+        "database",
+    ),
     # network: HTTP transfer tools and URLs
-    (re.compile(r'\b(?:curl|wget)\b|https?://', re.IGNORECASE), 'network'),
+    (re.compile(r"\b(?:curl|wget)\b|https?://", re.IGNORECASE), "network"),
 ]
+
 
 def _collect_string_values(
     obj: Any,
-    _out: Optional[List[str]] = None,
-    _seen: Optional[set[int]] = None,
-) -> List[str]:
+    _out: list[str] | None = None,
+    _seen: set[int] | None = None,
+) -> list[str]:
     """Recursively collect all string keys and values from JSON-like input.
 
     Uses a shared accumulator to avoid building intermediate lists at
     every level of the recursion. Container identities are tracked so a
     malformed cyclic Python object cannot recurse forever.
     """
-    out: List[str] = [] if _out is None else _out
+    out: list[str] = [] if _out is None else _out
     seen: set[int] = set() if _seen is None else _seen
     if isinstance(obj, str):
         out.append(obj)
@@ -353,7 +447,7 @@ def _collect_string_values(
     return out
 
 
-def _derive_data_accessed(action: Dict[str, Any], event_type: str) -> List[str]:
+def _derive_data_accessed(action: dict[str, Any], event_type: str) -> list[str]:
     """Scan action parameters and target for data-access tags.
 
     Returns a sorted deduplicated list of server-derived tags.
@@ -370,7 +464,8 @@ def _derive_data_accessed(action: Dict[str, Any], event_type: str) -> List[str]:
     scan_action = {
         key: value
         for key, value in action.items()
-        if key not in {
+        if key
+        not in {
             "call_id",
             "data_accessed",
             "declared_data_accessed",
@@ -390,8 +485,10 @@ def _derive_data_accessed(action: Dict[str, Any], event_type: str) -> List[str]:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
+
 class ValidationError(Exception):
     """Raised when an event fails schema validation."""
+
     pass
 
 
@@ -404,17 +501,14 @@ def validate_identifier(value: Any, field: str = "identifier") -> None:
             f"{field} must be at most {MAX_IDENTIFIER_LENGTH} characters"
         )
     if _CONTROL_CHARACTER_RE.search(value) or any(
-        unicodedata.category(character).startswith("C")
-        for character in value
+        unicodedata.category(character).startswith("C") for character in value
     ):
         raise ValidationError(f"{field} must not contain control characters")
     if "[REDACTED" in value or _redact_string(value) != value:
         raise ValidationError(f"{field} must not contain secret material")
 
 
-def is_valid_event_type(
-    event_type: Any, schema_version: int = SCHEMA_VERSION
-) -> bool:
+def is_valid_event_type(event_type: Any, schema_version: int = SCHEMA_VERSION) -> bool:
     """Whether *event_type* is legal under the given schema version.
 
     Every version accepts its built-in set. From v5, a namespaced type
@@ -437,7 +531,8 @@ def _resolve_schema_version(context: Any) -> int:
     """The schema version an event declares (default: the current one)."""
     version = (
         context.get("schema_version", SCHEMA_VERSION)
-        if isinstance(context, dict) else SCHEMA_VERSION
+        if isinstance(context, dict)
+        else SCHEMA_VERSION
     )
     if (
         isinstance(version, bool)
@@ -463,9 +558,7 @@ def _validate_attributes(attributes: Any) -> None:
     if not isinstance(attributes, dict):
         raise ValidationError("attributes must be a dict")
     _validate_json_value(attributes, "attributes")
-    size = len(
-        json.dumps(attributes, ensure_ascii=False).encode("utf-8", "replace")
-    )
+    size = len(json.dumps(attributes, ensure_ascii=False).encode("utf-8", "replace"))
     if size > MAX_ATTRIBUTES_BYTES:
         raise ValidationError(
             f"attributes exceeds the maximum of {MAX_ATTRIBUTES_BYTES} bytes"
@@ -493,13 +586,8 @@ def _validate_capture_metadata(
             continue
         value = capture[field]
         if not isinstance(value, str) or not value:
-            raise ValidationError(
-                f"context.capture.{field} must be a non-empty string"
-            )
-    if (
-        "provenance" in capture
-        and capture["provenance"] != _CAPTURE_PROVENANCE
-    ):
+            raise ValidationError(f"context.capture.{field} must be a non-empty string")
+    if "provenance" in capture and capture["provenance"] != _CAPTURE_PROVENANCE:
         raise ValidationError(
             "context.capture.provenance must declare an adapter assertion"
         )
@@ -516,9 +604,7 @@ def _validate_capture_metadata(
         if field in capture and not isinstance(capture[field], bool):
             raise ValidationError(f"context.capture.{field} must be a bool")
     if "authenticated" in capture and capture["authenticated"] is not False:
-        raise ValidationError(
-            "context.capture cannot claim authenticated provenance"
-        )
+        raise ValidationError("context.capture cannot claim authenticated provenance")
     if require_assertion_marker and "authenticated" not in capture:
         raise ValidationError(
             "context.capture must explicitly disclaim authenticated provenance"
@@ -527,14 +613,14 @@ def _validate_capture_metadata(
     observed_events = capture.get("observed_events")
     if observed_events is not None:
         if not isinstance(observed_events, list) or not all(
-            isinstance(event_type, str) and event_type
-            for event_type in observed_events
+            isinstance(event_type, str) and event_type for event_type in observed_events
         ):
             raise ValidationError(
                 "context.capture.observed_events must be a list of event types"
             )
         unknown_event_types = {
-            event_type for event_type in observed_events
+            event_type
+            for event_type in observed_events
             if not is_valid_event_type(event_type)
         }
         if unknown_event_types:
@@ -546,8 +632,7 @@ def _validate_capture_metadata(
     enforcement_points = capture.get("enforcement_points")
     if enforcement_points is not None:
         if not isinstance(enforcement_points, list) or not all(
-            isinstance(point, str) and point
-            for point in enforcement_points
+            isinstance(point, str) and point for point in enforcement_points
         ):
             raise ValidationError(
                 "context.capture.enforcement_points must be a list of strings"
@@ -557,12 +642,10 @@ def _validate_capture_metadata(
         raise ValidationError("context.capture.notes must be a string")
     for field, allowed_values in _SAFE_CAPTURE_METADATA_VALUES.items():
         if field in capture and (
-            not isinstance(capture[field], str)
-            or capture[field] not in allowed_values
+            not isinstance(capture[field], str) or capture[field] not in allowed_values
         ):
             raise ValidationError(
-                f"context.capture.{field} must be one of "
-                f"{sorted(allowed_values)}"
+                f"context.capture.{field} must be one of {sorted(allowed_values)}"
             )
 
 
@@ -575,7 +658,9 @@ def _reject_unencodable(text: str, path: str) -> None:
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:
-        raise ValidationError(f"{path} contains text that is not valid Unicode") from exc
+        raise ValidationError(
+            f"{path} contains text that is not valid Unicode"
+        ) from exc
 
 
 def _validate_json_value(
@@ -583,8 +668,8 @@ def _validate_json_value(
     path: str,
     *,
     depth: int = 0,
-    seen: Optional[set[int]] = None,
-    budget: Optional[Dict[str, int]] = None,
+    seen: set[int] | None = None,
+    budget: dict[str, int] | None = None,
 ) -> None:
     """Reject cyclic, non-JSON, non-finite, or pathologically deep content."""
     budget = {"nodes": 0, "text_chars": 0} if budget is None else budget
@@ -602,8 +687,7 @@ def _validate_json_value(
         budget["text_chars"] += len(value)
         if budget["text_chars"] > MAX_EVENT_TEXT_CHARS:
             raise ValidationError(
-                "event text exceeds the maximum of "
-                f"{MAX_EVENT_TEXT_CHARS} characters"
+                f"event text exceeds the maximum of {MAX_EVENT_TEXT_CHARS} characters"
             )
         return
     if value is None or isinstance(value, bool):
@@ -611,8 +695,7 @@ def _validate_json_value(
     if isinstance(value, int):
         if value.bit_length() > MAX_JSON_INTEGER_BITS:
             raise ValidationError(
-                f"{path} contains an integer larger than "
-                f"{MAX_JSON_INTEGER_BITS} bits"
+                f"{path} contains an integer larger than {MAX_JSON_INTEGER_BITS} bits"
             )
         return
     if isinstance(value, float):
@@ -669,7 +752,7 @@ def _validate_json_value(
     )
 
 
-def _validate_required_fields(event: Dict[str, Any]) -> None:
+def _validate_required_fields(event: dict[str, Any]) -> None:
     if not isinstance(event, dict):
         raise ValidationError("event must be a dict")
 
@@ -715,18 +798,12 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
             # A stored legacy row read back carries these empty; only a value
             # is a v5 feature.
             if event.get(field):
-                raise ValidationError(
-                    f"{field} requires context.schema_version 5"
-                )
+                raise ValidationError(f"{field} requires context.schema_version 5")
     else:
         validate_identifier(agent.get("type"), "agent.type")
         _validate_optional_identifier(agent.get("run_id"), "agent.run_id")
-        _validate_optional_identifier(
-            agent.get("parent_run_id"), "agent.parent_run_id"
-        )
-        _validate_optional_identifier(
-            event.get("correlation_id"), "correlation_id"
-        )
+        _validate_optional_identifier(agent.get("parent_run_id"), "agent.parent_run_id")
+        _validate_optional_identifier(event.get("correlation_id"), "correlation_id")
         _validate_attributes(event.get("attributes"))
     validate_identifier(agent.get("session_id"), "agent.session_id")
 
@@ -754,14 +831,15 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
         try:
             parsed.astimezone(timezone.utc)
         except OverflowError as exc:
-            raise ValidationError("timestamp is outside the representable range") from exc
+            raise ValidationError(
+                "timestamp is outside the representable range"
+            ) from exc
 
     # event_type
     if not is_valid_event_type(event.get("event_type"), schema_version):
         allowed_event_types = _EVENT_TYPES_BY_SCHEMA_VERSION[schema_version]
         namespaced = (
-            "; or a namespaced '<namespace>.<name>' type"
-            if schema_version >= 5 else ""
+            "; or a namespaced '<namespace>.<name>' type" if schema_version >= 5 else ""
         )
         raise ValidationError(
             f"Invalid event_type '{event.get('event_type')}' for event schema "
@@ -793,16 +871,16 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
         not isinstance(data_accessed, list)
         or not all(isinstance(tag, str) and tag for tag in data_accessed)
     ):
-        raise ValidationError("action.data_accessed must be a list of non-empty strings")
+        raise ValidationError(
+            "action.data_accessed must be a list of non-empty strings"
+        )
     for field in ("declared_data_accessed", "derived_data_accessed"):
         tags = action.get(field)
         if tags is not None and (
             not isinstance(tags, list)
             or not all(isinstance(tag, str) and tag for tag in tags)
         ):
-            raise ValidationError(
-                f"action.{field} must be a list of non-empty strings"
-            )
+            raise ValidationError(f"action.{field} must be a list of non-empty strings")
     call_id = action.get("call_id")
     if call_id is not None:
         validate_identifier(call_id, "action.call_id")
@@ -817,13 +895,13 @@ def _validate_required_fields(event: Dict[str, Any]) -> None:
         raise ValidationError("context.turn_number must be a non-negative integer")
 
 
-def validate_event(event: Dict[str, Any]) -> List[str]:
+def validate_event(event: dict[str, Any]) -> list[str]:
     """Validate an event against the universal schema.
 
     Returns a list of warnings (non-fatal issues). Raises ValidationError
     for fatal issues (missing required fields, invalid values).
     """
-    warnings: List[str] = []
+    warnings: list[str] = []
     _validate_required_fields(event)
 
     # Validate user if present. From v5 a user is optional and so are both
@@ -851,10 +929,17 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     if cost is not None and not isinstance(cost, dict):
         raise ValidationError("'cost' must be a dict")
     if isinstance(cost, dict):
-        for field in ("tokens_in", "tokens_out", "estimated_usd", "reasoning_tokens",
-                      "cached_input_tokens", "cache_creation_input_tokens",
-                      "cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens",
-                      "tool_prompt_tokens"):
+        for field in (
+            "tokens_in",
+            "tokens_out",
+            "estimated_usd",
+            "reasoning_tokens",
+            "cached_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_creation_5m_input_tokens",
+            "cache_creation_1h_input_tokens",
+            "tool_prompt_tokens",
+        ):
             value = cost.get(field)
             if value is None:
                 continue
@@ -888,8 +973,7 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
     if et == "agent_step":
         tool_names = action.get("tool_names")
         if not isinstance(tool_names, list) or not all(
-            isinstance(tool_name, str) and tool_name
-            for tool_name in tool_names
+            isinstance(tool_name, str) and tool_name for tool_name in tool_names
         ):
             raise ValidationError(
                 "agent_step action.tool_names must be a list of tool identifiers"
@@ -927,6 +1011,7 @@ def validate_event(event: Dict[str, Any]) -> List[str]:
 
 # ── Normalization ─────────────────────────────────────────────────────────────
 
+
 def _format_utc(dt: datetime) -> str:
     """Format a datetime as ISO8601 UTC with millisecond precision and Z suffix."""
     if dt.tzinfo is not None:
@@ -961,7 +1046,7 @@ def _normalize_timestamp(ts: Any) -> str:
     return _format_utc(parsed)
 
 
-def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_event(raw_event: dict[str, Any]) -> dict[str, Any]:
     """Normalize a raw event dict into the canonical schema.
 
     This fills in defaults, generates missing fields, redacts secrets,
@@ -991,7 +1076,13 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
         if value is not None:
             _validate_json_value(value, field, budget=json_budget)
     for field in (
-        "agent", "user", "action", "outcome", "context", "cost", "attributes"
+        "agent",
+        "user",
+        "action",
+        "outcome",
+        "context",
+        "cost",
+        "attributes",
     ):
         value = raw_event.get(field)
         if value is not None and not isinstance(value, dict):
@@ -1008,11 +1099,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     raw_context = raw_event.get("context", {}) or {}
     schema_version = _resolve_schema_version(raw_context)
     legacy = schema_version < 5
-    session_id = (
-        agent["session_id"]
-        if "session_id" in agent
-        else uuid.uuid4().hex
-    )
+    session_id = agent["session_id"] if "session_id" in agent else uuid.uuid4().hex
     validate_identifier(session_id, "agent.session_id")
     if legacy:
         run_id = agent["run_id"] if "run_id" in agent else uuid.uuid4().hex
@@ -1055,9 +1142,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
             not isinstance(tags, list)
             or not all(isinstance(tag, str) and tag for tag in tags)
         ):
-            raise ValidationError(
-                f"action.{field} must be a list of non-empty strings"
-            )
+            raise ValidationError(f"action.{field} must be a list of non-empty strings")
     tool_name = action.get("tool_name")
     if tool_name is not None:
         validate_identifier(tool_name, "action.tool_name")
@@ -1074,7 +1159,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     if raw_context.get("capture") is not None:
         _validate_capture_metadata(raw_context["capture"])
 
-    event: Dict[str, Any] = {}
+    event: dict[str, Any] = {}
 
     # --- event_id ---
     event["event_id"] = event_id
@@ -1107,7 +1192,8 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     else:
         # No default identity: absent stays absent.
         user_fields = {
-            key: value for key, value in user.items()
+            key: value
+            for key, value in user.items()
             if not (key in ("id", "auth_method") and value is None)
         }
     redacted_user = redact_secrets(user_fields)
@@ -1143,7 +1229,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     # --- always derive authoritative tags and union adapter-declared hints ---
-    derived: List[str] = []
+    derived: list[str] = []
     if event_type in (
         "tool_call",
         "tool_result",
@@ -1157,9 +1243,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
     # recomputes this field from the action itself.
     event["action"]["derived_data_accessed"] = sorted(set(derived))
     event["action"]["data_accessed"] = sorted(
-        set(declared_data_accessed).union(
-            event["action"]["derived_data_accessed"]
-        )
+        set(declared_data_accessed).union(event["action"]["derived_data_accessed"])
     )
     event["action"] = redact_secrets(event["action"])
     event["action"]["tool_name"] = tool_name
@@ -1169,12 +1253,14 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- outcome ---
     outcome = raw_event.get("outcome", {}) or {}
-    event["outcome"] = redact_secrets({
-        **outcome,
-        "status": outcome.get("status", "success"),
-        "summary": outcome.get("summary"),
-        "error": outcome.get("error"),
-    })
+    event["outcome"] = redact_secrets(
+        {
+            **outcome,
+            "status": outcome.get("status", "success"),
+            "summary": outcome.get("summary"),
+            "error": outcome.get("error"),
+        }
+    )
 
     # --- context (truncate user_message to 500 chars) ---
     context = raw_context
@@ -1202,12 +1288,14 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- cost ---
     cost = raw_event.get("cost", {}) or {}
-    event["cost"] = redact_secrets({
-        **cost,
-        "tokens_in": cost.get("tokens_in"),
-        "tokens_out": cost.get("tokens_out"),
-        "estimated_usd": cost.get("estimated_usd"),
-    })
+    event["cost"] = redact_secrets(
+        {
+            **cost,
+            "tokens_in": cost.get("tokens_in"),
+            "tokens_out": cost.get("tokens_out"),
+            "estimated_usd": cost.get("estimated_usd"),
+        }
+    )
 
     # --- raw payloads (optional, for debugging) ---
     event["raw_request"] = redact_secrets(raw_event.get("raw_request"))
@@ -1217,6 +1305,7 @@ def normalize_event(raw_event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ── Strict ingest ─────────────────────────────────────────────────────────────
+
 
 class IdentifierRewriteError(ValidationError):
     """Raised by strict ingest when redaction would alter an identifier field."""
@@ -1245,13 +1334,13 @@ STRICT_IDENTIFIER_PATHS = (
 _MISSING = object()
 
 
-def _values_at(root: Any, path: str) -> List[Any]:
+def _values_at(root: Any, path: str) -> list[Any]:
     """Every value *path* reaches in *root*; absent keys reach nothing."""
     nodes = [root]
     for part in path.split("."):
         each = part.endswith("[]")
         key = part[:-2] if each else part
-        reached: List[Any] = []
+        reached: list[Any] = []
         for node in nodes:
             value = node.get(key, _MISSING) if isinstance(node, dict) else _MISSING
             if value is _MISSING:
@@ -1266,9 +1355,9 @@ def _values_at(root: Any, path: str) -> List[Any]:
 
 
 def check_strict_identifiers(
-    raw_event: Dict[str, Any],
-    normalized: Dict[str, Any],
-    extra_paths: Tuple[str, ...] = (),
+    raw_event: dict[str, Any],
+    normalized: dict[str, Any],
+    extra_paths: tuple[str, ...] = (),
 ) -> None:
     """Refuse an event whose identifier fields normalization changed.
 
@@ -1292,7 +1381,8 @@ def check_strict_identifiers(
 
 # ── Helper: extract flattened fields for SQLite indexing ──────────────────────
 
-def extract_index_fields(event: Dict[str, Any]) -> Dict[str, Any]:
+
+def extract_index_fields(event: dict[str, Any]) -> dict[str, Any]:
     """Extract flattened fields from a normalized event for SQLite storage.
 
     SQLite stores nested dicts as JSON TEXT, but we also extract key fields

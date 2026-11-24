@@ -10,24 +10,33 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from enum import Enum, auto
 import logging
 import socket
 import threading
 import time
-from typing import Any
+from enum import Enum, auto
+from http.server import BaseHTTPRequestHandler
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from panoptes._events import AuditWriteError, provider_reported_usage
+from panoptes._events import AuditEventWriter, AuditWriteError, provider_reported_usage
 from panoptes.hooks import (
     STATIC_HOP_BY_HOP,
     Exchange,
     Identity,
     OutboundHeaders,
+    ProxyHooks,
     RequestHeaders,
     reject_response,
 )
+
+# The mixin only works on top of a request handler. Type checkers see that
+# base; at runtime ProxyHandler supplies it, so the MRO stays unchanged.
+if TYPE_CHECKING:
+    _HandlerBase = BaseHTTPRequestHandler
+else:
+    _HandlerBase = object
 
 log = logging.getLogger("panoptes")
 
@@ -67,7 +76,9 @@ def _may_have_reached_upstream(exc: BaseException) -> bool:
     )
 
 
-def _start_drain_timer(resp: Any, seconds: float) -> tuple[threading.Timer, threading.Event]:
+def _start_drain_timer(
+    resp: Any, seconds: float
+) -> tuple[threading.Timer, threading.Event]:
     """Cut the upstream read after *seconds*, however silent the upstream is.
 
     A deadline checked only when a chunk arrives is no bound at all: a stalled
@@ -102,7 +113,7 @@ def _answer_if_client_present(handler: Any, status: int, message: str) -> None:
         log.warning("Client disconnected before the %s reply was written", status)
 
 
-def _report_of(handler: Any) -> "_ForwardReport":
+def _report_of(handler: Any) -> _ForwardReport:
     run = getattr(handler, "_run", None)
     return run.report if run is not None else _ForwardReport()
 
@@ -130,6 +141,8 @@ class _ExchangeRun:
     """Proxy-side state of one exchange that entered ``before_forward``."""
 
     exchange: Exchange
+    hooks: ProxyHooks
+    writer: AuditEventWriter
     t0: float
     client_headers: dict
     req_body: dict | None  # the original, never the copy a hook can edit
@@ -161,12 +174,23 @@ class _ExchangeRun:
         return True
 
 
-class HookedExchangeMixin:
+class HookedExchangeMixin(_HandlerBase):
     """The hook-handling half of ``ProxyHandler``.
 
-    Expects the handler to provide ``hooks``, ``writer``, ``headers``,
-    ``_build_fwd_headers`` and ``_send_json_error``.
+    The attributes and methods declared below are provided by ``ProxyHandler``.
     """
+
+    hook_slow_seconds: float
+    _run: _ExchangeRun | None
+    _upstream_name: str
+
+    if TYPE_CHECKING:
+
+        def _build_fwd_headers(self, headers: dict[str, str]) -> dict[str, str]: ...
+
+        def _send_json_error(
+            self, status: int, message: str, extra: dict | None = None
+        ) -> None: ...
 
     # ------------------------------------------------------------------
     # Hook seam (docs/hooks.md)
@@ -186,6 +210,8 @@ class HookedExchangeMixin:
         exchange_ctx: dict,
         query_credentials: list[str],
         t0: float,
+        hooks: ProxyHooks,
+        writer: AuditEventWriter,
     ) -> _ExchangeRun:
         seeded = Identity(
             agent_type=exchange_ctx["agent_type"],
@@ -211,6 +237,8 @@ class HookedExchangeMixin:
         )
         run = _ExchangeRun(
             exchange=exchange,
+            hooks=hooks,
+            writer=writer,
             t0=t0,
             client_headers=req_headers,
             req_body=req_body,
@@ -227,13 +255,13 @@ class HookedExchangeMixin:
     def _run_before_forward(self, run: _ExchangeRun) -> bool:
         """Run ``before_forward`` and act on its answer. True means forward."""
         exchange = run.exchange
-        writer = self.writer
+        writer = run.writer
         run.enter()  # after_exchange is owed from here
         started = time.monotonic()
         failure: Exception | None = None
         reject: tuple[int, bytes, str] | None = None
         try:
-            result = self.hooks.before_forward(exchange)
+            result = run.hooks.before_forward(exchange)
             if result is not None:
                 reject = reject_response(result)
         except Exception as exc:
@@ -270,7 +298,7 @@ class HookedExchangeMixin:
             status, encoded, reason = reject
             hook = {"action": "reject", "status": status, "reason": reason}
             self._mark_hook_blocked(events, hook)
-            self._write_best_effort(events, "Hook rejection audit was not durable")
+            self._write_best_effort(run, events, "Hook rejection audit was not durable")
             run.outcome, run.status = "rejected", status
             self._send_json_bytes(status, encoded)
             return False
@@ -318,7 +346,7 @@ class HookedExchangeMixin:
         self._mark_hook_blocked(
             events, {"action": "error", "error_type": type(exc).__name__}
         )
-        self._write_best_effort(events, "Hook error audit was not durable")
+        self._write_best_effort(run, events, "Hook error audit was not durable")
         run.outcome, run.status = "hook_error", 502
         self._send_json_error(502, "The request could not be processed")
 
@@ -328,9 +356,11 @@ class HookedExchangeMixin:
         for event in events:
             event.setdefault("attributes", {})["hook"] = dict(hook)
 
-    def _write_best_effort(self, events: list[dict], message: str) -> None:
+    def _write_best_effort(
+        self, run: _ExchangeRun, events: list[dict], message: str
+    ) -> None:
         try:
-            self.writer.write(events)
+            run.writer.write(events)
         except AuditWriteError:
             log.exception(message)
 
@@ -347,7 +377,9 @@ class HookedExchangeMixin:
             log.warning(
                 "%s took %.1fs (hook_slow_seconds=%s); a slow hook holds a "
                 "request slot",
-                hook, elapsed, self.hook_slow_seconds,
+                hook,
+                elapsed,
+                self.hook_slow_seconds,
             )
 
     def _set_outcome(self, outcome: str, status: int | None) -> None:
@@ -406,7 +438,9 @@ class HookedExchangeMixin:
         outcome = run.outcome or "aborted"
         usage = run.usage
         sent = report.request_sent and outcome not in (
-            "rejected", "hook_error", "not_forwarded"
+            "rejected",
+            "hook_error",
+            "not_forwarded",
         )
         status = run.status
         # What the provider did, not what the client was told: Panoptes may
@@ -433,11 +467,11 @@ class HookedExchangeMixin:
         )
         started = time.monotonic()
         try:
-            self.hooks.after_exchange(exchange)
+            run.hooks.after_exchange(exchange)
         except Exception as exc:
             log.exception("after_exchange raised")
             try:
-                self.writer.write([self.writer.build_hook_error_event(run.ctx, exc)])
+                run.writer.write([run.writer.build_hook_error_event(run.ctx, exc)])
             except Exception:
                 log.exception("Could not record the after_exchange failure")
         finally:

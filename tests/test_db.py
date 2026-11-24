@@ -19,7 +19,6 @@ import sqlite3
 import stat
 import tempfile
 import threading
-import time
 import uuid
 
 import pytest
@@ -38,16 +37,18 @@ from panoptes.schema import SCHEMA_VERSION
 def test_insert_normalizes_and_redacts_stored_events(tmp_path):
     db = AuditDB(str(tmp_path / "audit.db"))
     try:
-        event_id = db.insert_event({
-            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-            "event_type": "tool_call",
-            "action": {
-                "tool_name": "read_file",
-                "parameters": {"path": "/srv/prod/config", "password": "secret123"},
-            },
-            "outcome": {"status": "pending"},
-            "context": {},
-        })
+        event_id = db.insert_event(
+            {
+                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                "event_type": "tool_call",
+                "action": {
+                    "tool_name": "read_file",
+                    "parameters": {"path": "/srv/prod/config", "password": "secret123"},
+                },
+                "outcome": {"status": "pending"},
+                "context": {},
+            }
+        )
         stored = db.query()[0]
         assert stored["event_id"] == event_id
         assert stored["timestamp"]
@@ -69,8 +70,7 @@ def test_db_lifecycle():
         # Schema version should match this build.
         stats = db.get_stats()
         assert stats["schema_version"] == SCHEMA_VERSION, (
-            f"Expected schema_version={SCHEMA_VERSION}, "
-            f"got {stats['schema_version']}"
+            f"Expected schema_version={SCHEMA_VERSION}, got {stats['schema_version']}"
         )
         assert stats["total_events"] == 0
 
@@ -80,21 +80,23 @@ def test_db_lifecycle():
             sid = uuid.uuid4().hex
             session_ids[agent_type] = sid
             for i in range(3):
-                eid = db.insert_event({
-                    "agent": {
-                        "type": agent_type,
-                        "session_id": sid,
-                        "run_id": uuid.uuid4().hex,
-                    },
-                    "event_type": "tool_call" if i % 2 == 0 else "model_response",
-                    "action": {
-                        "tool_name": "read_file" if i % 2 == 0 else None,
-                        "parameters": {"path": f"/tmp/file_{i}.txt"},
-                        "data_accessed": ["prod_db"] if i == 0 else [],
-                    },
-                    "outcome": {"status": "success", "summary": f"step {i}"},
-                    "context": {"turn_number": i, "user_message": f"do step {i}"},
-                })
+                eid = db.insert_event(
+                    {
+                        "agent": {
+                            "type": agent_type,
+                            "session_id": sid,
+                            "run_id": uuid.uuid4().hex,
+                        },
+                        "event_type": "tool_call" if i % 2 == 0 else "model_response",
+                        "action": {
+                            "tool_name": "read_file" if i % 2 == 0 else None,
+                            "parameters": {"path": f"/tmp/file_{i}.txt"},
+                            "data_accessed": ["prod_db"] if i == 0 else [],
+                        },
+                        "outcome": {"status": "success", "summary": f"step {i}"},
+                        "context": {"turn_number": i, "user_message": f"do step {i}"},
+                    }
+                )
                 assert eid, "insert_event should return event_id"
 
         stats2 = db.get_stats()
@@ -112,13 +114,15 @@ def test_in_memory_database_persists_across_operation_connections():
     """The documented :memory: path shares state across DB operations."""
 
     db = AuditDB(":memory:")
-    event_id = db.insert_event({
-        "agent": {"type": "hermes", "session_id": "memory", "run_id": "run-1"},
-        "event_type": "model_request",
-        "action": {},
-        "outcome": {"status": "success"},
-        "context": {},
-    })
+    event_id = db.insert_event(
+        {
+            "agent": {"type": "hermes", "session_id": "memory", "run_id": "run-1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {},
+        }
+    )
     assert event_id
     assert db.get_stats()["total_events"] == 1
     assert [event["event_id"] for event in db.query()] == [event_id]
@@ -135,24 +139,25 @@ def test_query_filters():
         db = AuditDB(db_path)
 
         sid = uuid.uuid4().hex
-        base_ts = "2026-07-05T10:00:00.000Z"
 
         # Insert events with known timestamps
         for i in range(5):
             ts = f"2026-07-05T10:0{i}:00.000Z"
-            db.insert_event({
-                "event_id": f"evt_{i}",
-                "timestamp": ts,
-                "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
-                "event_type": "tool_call" if i < 3 else "model_response",
-                "action": {
-                    "tool_name": "read_file",
-                    "parameters": {},
-                    "data_accessed": ["customer_db"] if i == 0 else ["config"],
-                },
-                "outcome": {"status": "success"},
-                "context": {"turn_number": i},
-            })
+            db.insert_event(
+                {
+                    "event_id": f"evt_{i}",
+                    "timestamp": ts,
+                    "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
+                    "event_type": "tool_call" if i < 3 else "model_response",
+                    "action": {
+                        "tool_name": "read_file",
+                        "parameters": {},
+                        "data_accessed": ["customer_db"] if i == 0 else ["config"],
+                    },
+                    "outcome": {"status": "success"},
+                    "context": {"turn_number": i},
+                }
+            )
 
         # Filter by agent_type
         results = db.query(agent_type="hermes")
@@ -169,7 +174,9 @@ def test_query_filters():
         results = db.query(until="2026-07-05T10:01:00.000Z")
         assert len(results) == 2  # evt_0, evt_1
 
-        results = db.query(since="2026-07-05T10:01:00.000Z", until="2026-07-05T10:03:00.000Z")
+        results = db.query(
+            since="2026-07-05T10:01:00.000Z", until="2026-07-05T10:03:00.000Z"
+        )
         assert len(results) == 3  # evt_1, evt_2, evt_3
 
         # Filter by data_accessed
@@ -204,14 +211,17 @@ def test_evidence_chain():
         # Turn 1: user message -> model_request -> tool_call -> tool_result -> model_response
         # Each turn shares a run_id; different turns use different run_ids.
         events = [
-            {   # 0: user message / model request (turn 1)
+            {  # 0: user message / model request (turn 1)
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
                 "event_type": "model_request",
                 "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
                 "outcome": {"status": "success", "summary": "Deciding to read config"},
-                "context": {"turn_number": 1, "user_message": "Show me the production database config"},
+                "context": {
+                    "turn_number": 1,
+                    "user_message": "Show me the production database config",
+                },
             },
-            {   # 1: tool_call (turn 1) — no explicit call_id, so falls back to turn-number chain
+            {  # 1: tool_call (turn 1) — no explicit call_id, so falls back to turn-number chain
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
                 "event_type": "tool_call",
                 "action": {
@@ -220,9 +230,12 @@ def test_evidence_chain():
                     "data_accessed": ["prod_config"],
                 },
                 "outcome": {"status": "success"},
-                "context": {"turn_number": 1, "reasoning": "Need to read prod config to answer"},
+                "context": {
+                    "turn_number": 1,
+                    "reasoning": "Need to read prod config to answer",
+                },
             },
-            {   # 2: tool_result (turn 1)
+            {  # 2: tool_result (turn 1)
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
                 "event_type": "tool_result",
                 "action": {
@@ -230,18 +243,24 @@ def test_evidence_chain():
                     "parameters": {"path": "/etc/app/production.yaml"},
                     "data_accessed": ["prod_config"],
                 },
-                "outcome": {"status": "success", "summary": "Read 200 lines from production.yaml"},
+                "outcome": {
+                    "status": "success",
+                    "summary": "Read 200 lines from production.yaml",
+                },
                 "context": {"turn_number": 1},
             },
-            {   # 3: model_response (turn 1)
+            {  # 3: model_response (turn 1)
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
                 "event_type": "model_response",
                 "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
-                "outcome": {"status": "success", "summary": "Database host is db.internal:5432"},
+                "outcome": {
+                    "status": "success",
+                    "summary": "Database host is db.internal:5432",
+                },
                 "context": {"turn_number": 1},
                 "cost": {"tokens_in": 1200, "tokens_out": 400, "estimated_usd": 0.003},
             },
-            {   # 4: unrelated next turn (different run_id, turn 3 → should NOT be in chain)
+            {  # 4: unrelated next turn (different run_id, turn 3 → should NOT be in chain)
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "r2"},
                 "event_type": "model_request",
                 "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
@@ -268,7 +287,9 @@ def test_evidence_chain():
 
         # Turn 3 event should NOT be in chain
         chain_ids = {e["event_id"] for e in chain}
-        assert event_ids[4] not in chain_ids, "Unrelated turn leaked into evidence chain"
+        assert event_ids[4] not in chain_ids, (
+            "Unrelated turn leaked into evidence chain"
+        )
 
         # Chain for non-existent event
         empty_chain = db.get_evidence_chain("nonexistent")
@@ -328,7 +349,7 @@ def test_evidence_chain_via_call_id():
                 "outcome": {"status": "success", "summary": "Listed files"},
                 "context": {"turn_number": 1},
             },
-            {   # Unrelated turn 2 with different run_id — must NOT appear in chain
+            {  # Unrelated turn 2 with different run_id — must NOT appear in chain
                 "agent": {"type": "hermes", "session_id": sid, "run_id": "run-turn2"},
                 "event_type": "model_request",
                 "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
@@ -374,19 +395,21 @@ def test_evidence_chain_temporal_fallback_parses_iso8601():
             "outside": "2026-07-10T10:01:30.000Z",
         }
         for event_id, timestamp in timestamps.items():
-            db.insert_event({
-                "event_id": event_id,
-                "timestamp": timestamp,
-                "agent": {
-                    "type": "hermes",
-                    "session_id": "time-window",
-                    "run_id": event_id,
-                },
-                "event_type": "model_request",
-                "action": {},
-                "outcome": {"status": "success"},
-                "context": {},
-            })
+            db.insert_event(
+                {
+                    "event_id": event_id,
+                    "timestamp": timestamp,
+                    "agent": {
+                        "type": "hermes",
+                        "session_id": "time-window",
+                        "run_id": event_id,
+                    },
+                    "event_type": "model_request",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
 
         chain = db.get_evidence_chain("anchor")
         assert [event["event_id"] for event in chain] == [
@@ -552,18 +575,20 @@ def test_call_id_correlation_across_sessions():
         call_id = "shared-call-id"
 
         for sid in ("sess-A", "sess-B"):
-            db.insert_event({
-                "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
-                "event_type": "tool_result",
-                "action": {
-                    "tool_name": "bash",
-                    "parameters": {},
-                    "call_id": call_id,
-                    "data_accessed": [],
-                },
-                "outcome": {"status": "success"},
-                "context": {},
-            })
+            db.insert_event(
+                {
+                    "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
+                    "event_type": "tool_result",
+                    "action": {
+                        "tool_name": "bash",
+                        "parameters": {},
+                        "call_id": call_id,
+                        "data_accessed": [],
+                    },
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
 
         results = db.query(event_type="tool_result")
         assert len(results) == 2, (
@@ -610,15 +635,21 @@ def test_migration_v1_to_v2():
         """)
 
         # Two legitimate tool_result rows happen to share a resource target.
-        action_json = json.dumps({
-            "tool_name": "bash",
-            "parameters": {},
-            "target": "call-legacy-001",
-            "data_accessed": [],
-        })
-        agent_json = json.dumps({"type": "hermes", "session_id": "sess-v1", "run_id": "r1"})
-        for evt_id, ts in [("dup-1", "2026-07-05T09:00:00.000Z"),
-                            ("dup-2", "2026-07-05T09:01:00.000Z")]:
+        action_json = json.dumps(
+            {
+                "tool_name": "bash",
+                "parameters": {},
+                "target": "call-legacy-001",
+                "data_accessed": [],
+            }
+        )
+        agent_json = json.dumps(
+            {"type": "hermes", "session_id": "sess-v1", "run_id": "r1"}
+        )
+        for evt_id, ts in [
+            ("dup-1", "2026-07-05T09:00:00.000Z"),
+            ("dup-2", "2026-07-05T09:01:00.000Z"),
+        ]:
             conn.execute(
                 "INSERT INTO events VALUES (?, ?, 'hermes', 'sess-v1', 'r1', "
                 "'tool_result', 'bash', '', ?, '{}', ?, '{}', '{}', '{}', NULL, NULL)",
@@ -659,23 +690,26 @@ def test_migration_v1_to_v2():
         assert "idx_events_dedup" not in index_names
 
         # A target is not a true idempotency key, so both rows survive.
-        rows = list(raw.execute(
-            "SELECT event_id FROM events WHERE event_type = 'tool_result'"
-        ))
+        rows = list(
+            raw.execute("SELECT event_id FROM events WHERE event_type = 'tool_result'")
+        )
         assert {row[0] for row in rows} == {"dup-1", "dup-2"}
 
         # No explicit action.call_id existed, so no replay key is fabricated.
         call_ids = {
-            row[0] for row in raw.execute(
+            row[0]
+            for row in raw.execute(
                 "SELECT call_id FROM events WHERE event_type = 'tool_result'"
             )
         }
         assert call_ids == {""}
 
         # Non-duplicate model_request row still present
-        rows2 = list(raw.execute(
-            "SELECT event_id FROM events WHERE event_type = 'model_request'"
-        ))
+        rows2 = list(
+            raw.execute(
+                "SELECT event_id FROM events WHERE event_type = 'model_request'"
+            )
+        )
         assert len(rows2) == 1 and rows2[0][0] == "unique-1"
 
         raw.close()
@@ -714,16 +748,20 @@ def test_migration_preserves_all_duplicate_call_ids():
             )
         """)
         for index, content in enumerate(("same", second_content), start=1):
-            action = json.dumps({
-                "tool_name": "Write",
-                "parameters": {"path": "/tmp/a", "content": content},
-                "call_id": "legacy-provider-call",
-            })
-            agent = json.dumps({
-                "type": "hermes",
-                "session_id": "legacy-session",
-                "run_id": f"run-{index}",
-            })
+            action = json.dumps(
+                {
+                    "tool_name": "Write",
+                    "parameters": {"path": "/tmp/a", "content": content},
+                    "call_id": "legacy-provider-call",
+                }
+            )
+            agent = json.dumps(
+                {
+                    "type": "hermes",
+                    "session_id": "legacy-session",
+                    "run_id": f"run-{index}",
+                }
+            )
             context = json.dumps({"turn_number": index})
             conn.execute(
                 """
@@ -769,9 +807,10 @@ def test_migration_preserves_all_duplicate_call_ids():
             "legacy-1",
             "legacy-2",
         }
-        assert {
-            row["action"]["parameters"]["content"] for row in conflict_rows
-        } == {"same", "changed"}
+        assert {row["action"]["parameters"]["content"] for row in conflict_rows} == {
+            "same",
+            "changed",
+        }
         assert conflict_db.get_chain_checkpoint()["legacy_event_count"] == 2
         conflict_db.close()
 
@@ -794,22 +833,38 @@ def test_session_access():
         sid2 = uuid.uuid4().hex
 
         for i in range(3):
-            db.insert_event({
-                "agent": {"type": "hermes", "session_id": sid1, "run_id": "r1"},
-                "event_type": "tool_call",
-                "action": {"tool_name": "read_file", "parameters": {}, "data_accessed": []},
-                "outcome": {"status": "success"},
-                "context": {"turn_number": i},
-            })
+            db.insert_event(
+                {
+                    "agent": {"type": "hermes", "session_id": sid1, "run_id": "r1"},
+                    "event_type": "tool_call",
+                    "action": {
+                        "tool_name": "read_file",
+                        "parameters": {},
+                        "data_accessed": [],
+                    },
+                    "outcome": {"status": "success"},
+                    "context": {"turn_number": i},
+                }
+            )
 
         for i in range(5):
-            db.insert_event({
-                "agent": {"type": "claude_code", "session_id": sid2, "run_id": "r2"},
-                "event_type": "model_request" if i % 2 == 0 else "model_response",
-                "action": {"tool_name": None, "parameters": {}, "data_accessed": []},
-                "outcome": {"status": "success"},
-                "context": {"turn_number": i},
-            })
+            db.insert_event(
+                {
+                    "agent": {
+                        "type": "claude_code",
+                        "session_id": sid2,
+                        "run_id": "r2",
+                    },
+                    "event_type": "model_request" if i % 2 == 0 else "model_response",
+                    "action": {
+                        "tool_name": None,
+                        "parameters": {},
+                        "data_accessed": [],
+                    },
+                    "outcome": {"status": "success"},
+                    "context": {"turn_number": i},
+                }
+            )
 
         # get_session
         s1_events = db.get_session(sid1)
@@ -845,16 +900,15 @@ def test_validation_error_on_insert():
         db = AuditDB(db_path)
 
         # Missing agent
-        try:
-            db.insert_event({
-                "event_type": "tool_call",
-                "action": {},
-                "outcome": {"status": "success"},
-                "context": {},
-            })
-            assert False, "Should have raised ValidationError"
-        except ValidationError:
-            pass
+        with pytest.raises(ValidationError):
+            db.insert_event(
+                {
+                    "event_type": "tool_call",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
 
         db.close()
 
@@ -873,13 +927,26 @@ def test_concurrent_access():
             try:
                 sid = uuid.uuid4().hex
                 for i in range(count_per_thread):
-                    db.insert_event({
-                        "agent": {"type": "hermes", "session_id": sid, "run_id": "r1"},
-                        "event_type": "tool_call",
-                        "action": {"tool_name": "read_file", "parameters": {}, "data_accessed": []},
-                        "outcome": {"status": "success"},
-                        "context": {"turn_number": i, "user_message": f"thread {thread_id} msg {i}"},
-                    })
+                    db.insert_event(
+                        {
+                            "agent": {
+                                "type": "hermes",
+                                "session_id": sid,
+                                "run_id": "r1",
+                            },
+                            "event_type": "tool_call",
+                            "action": {
+                                "tool_name": "read_file",
+                                "parameters": {},
+                                "data_accessed": [],
+                            },
+                            "outcome": {"status": "success"},
+                            "context": {
+                                "turn_number": i,
+                                "user_message": f"thread {thread_id} msg {i}",
+                            },
+                        }
+                    )
             except Exception as e:
                 errors.append(str(e))
 
@@ -897,7 +964,9 @@ def test_concurrent_access():
 
         stats = db.get_stats()
         expected = 4 * count_per_thread
-        assert stats["total_events"] == expected, f"Expected {expected} events, got {stats['total_events']}"
+        assert stats["total_events"] == expected, (
+            f"Expected {expected} events, got {stats['total_events']}"
+        )
         checkpoint = db.get_chain_checkpoint()
         assert checkpoint["event_count"] == expected
         verification = db.verify_chain()
@@ -918,22 +987,24 @@ def test_concurrent_batches_across_db_instances_do_not_fork_chain():
 
         def write_batch(db, start):
             try:
-                db.insert_events([
-                    {
-                        "event_id": f"concurrent-{i}",
-                        "timestamp": f"2026-07-10T10:00:{i:02d}.000Z",
-                        "agent": {
-                            "type": "hermes",
-                            "session_id": "shared-session",
-                            "run_id": f"run-{i}",
-                        },
-                        "event_type": "model_request",
-                        "action": {},
-                        "outcome": {"status": "success"},
-                        "context": {"turn_number": i},
-                    }
-                    for i in range(start, start + 20)
-                ])
+                db.insert_events(
+                    [
+                        {
+                            "event_id": f"concurrent-{i}",
+                            "timestamp": f"2026-07-10T10:00:{i:02d}.000Z",
+                            "agent": {
+                                "type": "hermes",
+                                "session_id": "shared-session",
+                                "run_id": f"run-{i}",
+                            },
+                            "event_type": "model_request",
+                            "action": {},
+                            "outcome": {"status": "success"},
+                            "context": {"turn_number": i},
+                        }
+                        for i in range(start, start + 20)
+                    ]
+                )
             except Exception as exc:
                 errors.append(exc)
 
@@ -986,7 +1057,9 @@ def test_schema_version_table():
 
         # Check via direct SQL
         conn = sqlite3.connect(db_path)
-        cur = conn.execute("SELECT version, applied_at FROM schema_version ORDER BY version DESC LIMIT 1")
+        cur = conn.execute(
+            "SELECT version, applied_at FROM schema_version ORDER BY version DESC LIMIT 1"
+        )
         row = cur.fetchone()
         assert row[0] == SCHEMA_VERSION, (
             f"Expected version {SCHEMA_VERSION}, got {row[0]}"
@@ -1019,14 +1092,12 @@ def test_future_schema_version_is_rejected():
         conn.commit()
         conn.close()
 
-        try:
+        with pytest.raises(UnsupportedSchemaVersionError) as excinfo:
             AuditDB(db_path)
-            assert False, "A future schema version must be rejected"
-        except UnsupportedSchemaVersionError as exc:
-            message = str(exc)
-            assert str(SCHEMA_VERSION + 1) in message
-            assert str(SCHEMA_VERSION) in message
-            assert "refusing to open" in message
+        message = str(excinfo.value)
+        assert str(SCHEMA_VERSION + 1) in message
+        assert str(SCHEMA_VERSION) in message
+        assert "refusing to open" in message
 
         check = sqlite3.connect(db_path)
         columns = [row[1] for row in check.execute("PRAGMA table_info(events)")]
@@ -1107,11 +1178,8 @@ def test_event_id_conflicts_and_invalid_events_are_never_silent():
             **event,
             "outcome": {"status": "error", "summary": "rewritten"},
         }
-        try:
+        with pytest.raises(EventConflictError, match="different canonical payload"):
             db.insert_event(conflicting)
-            assert False, "A conflicting event_id must not be silently ignored"
-        except EventConflictError as exc:
-            assert "different canonical payload" in str(exc)
 
         invalid = {
             "event_id": "invalid-null-session",
@@ -1121,11 +1189,8 @@ def test_event_id_conflicts_and_invalid_events_are_never_silent():
             "outcome": {"status": "success"},
             "context": {},
         }
-        try:
+        with pytest.raises((ValidationError, sqlite3.IntegrityError)):
             db.insert_event(invalid)
-            assert False, "An invalid NOT NULL field must fail visibly"
-        except (ValidationError, sqlite3.IntegrityError):
-            pass
 
         rows = db.query(limit=20)
         assert len(rows) == 1
@@ -1169,11 +1234,8 @@ def test_redaction_cannot_collapse_distinct_secret_bearing_event_replays():
                 },
             },
         ):
-            try:
+            with pytest.raises(EventConflictError, match="cannot be proven identical"):
                 db.insert_event(retry)
-                assert False, "A raw secret-bearing duplicate ID must conflict"
-            except EventConflictError as exc:
-                assert "cannot be proven identical" in str(exc)
 
         # A canonical read-back contains only the placeholder and is safe to
         # replay idempotently for transport recovery.
@@ -1200,11 +1262,10 @@ def test_explicit_event_id_requires_stable_timestamp():
             "context": {},
         }
         for _ in range(2):
-            try:
+            with pytest.raises(
+                ValidationError, match="timestamp is required when event_id is provided"
+            ):
                 db.insert_event(event)
-                assert False, "A stable event_id needs a stable timestamp"
-            except ValidationError as exc:
-                assert "timestamp is required when event_id is provided" in str(exc)
 
         assert db.get_stats()["total_events"] == 0
         assert db.get_chain_checkpoint()["event_count"] == 0
@@ -1251,26 +1312,28 @@ def test_query_round_trip_is_idempotent_with_safe_capture_metadata():
     """A safe authorization phase label is not mistaken for lost credentials."""
     with tempfile.TemporaryDirectory() as tmpdir:
         db = AuditDB(os.path.join(tmpdir, "capture-replay.db"))
-        event = normalize_event({
-            "event_id": "capture-replay-event",
-            "timestamp": "2026-07-17T12:00:00Z",
-            "agent": {
-                "type": "hermes",
-                "session_id": "capture-session",
-                "run_id": "capture-run",
-            },
-            "event_type": "decision_point",
-            "action": {
-                "tool_name": "read_file",
-                "parameters": {"path": "README.md"},
-            },
-            "outcome": {"status": "success"},
-            "context": {
-                "capture": HERMES_CAPABILITIES.as_context(
-                    authorization_check="pre_execution",
-                ),
-            },
-        })
+        event = normalize_event(
+            {
+                "event_id": "capture-replay-event",
+                "timestamp": "2026-07-17T12:00:00Z",
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "capture-session",
+                    "run_id": "capture-run",
+                },
+                "event_type": "decision_point",
+                "action": {
+                    "tool_name": "read_file",
+                    "parameters": {"path": "README.md"},
+                },
+                "outcome": {"status": "success"},
+                "context": {
+                    "capture": HERMES_CAPABILITIES.as_context(
+                        authorization_check="pre_execution",
+                    ),
+                },
+            }
+        )
 
         event_id = db.insert_event(event)
         before = db.get_chain_checkpoint()
@@ -1288,19 +1351,23 @@ def test_shared_target_without_call_id_is_not_deduplicated():
         db = AuditDB(os.path.join(tmpdir, "targets.db"))
         ids = []
         for i, content in enumerate(("first", "second")):
-            ids.append(db.insert_event({
-                "event_id": f"target-event-{i}",
-                "timestamp": f"2026-07-10T10:00:0{i}.000Z",
-                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-                "event_type": "tool_call",
-                "action": {
-                    "tool_name": "write_file",
-                    "target": "/tmp/shared.txt",
-                    "parameters": {"content": content},
-                },
-                "outcome": {"status": "success"},
-                "context": {"turn_number": i},
-            }))
+            ids.append(
+                db.insert_event(
+                    {
+                        "event_id": f"target-event-{i}",
+                        "timestamp": f"2026-07-10T10:00:0{i}.000Z",
+                        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                        "event_type": "tool_call",
+                        "action": {
+                            "tool_name": "write_file",
+                            "target": "/tmp/shared.txt",
+                            "parameters": {"content": content},
+                        },
+                        "outcome": {"status": "success"},
+                        "context": {"turn_number": i},
+                    }
+                )
+            )
 
         assert ids == ["target-event-0", "target-event-1"]
         assert len(db.query(event_type="tool_call", limit=20)) == 2
@@ -1316,15 +1383,17 @@ def test_hash_chain_detects_canonical_payload_tampering():
         db_path = os.path.join(tmpdir, "tamper.db")
         db = AuditDB(db_path)
         for i in range(3):
-            db.insert_event({
-                "event_id": f"chain-{i}",
-                "timestamp": f"2026-07-10T10:00:0{i}.000Z",
-                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-                "event_type": "model_request",
-                "action": {"sequence": i},
-                "outcome": {"status": "success"},
-                "context": {"turn_number": i},
-            })
+            db.insert_event(
+                {
+                    "event_id": f"chain-{i}",
+                    "timestamp": f"2026-07-10T10:00:0{i}.000Z",
+                    "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                    "event_type": "model_request",
+                    "action": {"sequence": i},
+                    "outcome": {"status": "success"},
+                    "context": {"turn_number": i},
+                }
+            )
 
         checkpoint = db.get_chain_checkpoint()
         assert checkpoint["initialized"]
@@ -1353,19 +1422,21 @@ def test_chain_append_validation_is_indexed_not_history_scanning():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "append-cost.db")
         db = AuditDB(db_path)
-        db.insert_event({
-            "event_id": "append-cost-1",
-            "timestamp": "2026-07-10T10:00:00.000Z",
-            "agent": {
-                "type": "hermes",
-                "session_id": "append-cost-session",
-                "run_id": "append-cost-run",
-            },
-            "event_type": "model_request",
-            "action": {},
-            "outcome": {"status": "success"},
-            "context": {},
-        })
+        db.insert_event(
+            {
+                "event_id": "append-cost-1",
+                "timestamp": "2026-07-10T10:00:00.000Z",
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "append-cost-session",
+                    "run_id": "append-cost-run",
+                },
+                "event_type": "model_request",
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {},
+            }
+        )
 
         raw = sqlite3.connect(db_path)
         raw.row_factory = sqlite3.Row
@@ -1391,17 +1462,19 @@ def test_chain_append_validation_is_indexed_not_history_scanning():
         tamper.commit()
         tamper.close()
         with pytest.raises(ChainIntegrityError, match="recorded head"):
-            db.insert_event({
-                "agent": {
-                    "type": "hermes",
-                    "session_id": "append-cost-session",
-                    "run_id": "append-cost-run-2",
-                },
-                "event_type": "model_request",
-                "action": {},
-                "outcome": {"status": "success"},
-                "context": {},
-            })
+            db.insert_event(
+                {
+                    "agent": {
+                        "type": "hermes",
+                        "session_id": "append-cost-session",
+                        "run_id": "append-cost-run-2",
+                    },
+                    "event_type": "model_request",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
         db.close()
 
 
@@ -1413,19 +1486,21 @@ def test_verify_checkpoint_exact_prefix_and_tampering():
         db = AuditDB(db_path)
 
         def insert(index):
-            db.insert_event({
-                "event_id": f"checkpoint-{index}",
-                "timestamp": f"2026-07-10T10:00:{index:02d}.000Z",
-                "agent": {
-                    "type": "hermes",
-                    "session_id": "checkpoint-session",
-                    "run_id": f"run-{index}",
-                },
-                "event_type": "model_request",
-                "action": {},
-                "outcome": {"status": "success"},
-                "context": {"turn_number": index},
-            })
+            db.insert_event(
+                {
+                    "event_id": f"checkpoint-{index}",
+                    "timestamp": f"2026-07-10T10:00:{index:02d}.000Z",
+                    "agent": {
+                        "type": "hermes",
+                        "session_id": "checkpoint-session",
+                        "run_id": f"run-{index}",
+                    },
+                    "event_type": "model_request",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {"turn_number": index},
+                }
+            )
 
         insert(1)
         insert(2)
@@ -1512,11 +1587,8 @@ def test_batch_conflict_rolls_back_events_and_chain_head():
             **original,
             "outcome": {"status": "error"},
         }
-        try:
+        with pytest.raises(EventConflictError):
             db.insert_events([new_event, conflicting])
-            assert False, "The conflicting tail event must abort the batch"
-        except EventConflictError:
-            pass
 
         assert [event["event_id"] for event in db.query(limit=20)] == ["existing"]
         assert db.get_chain_checkpoint() == before
@@ -1555,11 +1627,8 @@ def test_database_permissions_and_symlink_rejection():
             pass
         link = os.path.join(tmpdir, "linked.db")
         os.symlink(target, link)
-        try:
+        with pytest.raises(ValueError, match="(?i)symlink"):
             AuditDB(link)
-            assert False, "A symlink database path must be rejected"
-        except ValueError as exc:
-            assert "symlink" in str(exc).lower()
 
 
 def test_insert_events_preserves_replays_within_batch():
@@ -1677,11 +1746,8 @@ def test_insert_events_rollback_on_bad_event():
         }
 
         # Batch with the invalid event — should raise and leave DB empty
-        try:
+        with pytest.raises(ValidationError):
             db.insert_events([valid_event, invalid_event])
-            assert False, "Should have raised ValidationError"
-        except ValidationError:
-            pass
 
         # DB must be completely unchanged (the valid_event was NOT inserted)
         stats = db.get_stats()
@@ -1713,9 +1779,8 @@ def test_v3_fresh_schema():
         assert "event_hash" in col_names, "event_hash column missing on fresh DB"
 
         table_names = {
-            r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            r[0]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert "chain_meta" in table_names
         assert not {"baselines", "trust_events", "alerts"} & table_names
@@ -1769,17 +1834,21 @@ def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
             ("legacy-target-a", "legacy-target-b"),
             start=1,
         ):
-            action = json.dumps({
-                "tool_name": "bash",
-                "parameters": {"attempt": index},
-                "target": legacy_key,
-                "call_id": "shared-provider-call",
-            })
-            agent = json.dumps({
-                "type": "hermes",
-                "session_id": "migration-session",
-                "run_id": f"run-{index}",
-            })
+            action = json.dumps(
+                {
+                    "tool_name": "bash",
+                    "parameters": {"attempt": index},
+                    "target": legacy_key,
+                    "call_id": "shared-provider-call",
+                }
+            )
+            agent = json.dumps(
+                {
+                    "type": "hermes",
+                    "session_id": "migration-session",
+                    "run_id": f"run-{index}",
+                }
+            )
             conn.execute(
                 """
                 INSERT INTO events (
@@ -1808,23 +1877,25 @@ def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
         assert checkpoint["legacy_event_count"] == 2
         assert checkpoint["event_count"] == 0
 
-        third_id = db.insert_event({
-            "event_id": "new-delivery",
-            "timestamp": "2026-07-10T10:03:00.000Z",
-            "agent": {
-                "type": "hermes",
-                "session_id": "migration-session",
-                "run_id": "run-3",
-            },
-            "event_type": "tool_call",
-            "action": {
-                "tool_name": "bash",
-                "parameters": {"attempt": 3},
-                "call_id": "shared-provider-call",
-            },
-            "outcome": {"status": "success"},
-            "context": {},
-        })
+        third_id = db.insert_event(
+            {
+                "event_id": "new-delivery",
+                "timestamp": "2026-07-10T10:03:00.000Z",
+                "agent": {
+                    "type": "hermes",
+                    "session_id": "migration-session",
+                    "run_id": "run-3",
+                },
+                "event_type": "tool_call",
+                "action": {
+                    "tool_name": "bash",
+                    "parameters": {"attempt": 3},
+                    "call_id": "shared-provider-call",
+                },
+                "outcome": {"status": "success"},
+                "context": {},
+            }
+        )
         assert third_id == "new-delivery"
         assert db.get_stats()["total_events"] == 3
         assert db.verify_chain()["valid"]
@@ -1832,14 +1903,11 @@ def test_v3_to_v4_drops_call_id_uniqueness_before_legacy_correction():
 
         raw = sqlite3.connect(db_path)
         call_ids = [
-            row[0] for row in raw.execute(
-                "SELECT call_id FROM events ORDER BY timestamp"
-            )
+            row[0]
+            for row in raw.execute("SELECT call_id FROM events ORDER BY timestamp")
         ]
         indexes = {row[1] for row in raw.execute("PRAGMA index_list(events)")}
-        version = raw.execute(
-            "SELECT MAX(version) FROM schema_version"
-        ).fetchone()[0]
+        version = raw.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
         raw.close()
 
         assert call_ids == ["shared-provider-call"] * 3
@@ -1884,7 +1952,9 @@ def test_migration_v2_to_v3():
                 raw_response    TEXT
             )
         """)
-        agent_json = json.dumps({"type": "hermes", "session_id": "sess-v2", "run_id": "r1"})
+        agent_json = json.dumps(
+            {"type": "hermes", "session_id": "sess-v2", "run_id": "r1"}
+        )
         conn.execute(
             "INSERT INTO events VALUES ('v2-evt-1', '2026-07-01T10:00:00.000Z', "
             "'hermes', 'sess-v2', 'r1', 'tool_call', 'terminal', '', 'c1', "
@@ -1907,13 +1977,15 @@ def test_migration_v2_to_v3():
         assert len(events) == 1 and events[0]["event_id"] == "v2-evt-1"
 
         # New inserts work against the migrated table
-        new_event_id = db.insert_event({
-            "agent": {"type": "hermes", "session_id": "sess-v2", "run_id": "r2"},
-            "event_type": "tool_call",
-            "action": {"tool_name": "read_file", "parameters": {}},
-            "outcome": {"status": "success"},
-            "context": {},
-        })
+        new_event_id = db.insert_event(
+            {
+                "agent": {"type": "hermes", "session_id": "sess-v2", "run_id": "r2"},
+                "event_type": "tool_call",
+                "action": {"tool_name": "read_file", "parameters": {}},
+                "outcome": {"status": "success"},
+                "context": {},
+            }
+        )
         checkpoint = db.get_chain_checkpoint()
         assert checkpoint["event_count"] == 1
         assert checkpoint["legacy_event_count"] == 1
@@ -1938,7 +2010,8 @@ def test_migration_v2_to_v3():
         assert legacy_hashes == (None, None)
         assert all(new_hashes)
         table_names = {
-            r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            r[0]
+            for r in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert "chain_meta" in table_names
         raw.close()
@@ -1955,28 +2028,42 @@ def test_aggregate_basic():
         # claude_code: 2 tool_calls (1 blocked), 200/20 tokens each
         sid_h, sid_c = "sess-h", "sess-c"
         for i in range(3):
-            db.insert_event({
-                "agent": {"type": "hermes", "session_id": sid_h, "run_id": f"h{i}"},
-                "event_type": "tool_call",
-                "action": {"tool_name": f"tool_{i}", "parameters": {}},
-                "outcome": {"status": "error" if i == 0 else "success"},
-                "context": {},
-                "cost": {"tokens_in": 100, "tokens_out": 50, "estimated_usd": 0.01},
-            })
+            db.insert_event(
+                {
+                    "agent": {"type": "hermes", "session_id": sid_h, "run_id": f"h{i}"},
+                    "event_type": "tool_call",
+                    "action": {"tool_name": f"tool_{i}", "parameters": {}},
+                    "outcome": {"status": "error" if i == 0 else "success"},
+                    "context": {},
+                    "cost": {"tokens_in": 100, "tokens_out": 50, "estimated_usd": 0.01},
+                }
+            )
         for i in range(2):
-            db.insert_event({
-                "agent": {"type": "claude_code", "session_id": sid_c, "run_id": f"c{i}"},
-                "event_type": "tool_call",
-                "action": {"tool_name": "terminal", "parameters": {}},
-                "outcome": {"status": "blocked" if i == 0 else "success"},
-                "context": {},
-                "cost": {"tokens_in": 200, "tokens_out": 20, "estimated_usd": 0.02},
-            })
+            db.insert_event(
+                {
+                    "agent": {
+                        "type": "claude_code",
+                        "session_id": sid_c,
+                        "run_id": f"c{i}",
+                    },
+                    "event_type": "tool_call",
+                    "action": {"tool_name": "terminal", "parameters": {}},
+                    "outcome": {"status": "blocked" if i == 0 else "success"},
+                    "context": {},
+                    "cost": {"tokens_in": 200, "tokens_out": 20, "estimated_usd": 0.02},
+                }
+            )
 
         rows = db.aggregate(
             group_by=["agent_type"],
-            metrics=["count", "tokens_in", "tokens_out", "error_count",
-                     "blocked_count", "distinct_tools"],
+            metrics=[
+                "count",
+                "tokens_in",
+                "tokens_out",
+                "error_count",
+                "blocked_count",
+                "distinct_tools",
+            ],
         )
         by_agent = {r["agent_type"]: r for r in rows}
         assert set(by_agent) == {"hermes", "claude_code"}, f"Got: {by_agent}"
@@ -2015,19 +2102,22 @@ def test_aggregate_buckets_and_filters():
             "2026-07-02T10:00:00.000Z",
         ]
         for i, ts in enumerate(timestamps):
-            db.insert_event({
-                "timestamp": ts,
-                "agent": {"type": "hermes", "session_id": "s1", "run_id": f"r{i}"},
-                "event_type": "tool_call",
-                "action": {"tool_name": "terminal", "parameters": {}},
-                "outcome": {"status": "success"},
-                "context": {},
-            })
+            db.insert_event(
+                {
+                    "timestamp": ts,
+                    "agent": {"type": "hermes", "session_id": "s1", "run_id": f"r{i}"},
+                    "event_type": "tool_call",
+                    "action": {"tool_name": "terminal", "parameters": {}},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
 
         # Day buckets, ascending
         days = db.aggregate(group_by=["day"], order_by="day", descending=False)
         assert [(d["day"], d["count"]) for d in days] == [
-            ("2026-07-01", 2), ("2026-07-02", 1),
+            ("2026-07-01", 2),
+            ("2026-07-02", 1),
         ], f"Got: {days}"
 
         # Hour bucket + since filter + first/last seen
@@ -2065,11 +2155,8 @@ def test_aggregate_validation():
             lambda: db.query(offset=-1),
             lambda: db.list_sessions(limit=0),
         ):
-            try:
+            with pytest.raises(ValueError):
                 bad_call()
-                assert False, "Expected ValueError"
-            except ValueError:
-                pass
 
         db.close()
 
@@ -2084,15 +2171,17 @@ def test_verify_detects_duplicate_keys_that_keep_the_parsed_hash():
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, "audit.db")
         db = AuditDB(db_path)
-        db.insert_event({
-            "event_id": "evt-dup",
-            "timestamp": "2026-07-17T12:00:00.000Z",
-            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-            "event_type": "model_request",
-            "action": {},
-            "outcome": {"status": "blocked"},
-            "context": {},
-        })
+        db.insert_event(
+            {
+                "event_id": "evt-dup",
+                "timestamp": "2026-07-17T12:00:00.000Z",
+                "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                "event_type": "model_request",
+                "action": {},
+                "outcome": {"status": "blocked"},
+                "context": {},
+            }
+        )
         assert db.verify_chain()["valid"] is True
         conn = db._get_conn()
         try:
@@ -2126,13 +2215,15 @@ def test_read_only_audit_db_never_writes():
         try:
             assert reader.verify_chain()["valid"] is True
             with pytest.raises(sqlite3.OperationalError):
-                reader.insert_event({
-                    "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-                    "event_type": "model_request",
-                    "action": {},
-                    "outcome": {"status": "success"},
-                    "context": {},
-                })
+                reader.insert_event(
+                    {
+                        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                        "event_type": "model_request",
+                        "action": {},
+                        "outcome": {"status": "success"},
+                        "context": {},
+                    }
+                )
         finally:
             reader.close()
         assert stat.S_IMODE(os.stat(db_path).st_mode) == 0o644
@@ -2147,14 +2238,30 @@ def test_read_only_audit_db_never_writes():
 def test_usage_breakdown_storage_and_aggregation(tmp_path):
     db = AuditDB(str(tmp_path / "usage.db"))
     for i, cost in enumerate(({"reasoning_tokens": 0}, {"reasoning_tokens": 12}, {})):
-        db.insert_event({
-            "agent": {"type": "hermes", "session_id": "usage", "run_id": str(i)},
-            "event_type": "model_response", "action": {},
-            "outcome": {"status": "success"}, "context": {}, "cost": cost,
-        })
-    rows = db.aggregate(group_by=[], metrics=[
-        "reasoning_tokens", "reasoning_tokens_reported",
-        "cached_input_tokens", "cached_input_tokens_reported",
-    ])
-    assert rows == [{"reasoning_tokens": 12, "reasoning_tokens_reported": 2,
-                     "cached_input_tokens": None, "cached_input_tokens_reported": 0}]
+        db.insert_event(
+            {
+                "agent": {"type": "hermes", "session_id": "usage", "run_id": str(i)},
+                "event_type": "model_response",
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {},
+                "cost": cost,
+            }
+        )
+    rows = db.aggregate(
+        group_by=[],
+        metrics=[
+            "reasoning_tokens",
+            "reasoning_tokens_reported",
+            "cached_input_tokens",
+            "cached_input_tokens_reported",
+        ],
+    )
+    assert rows == [
+        {
+            "reasoning_tokens": 12,
+            "reasoning_tokens_reported": 2,
+            "cached_input_tokens": None,
+            "cached_input_tokens_reported": 0,
+        }
+    ]

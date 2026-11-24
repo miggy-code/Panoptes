@@ -11,7 +11,9 @@ ROOT = Path(panoptes.__file__).parent
 
 def run(code):
     return subprocess.run(
-        [sys.executable, "-I", "-c", code], capture_output=True, text=True,
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        text=True,
         cwd=str(ROOT.parent),
     )
 

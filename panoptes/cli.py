@@ -1,12 +1,12 @@
 """Panoptes CLI for adapter observations and local audit trails."""
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import sqlite3
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from panoptes import __version__
 from panoptes.db import AuditDB
@@ -35,8 +35,7 @@ def _open_existing_db(db_path: str, *, read_only: bool = True) -> AuditDB:
         uri = f"{Path(expanded).resolve().as_uri()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True)
         initialized = connection.execute(
-            "SELECT 1 FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'events'"
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events'"
         ).fetchone()
     except sqlite3.Error as exc:
         print(f"Cannot read audit database {expanded}: {exc}", file=sys.stderr)
@@ -62,37 +61,55 @@ def _display_text(value, limit=180):
     """Keep untrusted audit text redacted, bounded, and on one terminal line."""
     text = str(redact_secrets(value))
     text = " ".join("".join(c if c.isprintable() else " " for c in text).split())
-    return text if len(text) <= limit else text[:limit - 3] + "..."
+    return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
 def cmd_doctor(args):
     """Inspect local setup without changing audit data or contacting a provider."""
     failed = False
     print("Panoptes doctor — requested configuration (read-only)")
-    print("Running proxy settings, client routing, and direct egress are not verified.\n")
+    print(
+        "Running proxy settings, client routing, and direct egress are not verified.\n"
+    )
     db = None
     try:
         db = _open_existing_db(args.db_path)
         stats = db.get_stats()
-        print(f"[OK] Database: schema {stats['schema_version']}, {stats['total_events']} events")
+        print(
+            f"[OK] Database: schema {stats['schema_version']}, {stats['total_events']} events"
+        )
         latest = db.query(limit=1)
         if latest:
             event = latest[0]
-            timestamp = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+            timestamp = datetime.fromisoformat(
+                event["timestamp"].replace("Z", "+00:00")
+            )
             stale = (datetime.now(timezone.utc) - timestamp).total_seconds() > 86400
             status = "WARN" if stale else "INFO"
             age = "; older than 24 hours" if stale else ""
-            print(f"[{status}] Last audit event: {_display_text(event['timestamp'])} ({_display_text(event['event_type'])}{age})")
+            print(
+                f"[{status}] Last audit event: {_display_text(event['timestamp'])} ({_display_text(event['event_type'])}{age})"
+            )
         else:
-            print("[WARN] Capture: no recorded activity; run a client through Panoptes first")
-        if not (os.access(os.path.expanduser(args.db_path), os.W_OK)
-                and os.access(Path(os.path.expanduser(args.db_path)).parent, os.W_OK)):
-            print("[WARN] Database write permissions unavailable; capture needs write access")
-        print("[INFO] No database write attempted; use 'panoptes verify' to check chain integrity")
+            print(
+                "[WARN] Capture: no recorded activity; run a client through Panoptes first"
+            )
+        if not (
+            os.access(os.path.expanduser(args.db_path), os.W_OK)
+            and os.access(Path(os.path.expanduser(args.db_path)).parent, os.W_OK)
+        ):
+            print(
+                "[WARN] Database write permissions unavailable; capture needs write access"
+            )
+        print(
+            "[INFO] No database write attempted; use 'panoptes verify' to check chain integrity"
+        )
     except SystemExit as exc:
         if exc.code != 2:
             raise
-        print("[ERROR] Database unavailable; check --db-path or start the proxy to initialize it")
+        print(
+            "[ERROR] Database unavailable; check --db-path or start the proxy to initialize it"
+        )
         failed = True
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
         print(f"[ERROR] Database: {_display_text(str(exc), limit=1200)}")
@@ -128,8 +145,7 @@ def cmd_query(args):
         tool = action.get("tool_name", "-")
         status = outcome.get("status", "-")
         print(
-            f"[{r['timestamp']}] {agent_type} | "
-            f"{r['event_type']} | {tool} | {status}"
+            f"[{r['timestamp']}] {agent_type} | {r['event_type']} | {tool} | {status}"
         )
 
 
@@ -158,20 +174,27 @@ def cmd_session(args):
         events = db.query(session_id=args.session_id, limit=args.limit)
         events.reverse()
         total_rows = db.aggregate(
-            group_by=[], metrics=["count"], session_id=args.session_id,
+            group_by=[],
+            metrics=["count"],
+            session_id=args.session_id,
         )
         matching_total = int(total_rows[0]["count"]) if total_rows else 0
     finally:
         db.close()
 
     if args.json:
-        print(json.dumps({
-            "session_id": args.session_id,
-            "selected_count": len(events),
-            "matching_count": matching_total,
-            "partial": len(events) < matching_total,
-            "events": events,
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "session_id": args.session_id,
+                    "selected_count": len(events),
+                    "matching_count": matching_total,
+                    "partial": len(events) < matching_total,
+                    "events": events,
+                },
+                indent=2,
+            )
+        )
         return
     if not events:
         print(f"No events found for session: {_display_text(args.session_id)}")
@@ -181,7 +204,9 @@ def cmd_session(args):
     if len(events) < matching_total:
         selection += f"; showing the newest {args.limit}; partial timeline"
     print(f"Session: {_display_text(args.session_id)} ({selection})")
-    print("Chronological order; tool proposals and authorizations do not prove execution.")
+    print(
+        "Chronological order; tool proposals and authorizations do not prove execution."
+    )
     for event in events:
         _print_timeline_event(event)
 
@@ -197,7 +222,11 @@ def _print_timeline_event(event):
     kind = event["event_type"]
     label = action.get("tool_name") or action.get("model") or ""
     if kind == "decision_point":
-        label = f"authorization {label}" if context.get("decision_kind") == "tool_authorization" else label
+        label = (
+            f"authorization {label}"
+            if context.get("decision_kind") == "tool_authorization"
+            else label
+        )
     duration = action.get("duration_ms")
     timing = f" ({_display_text(duration)} ms)" if duration is not None else ""
     print(
@@ -232,9 +261,17 @@ def _print_timeline_event(event):
             for match in (matches if isinstance(matches, list) else [])
             if isinstance(match, dict)
         )
-        details.append(_display_text(f"event policy={policy['action']}" + (f" [{names}]" if names else "")))
+        details.append(
+            _display_text(
+                f"event policy={policy['action']}" + (f" [{names}]" if names else "")
+            )
+        )
     elif context.get("policy_name"):
-        details.append(_display_text(f"event policy={context.get('policy_action', 'unknown')} [{context['policy_name']}]"))
+        details.append(
+            _display_text(
+                f"event policy={context.get('policy_action', 'unknown')} [{context['policy_name']}]"
+            )
+        )
     if policy.get("evaluation_errors"):
         details.append(_display_text(f"policy errors={policy['evaluation_errors']}"))
     if capture.get("adapter"):
@@ -243,7 +280,11 @@ def _print_timeline_event(event):
         if action.get("execution_scope") in ("provider", "server"):
             details.append("execution=provider-reported")
         elif capture.get("adapter") == "http_proxy":
-            details.append("execution=client-reported" if kind == "tool_result" else "execution=not observed")
+            details.append(
+                "execution=client-reported"
+                if kind == "tool_result"
+                else "execution=not observed"
+            )
         elif capture.get("adapter") == "hermes_authorizer":
             details.append("execution=not observed")
         elif capture.get("adapter") == "hermes_plugin":
@@ -252,7 +293,14 @@ def _print_timeline_event(event):
             details.append("execution=not verified")
     if capture.get("inspection_status"):
         details.append(_display_text(f"inspection={capture['inspection_status']}"))
-    if any(capture.get(key) for key in ("audit_body_truncated", "raw_request_truncated", "raw_response_truncated")):
+    if any(
+        capture.get(key)
+        for key in (
+            "audit_body_truncated",
+            "raw_request_truncated",
+            "raw_response_truncated",
+        )
+    ):
         details.append("capture=truncated")
     if details:
         print("  " + " | ".join(details))
@@ -282,14 +330,14 @@ def cmd_verify(args):
     if args.checkpoint:
         checkpoint_path = os.path.expanduser(args.checkpoint)
         try:
-            with open(checkpoint_path, "r", encoding="utf-8") as handle:
+            with open(checkpoint_path, encoding="utf-8") as handle:
                 checkpoint = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             print(
                 f"Cannot read checkpoint {checkpoint_path}: {exc}",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(2) from exc
         result = db.verify_checkpoint(checkpoint)
     else:
         result = db.verify_chain()
@@ -318,20 +366,33 @@ def cmd_checkpoint(args):
 def cmd_export_otel(args):
     """Export a bounded selection without touching capture or database writes."""
     try:
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+
         from panoptes.otel import ExportError, export_events
-    except ModuleNotFoundError:
-        print("Install OpenTelemetry output with: pip install 'panoptes-observe[otel]'", file=sys.stderr)
-        raise SystemExit(2)
+    except ModuleNotFoundError as exc:
+        print(
+            "Install OpenTelemetry output with: pip install 'panoptes-observe[otel]'",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from exc
     db = _open_existing_db(args.db_path)
     try:
-        filters = {"session_id": args.session_id, "since": args.since, "until": args.until}
+        filters = {
+            "session_id": args.session_id,
+            "since": args.since,
+            "until": args.until,
+        }
         events = db.query(**filters, limit=args.limit)
         counts = db.aggregate(group_by=[], metrics=["count"], **filters)
         matching = int(counts[0]["count"]) if counts else 0
     finally:
         db.close()
-    print(f"Selected {len(events)} of {matching} matching events (newest {args.limit}); metadata only", file=sys.stderr)
+    print(
+        f"Selected {len(events)} of {matching} matching events (newest {args.limit}); metadata only",
+        file=sys.stderr,
+    )
     if not events:
         return
     exporter = OTLPSpanExporter(endpoint=args.endpoint, timeout=10)
@@ -342,7 +403,9 @@ def cmd_export_otel(args):
         raise SystemExit(1) from None
     finally:
         exporter.shutdown()
-    print(f"Receiver acknowledged {accepted} observations; this does not verify backend storage")
+    print(
+        f"Receiver acknowledged {accepted} observations; this does not verify backend storage"
+    )
 
 
 def main(argv=None):
@@ -370,20 +433,27 @@ def main(argv=None):
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     otel_parser = subparsers.add_parser(
-        "export-otel", help="Export newest committed observations via OTLP/HTTP (metadata only)",
+        "export-otel",
+        help="Export newest committed observations via OTLP/HTTP (metadata only)",
         parents=[db_opts],
     )
-    otel_parser.add_argument("--endpoint", required=True, help="OTLP/HTTP traces URL, including /v1/traces")
+    otel_parser.add_argument(
+        "--endpoint", required=True, help="OTLP/HTTP traces URL, including /v1/traces"
+    )
     otel_parser.add_argument("--session-id")
     otel_parser.add_argument("--since")
     otel_parser.add_argument("--until")
-    otel_parser.add_argument("--limit", type=int, default=1000, help="Newest events to export (1–10000)")
+    otel_parser.add_argument(
+        "--limit", type=int, default=1000, help="Newest events to export (1–10000)"
+    )
 
     # --- proxy ---
     proxy_parser = subparsers.add_parser(
         "proxy", help="Start the model-API reverse proxy", parents=[db_opts, proxy_opts]
     )
-    proxy_parser.add_argument("--port", default=8081, type=int, help="Proxy listen port")
+    proxy_parser.add_argument(
+        "--port", default=8081, type=int, help="Proxy listen port"
+    )
     proxy_parser.add_argument(
         "--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)"
     )
@@ -408,7 +478,8 @@ def main(argv=None):
     )
 
     subparsers.add_parser(
-        "doctor", help="Check local setup and requested proxy configuration (read-only)",
+        "doctor",
+        help="Check local setup and requested proxy configuration (read-only)",
         parents=[db_opts, proxy_opts],
     )
 
@@ -434,8 +505,17 @@ def main(argv=None):
         "session", help="Show up to 10,000 newest session events", parents=[db_opts]
     )
     session_parser.add_argument("session_id", help="Session ID to inspect")
-    session_parser.add_argument("--limit", type=int, default=10000, help="Newest events to show (1–10000; default: 10000)")
-    session_parser.add_argument("--json", action="store_true", help="Print full events and selection counts as JSON")
+    session_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10000,
+        help="Newest events to show (1–10000; default: 10000)",
+    )
+    session_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print full events and selection counts as JSON",
+    )
 
     # --- evidence ---
     evidence_parser = subparsers.add_parser(
@@ -475,7 +555,7 @@ def main(argv=None):
                 "pip install 'panoptes-observe[proxy]'",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(2) from exc
 
         pricing = None
         if getattr(args, "pricing", None):
@@ -485,7 +565,7 @@ def main(argv=None):
                 pricing = PricingTable.load(args.pricing)
             except PricingError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
-                raise SystemExit(2)
+                raise SystemExit(2) from exc
 
         start_proxy(
             port=args.port,

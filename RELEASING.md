@@ -31,9 +31,9 @@ no API token and no repository secret.
 2. Run the local release checks:
 
    ```bash
-   python -m pytest -q
-   python -m build
-   python -m twine check --strict dist/*
+   uv run pytest -q
+   uv build
+   uv run --group release twine check --strict dist/*
    ```
 
 3. Merge the release commit after CI passes.

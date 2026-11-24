@@ -51,9 +51,9 @@ def test_batching_never_skips_or_repeats(db, batch_size):
 
 @pytest.mark.parametrize("batch_size", [1, 3, 500])
 def test_timestamp_order_pages_correctly_with_ties(db, batch_size):
-    db.insert_events([
-        event(100 + i, timestamp="2026-11-02T11:00:00.000Z") for i in range(5)
-    ])
+    db.insert_events(
+        [event(100 + i, timestamp="2026-11-02T11:00:00.000Z") for i in range(5)]
+    )
     forward = list(db.iter_events(order="timestamp", batch_size=batch_size))
     stamps = [(e["timestamp"], e["event_id"]) for e in forward]
     assert len(forward) == 35 and len(set(ids(forward))) == 35
@@ -69,16 +69,25 @@ def test_filters_match_query(db):
 
 
 def test_every_documented_filter_narrows_to_the_matching_event(db):
-    db.insert_event(event(
-        200, correlation_id="c1", event_type="tool_call",
-        timestamp="2030-01-01T00:00:00.000Z",
-        agent={"type": "x", "session_id": "s", "run_id": "r", "parent_run_id": "p"},
-        action={"tool_name": "bash", "target": "prod"},
-    ))
+    db.insert_event(
+        event(
+            200,
+            correlation_id="c1",
+            event_type="tool_call",
+            timestamp="2030-01-01T00:00:00.000Z",
+            agent={"type": "x", "session_id": "s", "run_id": "r", "parent_run_id": "p"},
+            action={"tool_name": "bash", "target": "prod"},
+        )
+    )
     exact = {
-        "agent_type": "x", "event_type": "tool_call", "session_id": "s",
-        "run_id": "r", "parent_run_id": "p", "correlation_id": "c1",
-        "tool_name": "bash", "data_accessed": "prod",
+        "agent_type": "x",
+        "event_type": "tool_call",
+        "session_id": "s",
+        "run_id": "r",
+        "parent_run_id": "p",
+        "correlation_id": "c1",
+        "tool_name": "bash",
+        "data_accessed": "prod",
         "since": "2029-01-01T00:00:00.000Z",
     }
     for name, value in exact.items():
@@ -117,7 +126,9 @@ def test_iteration_does_not_block_a_writer(db):
     iterator.close()
 
 
-@pytest.mark.parametrize("kwargs", [{"order": "newest"}, {"batch_size": 0}, {"batch_size": True}])
+@pytest.mark.parametrize(
+    "kwargs", [{"order": "newest"}, {"batch_size": 0}, {"batch_size": True}]
+)
 def test_bad_arguments_are_rejected(db, kwargs):
     with pytest.raises(ValueError):
         list(db.iter_events(**kwargs))
@@ -147,7 +158,10 @@ def test_read_api_works_on_a_v4_log_opened_read_only(tmp_path):
         streamed = list(reader.iter_events(agent_type="agentgate"))
         assert len(streamed) == 91
         assert list(reader.iter_events(correlation_id="x")) == []
-        assert ids(reader.iter_events(order="-rowid", batch_size=10)) == ids(streamed)[::-1]
+        assert (
+            ids(reader.iter_events(order="-rowid", batch_size=10))
+            == ids(streamed)[::-1]
+        )
         assert all(e["event_type"] == "decision_point" for e in streamed)
     finally:
         reader.close()

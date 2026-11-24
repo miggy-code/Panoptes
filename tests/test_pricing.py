@@ -30,11 +30,23 @@ RATES = {
 def test_cost_is_priced_from_reported_tokens_and_rounded_up():
     table = PricingTable.from_dict(RATES)
     assert table.cost_micros("gpt-test", {"tokens_in": 3, "tokens_out": 1}) == 5_000_000
-    assert table.cost_micros(
-        "gpt-test", {"tokens_in": 4, "tokens_out": 0, "cached_input_tokens": 2}
-    ) == 3_000_000
+    assert (
+        table.cost_micros(
+            "gpt-test", {"tokens_in": 4, "tokens_out": 0, "cached_input_tokens": 2}
+        )
+        == 3_000_000
+    )
     tiny = PricingTable.from_dict(
-        {**RATES, "models": {"m": {"input_per_million": "0.1", "cached_input_per_million": 0, "output_per_million": 0}}}
+        {
+            **RATES,
+            "models": {
+                "m": {
+                    "input_per_million": "0.1",
+                    "cached_input_per_million": 0,
+                    "output_per_million": 0,
+                }
+            },
+        }
     )
     assert tiny.cost_micros("m", {"tokens_in": 1, "tokens_out": 0}) == 1
 
@@ -60,7 +72,15 @@ def test_unpriceable_responses_are_reported_as_unpriced(model, cost):
         {"version": ""},
         {"source": None},
         {"models": {}},
-        {"models": {"m": {"input_per_million": -1, "cached_input_per_million": 0, "output_per_million": 0}}},
+        {
+            "models": {
+                "m": {
+                    "input_per_million": -1,
+                    "cached_input_per_million": 0,
+                    "output_per_million": 0,
+                }
+            }
+        },
         {"models": {"m": {"input_per_million": 1}}},
     ],
 )
@@ -79,11 +99,13 @@ OPENAI_BODY = {"model": "gpt-test", "messages": [{"role": "user", "content": "he
 OPENAI_REPLY = {
     "id": "chatcmpl-1",
     "object": "chat.completion",
-    "choices": [{
-        "index": 0,
-        "message": {"role": "assistant", "content": "hi"},
-        "finish_reason": "stop",
-    }],
+    "choices": [
+        {
+            "index": 0,
+            "message": {"role": "assistant", "content": "hi"},
+            "finish_reason": "stop",
+        }
+    ],
     "usage": {"prompt_tokens": 3, "completion_tokens": 1},
 }
 
@@ -204,90 +226,223 @@ def test_an_unreadable_reply_split_leaves_the_response_unpriced(split, stream):
     from panoptes.providers.anthropic import AnthropicProvider
 
     provider = AnthropicProvider()
-    reply = {"usage": {
-        "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 4,
-        "cache_creation": split,
-    }}
+    reply = {
+        "usage": {
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "cache_creation_input_tokens": 4,
+            "cache_creation": split,
+        }
+    }
     if stream:
-        reply = provider.reassemble_sse(_sse(
-            {"type": "message_start", "message": reply},
-            {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
-             "usage": {"output_tokens": 1}},
-            {"type": "message_stop"},
-        ))
+        reply = provider.reassemble_sse(
+            _sse(
+                {"type": "message_start", "message": reply},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 1},
+                },
+                {"type": "message_stop"},
+            )
+        )
     usage = provider.extract_usage(reply)
     assert usage.get("cache_creation_split_invalid") is True
-    assert PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) is None
+    assert (
+        PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) is None
+    )
 
 
 def test_a_readable_reply_split_is_priced():
     from panoptes.providers.anthropic import AnthropicProvider
 
-    usage = AnthropicProvider().extract_usage({"usage": {
-        "input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 4,
-        "cache_creation": {"ephemeral_5m_input_tokens": 4, "ephemeral_1h_input_tokens": 0},
-    }})
+    usage = AnthropicProvider().extract_usage(
+        {
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_creation_input_tokens": 4,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 4,
+                    "ephemeral_1h_input_tokens": 0,
+                },
+            }
+        }
+    )
     assert "cache_creation_split_invalid" not in usage
     # 1 uncached input + 4 five-minute writes at 1.25 + 1 output at 5.
-    assert PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage) == 11_000_000
+    assert (
+        PricingTable.from_dict(CACHE_RATES).cost_micros("claude-5m-only", usage)
+        == 11_000_000
+    )
 
 
 def test_cache_writes_are_priced_at_their_own_rates():
     table = PricingTable.from_dict(CACHE_RATES)
     # 3 uncached + 10 read + 4 written (1 of them 1-hour) = 17 prompt tokens.
-    cost = {"tokens_in": 17, "tokens_out": 2, "cached_input_tokens": 10,
-            "cache_creation_input_tokens": 4, "cache_creation_5m_input_tokens": 3,
-            "cache_creation_1h_input_tokens": 1}
+    cost = {
+        "tokens_in": 17,
+        "tokens_out": 2,
+        "cached_input_tokens": 10,
+        "cache_creation_input_tokens": 4,
+        "cache_creation_5m_input_tokens": 3,
+        "cache_creation_1h_input_tokens": 1,
+    }
     # 3*1 + 10*0.1 + 3*1.25 + 1*2 + 2*5 = 19.75
     assert table.cost_micros("claude-test", cost) == 19_750_000
     # All writes 5-minute, reported with a zero 1-hour share.
-    assert table.cost_micros(
-        "claude-5m-only", {**cost, "cache_creation_5m_input_tokens": 4, "cache_creation_1h_input_tokens": 0}
-    ) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+    assert (
+        table.cost_micros(
+            "claude-5m-only",
+            {
+                **cost,
+                "cache_creation_5m_input_tokens": 4,
+                "cache_creation_1h_input_tokens": 0,
+            },
+        )
+        == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+    )
     # A provider without a TTL breakdown (OpenAI-style cache_write_tokens).
-    no_split = {k: v for k, v in cost.items() if not k.startswith(("cache_creation_5m", "cache_creation_1h"))}
-    assert table.cost_micros("claude-5m-only", no_split) == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+    no_split = {
+        k: v
+        for k, v in cost.items()
+        if not k.startswith(("cache_creation_5m", "cache_creation_1h"))
+    }
+    assert (
+        table.cost_micros("claude-5m-only", no_split)
+        == 3_000_000 + 1_000_000 + 5_000_000 + 10_000_000
+    )
 
 
 @pytest.mark.parametrize(
     "model, cost",
     [
         # Cache writes and no write rate: never priced at the input rate.
-        ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
-        ("claude-no-write-rate", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                                  "cache_creation_5m_input_tokens": 4, "cache_creation_1h_input_tokens": 0}),
-        ("gpt-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
+        (
+            "claude-no-write-rate",
+            {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4},
+        ),
+        (
+            "claude-no-write-rate",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 4,
+                "cache_creation_5m_input_tokens": 4,
+                "cache_creation_1h_input_tokens": 0,
+            },
+        ),
+        (
+            "gpt-test",
+            {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4},
+        ),
         # 1-hour writes and no 1-hour rate.
-        ("claude-5m-only", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                            "cache_creation_5m_input_tokens": 3, "cache_creation_1h_input_tokens": 1}),
+        (
+            "claude-5m-only",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 4,
+                "cache_creation_5m_input_tokens": 3,
+                "cache_creation_1h_input_tokens": 1,
+            },
+        ),
         # A 1-hour rate exists but the response does not say which writes were 1-hour.
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4}),
+        (
+            "claude-test",
+            {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4},
+        ),
         # Inconsistent counts.
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cached_input_tokens": 3,
-                         "cache_creation_input_tokens": 3, "cache_creation_5m_input_tokens": 3,
-                         "cache_creation_1h_input_tokens": 0}),
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
-                         "cache_creation_1h_input_tokens": 3}),
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": -1}),
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 2,
-                         "cache_creation_5m_input_tokens": 2, "cache_creation_1h_input_tokens": True}),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cached_input_tokens": 3,
+                "cache_creation_input_tokens": 3,
+                "cache_creation_5m_input_tokens": 3,
+                "cache_creation_1h_input_tokens": 0,
+            },
+        ),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 2,
+                "cache_creation_1h_input_tokens": 3,
+            },
+        ),
+        (
+            "claude-test",
+            {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": -1},
+        ),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 2,
+                "cache_creation_5m_input_tokens": 2,
+                "cache_creation_1h_input_tokens": True,
+            },
+        ),
         # A TTL split that does not sum to the total writes.
-        ("claude-test", {"tokens_in": 10, "tokens_out": 1, "cache_creation_input_tokens": 10,
-                         "cache_creation_5m_input_tokens": 9, "cache_creation_1h_input_tokens": 0}),
+        (
+            "claude-test",
+            {
+                "tokens_in": 10,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 10,
+                "cache_creation_5m_input_tokens": 9,
+                "cache_creation_1h_input_tokens": 0,
+            },
+        ),
         # A nonzero split with zero or absent total writes.
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 0,
-                         "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 1}),
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1,
-                         "cache_creation_5m_input_tokens": 0, "cache_creation_1h_input_tokens": 1}),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 0,
+                "cache_creation_5m_input_tokens": 0,
+                "cache_creation_1h_input_tokens": 1,
+            },
+        ),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_5m_input_tokens": 0,
+                "cache_creation_1h_input_tokens": 1,
+            },
+        ),
         # A partial split (one half missing).
-        ("claude-test", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                         "cache_creation_1h_input_tokens": 1}),
-        ("claude-5m-only", {"tokens_in": 5, "tokens_out": 1, "cache_creation_input_tokens": 4,
-                            "cache_creation_5m_input_tokens": 4}),
+        (
+            "claude-test",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 4,
+                "cache_creation_1h_input_tokens": 1,
+            },
+        ),
+        (
+            "claude-5m-only",
+            {
+                "tokens_in": 5,
+                "tokens_out": 1,
+                "cache_creation_input_tokens": 4,
+                "cache_creation_5m_input_tokens": 4,
+            },
+        ),
     ],
 )
 def test_cache_writes_without_a_matching_rate_are_unpriced(model, cost):
-    table = PricingTable.from_dict({**CACHE_RATES, "models": {**CACHE_RATES["models"], **RATES["models"]}})
+    table = PricingTable.from_dict(
+        {**CACHE_RATES, "models": {**CACHE_RATES["models"], **RATES["models"]}}
+    )
     assert table.cost_micros(model, cost) is None
 
 
@@ -295,20 +450,32 @@ def test_responses_without_cache_writes_price_as_before():
     # An old table (no optional rates) still loads and prices reads and output.
     table = PricingTable.from_dict(RATES)
     assert "cache_write_per_million" not in table.models["gpt-test"]
-    assert table.cost_micros(
-        "gpt-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
-    ) == 5_000_000
-    assert table.cost_micros(
-        "gpt-test", {"tokens_in": 4, "tokens_out": 1, "cache_creation_input_tokens": 0}
-    ) == 6_000_000
+    assert (
+        table.cost_micros(
+            "gpt-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
+        )
+        == 5_000_000
+    )
+    assert (
+        table.cost_micros(
+            "gpt-test",
+            {"tokens_in": 4, "tokens_out": 1, "cache_creation_input_tokens": 0},
+        )
+        == 6_000_000
+    )
     # A write rate on the table changes nothing for a response without writes.
     cache_table = PricingTable.from_dict(CACHE_RATES)
-    assert cache_table.cost_micros(
-        "claude-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
-    ) == 2_000_000 + 200_000 + 5_000_000
+    assert (
+        cache_table.cost_micros(
+            "claude-test", {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
+        )
+        == 2_000_000 + 200_000 + 5_000_000
+    )
 
 
-@pytest.mark.parametrize("field", ["cache_write_per_million", "cache_write_1h_per_million"])
+@pytest.mark.parametrize(
+    "field", ["cache_write_per_million", "cache_write_1h_per_million"]
+)
 @pytest.mark.parametrize("value", [-1, "nan", "abc", None])
 def test_malformed_optional_rates_are_rejected(field, value):
     rate = {**RATES["models"]["gpt-test"], field: value}
@@ -349,15 +516,34 @@ def _sse(*events):
 # Anthropic streams report the prompt counts on message_start; message_delta
 # carries the final (cumulative) output count.
 ANTHROPIC_STREAM = _sse(
-    {"type": "message_start", "message": {
-        "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
-        "content": [], "stop_reason": None,
-        "usage": {**ANTHROPIC_USAGE, "output_tokens": 1}}},
-    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+    {
+        "type": "message_start",
+        "message": {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-test",
+            "content": [],
+            "stop_reason": None,
+            "usage": {**ANTHROPIC_USAGE, "output_tokens": 1},
+        },
+    },
+    {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "hi"},
+    },
     {"type": "content_block_stop", "index": 0},
-    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-     "usage": {"output_tokens": 2}},
+    {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 2},
+    },
     {"type": "message_stop"},
 )
 
@@ -371,7 +557,9 @@ def anthropic_proxy(tmp_path, monkeypatch):
             pass
 
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+            body = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            )
             content_type, payload = replies["stream" if body.get("stream") else "json"]
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -392,7 +580,9 @@ def anthropic_proxy(tmp_path, monkeypatch):
         pricing=PricingTable.from_dict(CACHE_RATES),
     )
     port = server.start()
-    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=15)
+    client = httpx.Client(
+        base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=15
+    )
     yield server, client, replies
     client.close()
     server.stop()
@@ -453,10 +643,15 @@ def test_openai_cached_tokens_price_unchanged(priced_proxy):
     server, client = priced_proxy
     from panoptes.providers.openai import OpenAIProvider
 
-    usage = OpenAIProvider().extract_usage({"usage": {
-        "prompt_tokens": 4, "completion_tokens": 1,
-        "prompt_tokens_details": {"cached_tokens": 2},
-    }})
+    usage = OpenAIProvider().extract_usage(
+        {
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            }
+        }
+    )
     assert usage == {"tokens_in": 4, "tokens_out": 1, "cached_input_tokens": 2}
     # 2 uncached * $1 + 2 cached * $0.5 + 1 output * $2, as before this change.
     assert PricingTable.from_dict(RATES).cost_micros("gpt-test", usage) == 5_000_000
@@ -465,13 +660,54 @@ def test_openai_cached_tokens_price_unchanged(priced_proxy):
 def test_pricing_is_exact_and_never_rounds_down_before_the_ceiling():
     # 1 token at just over $1 per million is just over 1 micro-dollar: it must bill 2, not 1.
     rate = "1.0000000000000000000000000001"
-    table = PricingTable.from_dict({"version": "exact-1", "source": "unit test", "currency": "USD", "models": {
-        "m": {"input_per_million": rate, "cached_input_per_million": rate, "output_per_million": rate,
-              "cache_write_per_million": rate, "cache_write_1h_per_million": rate}}})
+    table = PricingTable.from_dict(
+        {
+            "version": "exact-1",
+            "source": "unit test",
+            "currency": "USD",
+            "models": {
+                "m": {
+                    "input_per_million": rate,
+                    "cached_input_per_million": rate,
+                    "output_per_million": rate,
+                    "cache_write_per_million": rate,
+                    "cache_write_1h_per_million": rate,
+                }
+            },
+        }
+    )
     assert table.cost_micros("m", {"tokens_in": 1, "tokens_out": 0}) == 2
-    assert table.cost_micros("m", {"tokens_in": 1, "tokens_out": 0, "cache_creation_input_tokens": 1,
-                                   "cache_creation_5m_input_tokens": 1, "cache_creation_1h_input_tokens": 0}) == 2
+    assert (
+        table.cost_micros(
+            "m",
+            {
+                "tokens_in": 1,
+                "tokens_out": 0,
+                "cache_creation_input_tokens": 1,
+                "cache_creation_5m_input_tokens": 1,
+                "cache_creation_1h_input_tokens": 0,
+            },
+        )
+        == 2
+    )
     # Exact whole micro-dollars stay exact.
-    whole = PricingTable.from_dict({"version": "exact-2", "source": "unit test", "currency": "USD", "models": {
-        "m": {"input_per_million": "3", "cached_input_per_million": "0.3", "output_per_million": "15"}}})
-    assert whole.cost_micros("m", {"tokens_in": 10, "tokens_out": 2, "cached_input_tokens": 10}) == 3 + 30
+    whole = PricingTable.from_dict(
+        {
+            "version": "exact-2",
+            "source": "unit test",
+            "currency": "USD",
+            "models": {
+                "m": {
+                    "input_per_million": "3",
+                    "cached_input_per_million": "0.3",
+                    "output_per_million": "15",
+                }
+            },
+        }
+    )
+    assert (
+        whole.cost_micros(
+            "m", {"tokens_in": 10, "tokens_out": 2, "cached_input_tokens": 10}
+        )
+        == 3 + 30
+    )

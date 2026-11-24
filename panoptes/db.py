@@ -8,9 +8,10 @@ import secrets
 import sqlite3
 import stat
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any
 
 from .schema import (
     SCHEMA_VERSION,
@@ -134,10 +135,23 @@ INSERT INTO events (
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _EVENT_PAYLOAD_COLUMNS = (
-    "event_id", "timestamp", "agent_type", "session_id", "run_id",
-    "event_type", "tool_name", "data_accessed", "call_id",
-    "agent", "user_info", "action", "outcome", "context", "cost",
-    "raw_request", "raw_response",
+    "event_id",
+    "timestamp",
+    "agent_type",
+    "session_id",
+    "run_id",
+    "event_type",
+    "tool_name",
+    "data_accessed",
+    "call_id",
+    "agent",
+    "user_info",
+    "action",
+    "outcome",
+    "context",
+    "cost",
+    "raw_request",
+    "raw_response",
 )
 # Columns added by schema v5. They enter the hashed payload only when set, so
 # a row without them hashes exactly as it did under v4 and every pre-v5 chain
@@ -145,24 +159,33 @@ _EVENT_PAYLOAD_COLUMNS = (
 # the hash.
 _V5_PAYLOAD_COLUMNS = _V5_COLUMNS
 _ALL_PAYLOAD_COLUMNS = _EVENT_PAYLOAD_COLUMNS + _V5_PAYLOAD_COLUMNS
-_EVENT_JSON_COLUMNS = frozenset({
-    "agent", "user_info", "action", "outcome", "context", "cost",
-})
+_EVENT_JSON_COLUMNS = frozenset(
+    {
+        "agent",
+        "user_info",
+        "action",
+        "outcome",
+        "context",
+        "cost",
+    }
+)
 _OPTIONAL_JSON_COLUMNS = frozenset({"attributes"})
 
 _CHAIN_FORMAT_VERSION = "1"
 _CHAIN_ALGORITHM = "sha256"
-_CHAIN_META_KEYS = frozenset({
-    "chain_format_version",
-    "chain_algorithm",
-    "chain_anchor",
-    "chain_head",
-    "chain_event_count",
-    "chain_legacy_event_count",
-    "chain_started_at",
-    "chain_first_event_id",
-    "chain_last_event_id",
-})
+_CHAIN_META_KEYS = frozenset(
+    {
+        "chain_format_version",
+        "chain_algorithm",
+        "chain_anchor",
+        "chain_head",
+        "chain_event_count",
+        "chain_legacy_event_count",
+        "chain_started_at",
+        "chain_first_event_id",
+        "chain_last_event_id",
+    }
+)
 
 
 # Recorded in chain_meta when a database was deliberately created without a
@@ -191,7 +214,7 @@ def _serialize(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _input_requires_redaction(event: Dict[str, Any]) -> bool:
+def _input_requires_redaction(event: dict[str, Any]) -> bool:
     """Whether canonicalization would erase a distinction in this input.
 
     An existing redacted row cannot prove that a second raw secret equals the
@@ -207,9 +230,7 @@ def _input_requires_redaction(event: Dict[str, Any]) -> bool:
         # treatment so a canonical authorization decision remains replayable.
         redacted_context = redacted.get("context")
         if isinstance(redacted_context, dict):
-            redacted_context["capture"] = _redact_capture_metadata(
-                context["capture"]
-            )
+            redacted_context["capture"] = _redact_capture_metadata(context["capture"])
     return redacted != event
 
 
@@ -224,13 +245,13 @@ def _canonical_json(value: Any) -> str:
     )
 
 
-def _deserialize(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+def _deserialize(raw: str | None) -> dict[str, Any] | None:
     if raw is None:
         return None
     return json.loads(raw)
 
 
-def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     """Convert a SQLite row to the canonical event dict."""
     return {
         "event_id": row["event_id"],
@@ -249,19 +270,19 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
-def _as_sql_text(value: Any) -> Optional[str]:
+def _as_sql_text(value: Any) -> str | None:
     """Coerce a value to the representation SQLite stores in a TEXT column."""
     return None if value is None else str(value)
 
 
-def _raw_payload_text(value: Any) -> Optional[str]:
+def _raw_payload_text(value: Any) -> str | None:
     """Store structured raw payloads as JSON while preserving existing strings."""
     if value is None or isinstance(value, str):
         return value
     return _serialize(value)
 
 
-def _build_params(normalized: Dict[str, Any], flat: Dict[str, Any]) -> tuple:
+def _build_params(normalized: dict[str, Any], flat: dict[str, Any]) -> tuple:
     """Build the non-hash SQL values for one event INSERT."""
     return (
         _as_sql_text(normalized["event_id"]),
@@ -287,13 +308,13 @@ def _build_params(normalized: Dict[str, Any], flat: Dict[str, Any]) -> tuple:
     )
 
 
-def _canonical_payload_from_values(values: tuple) -> Dict[str, Any]:
+def _canonical_payload_from_values(values: tuple) -> dict[str, Any]:
     """Build the canonical event payload from values destined for SQLite.
 
     v5 columns that are unset are left out entirely, which is what makes a
     v5 writer's hash of a field-less event identical to v4's.
     """
-    payload: Dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values))
+    payload: dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values, strict=True))
     for column in _EVENT_JSON_COLUMNS:
         payload[column] = json.loads(payload[column])
     for column in _V5_PAYLOAD_COLUMNS:
@@ -304,13 +325,13 @@ def _canonical_payload_from_values(values: tuple) -> Dict[str, Any]:
     return payload
 
 
-def _canonical_payload_from_row(row: sqlite3.Row) -> Dict[str, Any]:
+def _canonical_payload_from_row(row: sqlite3.Row) -> dict[str, Any]:
     """Build the canonical event payload from a stored SQLite row."""
     values = tuple(row[column] for column in _ALL_PAYLOAD_COLUMNS)
     return _canonical_payload_from_values(values)
 
 
-def _rewritten_json_column(row: sqlite3.Row) -> Optional[str]:
+def _rewritten_json_column(row: sqlite3.Row) -> str | None:
     """Name a stored JSON column that differs from what the writer wrote.
 
     The hash covers parsed values, so a duplicate-key or other re-encoding can
@@ -328,16 +349,18 @@ def _rewritten_json_column(row: sqlite3.Row) -> Optional[str]:
     return None
 
 
-def _event_hash(prev_hash: str, payload: Dict[str, Any]) -> str:
+def _event_hash(prev_hash: str, payload: dict[str, Any]) -> str:
     """Hash one canonical event and its predecessor with an unambiguous frame."""
-    material = _canonical_json({
-        "event": payload,
-        "prev_hash": prev_hash,
-    }).encode("utf-8")
+    material = _canonical_json(
+        {
+            "event": payload,
+            "prev_hash": prev_hash,
+        }
+    ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
 
 
-def _read_chain_meta(conn: sqlite3.Connection) -> Dict[str, str]:
+def _read_chain_meta(conn: sqlite3.Connection) -> dict[str, str]:
     placeholders = ", ".join("?" for _ in _CHAIN_META_KEYS)
     rows = conn.execute(
         f"SELECT key, value FROM chain_meta WHERE key IN ({placeholders})",
@@ -346,7 +369,7 @@ def _read_chain_meta(conn: sqlite3.Connection) -> Dict[str, str]:
     return {row["key"]: row["value"] for row in rows}
 
 
-def _checkpoint_from_meta(meta: Dict[str, str]) -> Dict[str, Any]:
+def _checkpoint_from_meta(meta: dict[str, str]) -> dict[str, Any]:
     missing = _CHAIN_META_KEYS - set(meta)
     if missing:
         raise ChainIntegrityError(
@@ -376,7 +399,7 @@ def _checkpoint_from_meta(meta: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
-def _initialize_chain(conn: sqlite3.Connection) -> Dict[str, Any]:
+def _initialize_chain(conn: sqlite3.Connection) -> dict[str, Any]:
     """Create a chain boundary without retroactively blessing legacy rows."""
     hashed_count = conn.execute(
         "SELECT COUNT(*) FROM events WHERE event_hash IS NOT NULL"
@@ -418,7 +441,7 @@ def _initialize_chain(conn: sqlite3.Connection) -> Dict[str, Any]:
     return _checkpoint_from_meta(values)
 
 
-def _load_chain_for_append(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+def _load_chain_for_append(conn: sqlite3.Connection) -> dict[str, Any] | None:
     """Load and minimally validate the chain head while holding a write lock.
 
     Returns ``None`` for a database deliberately created without a chain.
@@ -452,10 +475,7 @@ def _load_chain_for_append(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]
         ):
             raise ChainIntegrityError("Empty hash chain has event boundaries")
     else:
-        if (
-            checkpoint["first_event_id"] is None
-            or checkpoint["last_event_id"] is None
-        ):
+        if checkpoint["first_event_id"] is None or checkpoint["last_event_id"] is None:
             raise ChainIntegrityError("Non-empty hash chain is missing boundaries")
         head = conn.execute(
             "SELECT prev_hash, event_hash FROM events WHERE event_id = ?",
@@ -474,7 +494,7 @@ def _load_chain_for_append(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]
 
 def _persist_chain_checkpoint(
     conn: sqlite3.Connection,
-    checkpoint: Dict[str, Any],
+    checkpoint: dict[str, Any],
 ) -> None:
     updates = {
         "chain_head": checkpoint["head"],
@@ -545,8 +565,13 @@ def _restrict_database_files(path: str) -> None:
 
 
 _FILTER_FIELDS = (
-    "agent_type", "session_id", "run_id", "parent_run_id", "correlation_id",
-    "event_type", "tool_name",
+    "agent_type",
+    "session_id",
+    "run_id",
+    "parent_run_id",
+    "correlation_id",
+    "event_type",
+    "tool_name",
 )
 MAX_QUERY_LIMIT = 10_000
 MAX_QUERY_OFFSET = 10_000_000
@@ -567,16 +592,16 @@ def _validate_page_value(
 
 
 def _build_filter_clause(
-    filters: Dict[str, Any], existing: Optional[frozenset] = None
-) -> Tuple[str, List[Any]]:
+    filters: dict[str, Any], existing: frozenset | None = None
+) -> tuple[str, list[Any]]:
     """Build a WHERE clause + params from the shared filter semantics.
 
     Supports equality filters (_FILTER_FIELDS), since/until timestamp
     bounds, and data_accessed partial match. Returns ("", []) if no
     filters are set.
     """
-    conditions: List[str] = []
-    params: List[Any] = []
+    conditions: list[str] = []
+    params: list[Any] = []
 
     for field in _FILTER_FIELDS:
         if filters.get(field) is not None:
@@ -602,23 +627,29 @@ def _build_filter_clause(
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
 
 
 def _chain_disabled(conn: sqlite3.Connection) -> bool:
     """Whether this database was deliberately created without a hash chain."""
-    return conn.execute(
-        "SELECT 1 FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,)
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM chain_meta WHERE key = ?", (_CHAIN_OFF_KEY,)
+        ).fetchone()
+        is not None
+    )
 
 
 def _unchained_report(
     legacy_events: int,
-    error: Optional[str] = None,
+    error: str | None = None,
     chain: str = "absent",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The checkpoint of a database with no usable hash chain.
 
     Passing ``error`` makes it a verification result: ``valid`` is false and
@@ -626,7 +657,7 @@ def _unchained_report(
     integrity was checked. ``chain`` is ``"absent"`` (no chain, none expected)
     or ``"broken"`` (a chain is missing from a database that must have one).
     """
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "chain": chain,
         "initialized": False,
         "format_version": _CHAIN_FORMAT_VERSION,
@@ -643,9 +674,7 @@ def _unchained_report(
         "external_anchor_required": True,
     }
     if error is not None:
-        report.update(
-            valid=False, checked_events=0, broken_event_id=None, error=error
-        )
+        report.update(valid=False, checked_events=0, broken_event_id=None, error=error)
     return report
 
 
@@ -655,7 +684,7 @@ def _schema_version_of(conn: sqlite3.Connection) -> int:
 
 
 def _settle_chain_mode(
-    conn: sqlite3.Connection, chain: Optional[bool], schema_version: int
+    conn: sqlite3.Connection, chain: bool | None, schema_version: int
 ) -> None:
     """Decide, once per open and inside the schema transaction, chained or not.
 
@@ -715,28 +744,25 @@ _QUERY_FILTER_NAMES = frozenset(
 _AGGREGATE_FILTER_NAMES = frozenset(_FILTER_FIELDS + _RANGE_FILTER_FIELDS)
 
 
-def _reject_unknown_filters(filters: Dict[str, Any], allowed: frozenset) -> None:
+def _reject_unknown_filters(filters: dict[str, Any], allowed: frozenset) -> None:
     """A misspelled filter must fail, not silently match every event."""
     unknown = sorted(set(filters) - allowed)
     if unknown:
-        raise ValueError(
-            f"Unknown filter(s) {unknown}. Allowed: {sorted(allowed)}"
-        )
+        raise ValueError(f"Unknown filter(s) {unknown}. Allowed: {sorted(allowed)}")
 
 
-def _aliased_columns(columns: Tuple[str, ...], existing: frozenset) -> str:
+def _aliased_columns(columns: tuple[str, ...], existing: frozenset) -> str:
     """A SELECT list that yields NULL for a column an older database lacks.
 
     A read-only open never migrates, so a v4 file has no v5 columns. Selecting
     them as NULL lets every reader treat all schema versions uniformly.
     """
     return ", ".join(
-        column if column in existing else f"NULL AS {column}"
-        for column in columns
+        column if column in existing else f"NULL AS {column}" for column in columns
     )
 
 
-def _ensure_schema(db: "AuditDB", chain: Optional[bool] = None) -> None:
+def _ensure_schema(db: "AuditDB", chain: bool | None = None) -> None:
     """Create tables and indices if they don't exist; migrate if needed.
 
     Migration path:
@@ -862,7 +888,8 @@ def _check_read_only_schema(db: "AuditDB") -> None:
     with db._connection() as conn:
         try:
             tables = {
-                row[0] for row in conn.execute(
+                row[0]
+                for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
@@ -875,9 +902,8 @@ def _check_read_only_schema(db: "AuditDB") -> None:
             directory = os.path.dirname(os.path.abspath(db._db_path))
             message = str(exc).lower()
             if (
-                ("unable to open" in message or "readonly database" in message)
-                and not os.access(directory, os.W_OK)
-            ):
+                "unable to open" in message or "readonly database" in message
+            ) and not os.access(directory, os.W_OK):
                 raise ReadOnlyMediaError(
                     f"Cannot read {db._db_path}: it is a write-ahead-log "
                     "database, SQLite must create -wal/-shm files beside it "
@@ -904,16 +930,32 @@ def _check_read_only_schema(db: "AuditDB") -> None:
 
 # ── AuditDB ───────────────────────────────────────────────────────────────────
 
+
 class AuditDB:
     """Thread-safe SQLite storage for the canonical Panoptes audit trail."""
 
     # Columns returned by SELECT * (order matters for _row_to_event)
     _EVENT_COLUMNS = [
-        "event_id", "timestamp", "agent_type", "session_id", "run_id",
-        "event_type", "tool_name", "data_accessed", "call_id",
-        "agent", "user_info", "action", "outcome", "context", "cost",
-        "raw_request", "raw_response",
-        "correlation_id", "parent_run_id", "attributes",
+        "event_id",
+        "timestamp",
+        "agent_type",
+        "session_id",
+        "run_id",
+        "event_type",
+        "tool_name",
+        "data_accessed",
+        "call_id",
+        "agent",
+        "user_info",
+        "action",
+        "outcome",
+        "context",
+        "cost",
+        "raw_request",
+        "raw_response",
+        "correlation_id",
+        "parent_run_id",
+        "attributes",
     ]
 
     def __init__(
@@ -921,7 +963,7 @@ class AuditDB:
         db_path: str = "~/.panoptes/audit.db",
         *,
         read_only: bool = False,
-        chain: Optional[bool] = None,
+        chain: bool | None = None,
     ):
         """Open (creating and migrating) an audit database.
 
@@ -952,12 +994,16 @@ class AuditDB:
         else:
             self._connect_path = (
                 f"file:panoptes-{secrets.token_hex(16)}?mode=memory&cache=shared"
-                if self._is_memory else self._db_path
+                if self._is_memory
+                else self._db_path
             )
+        # Connections are scoped to one database operation. ThreadingHTTPServer
+        # creates short-lived request threads, so retaining a thread-local
+        # connection would leak one connection per completed request.
+        self._all_conns: set[sqlite3.Connection] = set()
+        self._conns_lock = threading.Lock()
+        self._keeper_conn: sqlite3.Connection | None = None
         if read_only:
-            self._all_conns: set = set()
-            self._conns_lock = threading.Lock()
-            self._keeper_conn: Optional[sqlite3.Connection] = None
             try:
                 _check_read_only_schema(self)
                 self._refresh_columns()
@@ -966,13 +1012,6 @@ class AuditDB:
                 raise
             return
         _prepare_database_path(self._db_path)
-
-        # Connections are scoped to one database operation. ThreadingHTTPServer
-        # creates short-lived request threads, so retaining a thread-local
-        # connection would leak one connection per completed request.
-        self._all_conns: set = set()
-        self._conns_lock = threading.Lock()
-        self._keeper_conn: Optional[sqlite3.Connection] = None
 
         try:
             # A named shared-memory database exists only while at least one
@@ -1102,11 +1141,11 @@ class AuditDB:
 
     def insert_events(
         self,
-        events: List[Dict[str, Any]],
+        events: list[dict[str, Any]],
         *,
         strict: bool = False,
-        strict_paths: Tuple[str, ...] = (),
-    ) -> List[str]:
+        strict_paths: tuple[str, ...] = (),
+    ) -> list[str]:
         """Validate, normalize, and insert a batch of events in one transaction.
 
         Returns a list of event_ids in the same order as *events*.
@@ -1136,7 +1175,7 @@ class AuditDB:
         """
         # Step 1: validate + normalize ALL events before touching the DB.
         # A ValidationError here means no DB state has changed yet.
-        prepared: List[tuple] = []  # (normalized, flat, input_requires_redaction)
+        prepared: list[tuple] = []  # (normalized, flat, input_requires_redaction)
         for event in events:
             warnings = validate_event(event)  # raises ValidationError if invalid
             if event.get("event_id") and not event.get("timestamp"):
@@ -1147,7 +1186,8 @@ class AuditDB:
             if warnings:
                 log.debug(
                     "Event validation warnings (event_id=%s): %s",
-                    event.get("event_id"), warnings,
+                    event.get("event_id"),
+                    warnings,
                 )
             normalized = normalize_event(event)
             if strict or strict_paths:
@@ -1168,8 +1208,8 @@ class AuditDB:
                     return []
 
                 conn.execute("BEGIN IMMEDIATE")
-                event_ids: List[str] = []
-                checkpoint: Optional[Dict[str, Any]] = None
+                event_ids: list[str] = []
+                checkpoint: dict[str, Any] | None = None
                 chain_loaded = False
                 payload_columns = ", ".join(_ALL_PAYLOAD_COLUMNS)
 
@@ -1198,10 +1238,9 @@ class AuditDB:
                                 "incoming raw payload contains redacted material; "
                                 "secret-bearing retries cannot be proven identical"
                             )
-                        if (
-                            _canonical_json(_canonical_payload_from_row(existing))
-                            != _canonical_json(payload)
-                        ):
+                        if _canonical_json(
+                            _canonical_payload_from_row(existing)
+                        ) != _canonical_json(payload):
                             raise EventConflictError(
                                 f"event_id {event_id!r} already exists with a "
                                 "different canonical payload"
@@ -1241,10 +1280,10 @@ class AuditDB:
 
     def insert_event(
         self,
-        event: Dict[str, Any],
+        event: dict[str, Any],
         *,
         strict: bool = False,
-        strict_paths: Tuple[str, ...] = (),
+        strict_paths: tuple[str, ...] = (),
     ) -> str:
         """Validate, normalize, and insert a single event. Returns the event_id.
 
@@ -1254,13 +1293,11 @@ class AuditDB:
 
         Raises ValidationError if required fields are missing or invalid.
         """
-        return self.insert_events(
-            [event], strict=strict, strict_paths=strict_paths
-        )[0]
+        return self.insert_events([event], strict=strict, strict_paths=strict_paths)[0]
 
     # ── Tamper-evidence hash chain ────────────────────────────────────────
 
-    def get_chain_checkpoint(self) -> Dict[str, Any]:
+    def get_chain_checkpoint(self) -> dict[str, Any]:
         """Return the current chain head and its honest coverage boundary.
 
         ``chain`` is ``"present"`` for a chained database and ``"absent"`` for
@@ -1321,12 +1358,11 @@ class AuditDB:
 
     def _chain_storage_present(self, conn: sqlite3.Connection) -> bool:
         """Whether this file has the columns and table a hash chain lives in."""
-        return (
-            {"prev_hash", "event_hash"} <= self._existing_columns
-            and _has_table(conn, "chain_meta")
+        return {"prev_hash", "event_hash"} <= self._existing_columns and _has_table(
+            conn, "chain_meta"
         )
 
-    def verify_chain(self) -> Dict[str, Any]:
+    def verify_chain(self) -> dict[str, Any]:
         """Verify links, canonical event hashes, head, count, and boundary.
 
         Returns a structured result instead of raising for detected tampering,
@@ -1368,7 +1404,7 @@ class AuditDB:
             }
         return result
 
-    def _verify_chain(self) -> Dict[str, Any]:
+    def _verify_chain(self) -> dict[str, Any]:
         with self._connection() as conn:
             try:
                 conn.execute("BEGIN")
@@ -1435,7 +1471,8 @@ class AuditDB:
                         report = _unchained_report(
                             legacy_count,
                             "Events exist but the hash chain is not initialized"
-                            if total else "No hash chain has been started",
+                            if total
+                            else "No hash chain has been started",
                         )
                     conn.commit()
                     return report
@@ -1460,7 +1497,7 @@ class AuditDB:
                     "error": None,
                 }
 
-                def fail(message: str, event_id: Optional[str] = None) -> Dict[str, Any]:
+                def fail(message: str, event_id: str | None = None) -> dict[str, Any]:
                     result["error"] = message
                     result["broken_event_id"] = event_id
                     return result
@@ -1486,7 +1523,7 @@ class AuditDB:
                     f"SELECT {columns}, prev_hash, event_hash FROM events "
                     "WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL"
                 ).fetchall()
-                by_prev: Dict[str, sqlite3.Row] = {}
+                by_prev: dict[str, sqlite3.Row] = {}
                 for row in rows:
                     prev_hash = row["prev_hash"]
                     if prev_hash in by_prev:
@@ -1498,8 +1535,8 @@ class AuditDB:
                     by_prev[prev_hash] = row
 
                 current = checkpoint["anchor"]
-                first_event_id: Optional[str] = None
-                last_event_id: Optional[str] = None
+                first_event_id: str | None = None
+                last_event_id: str | None = None
                 visited: set = set()
                 for _ in range(checkpoint["event_count"]):
                     row = by_prev.get(current)
@@ -1556,7 +1593,7 @@ class AuditDB:
                 conn.rollback()
                 raise
 
-    def verify_checkpoint(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+    def verify_checkpoint(self, checkpoint: dict[str, Any]) -> dict[str, Any]:
         """Prove that an external checkpoint is an exact prefix of this chain.
 
         The current chain is fully verified first. The external checkpoint
@@ -1568,7 +1605,7 @@ class AuditDB:
         ``appended_events`` (events added since a valid older checkpoint).
         Invalid checkpoints return ``appended_events`` as ``None``.
         """
-        base_result: Dict[str, Any] = {
+        base_result: dict[str, Any] = {
             "valid": False,
             "exact": False,
             "appended_events": None,
@@ -1578,7 +1615,7 @@ class AuditDB:
             "error": None,
         }
 
-        def fail(message: str, **details: Any) -> Dict[str, Any]:
+        def fail(message: str, **details: Any) -> dict[str, Any]:
             return {**base_result, **details, "error": message}
 
         if not isinstance(checkpoint, dict):
@@ -1594,9 +1631,7 @@ class AuditDB:
         }
         missing = required - set(checkpoint)
         if missing:
-            return fail(
-                f"Checkpoint is missing required fields: {sorted(missing)}"
-            )
+            return fail(f"Checkpoint is missing required fields: {sorted(missing)}")
 
         external_count = checkpoint["event_count"]
         external_legacy_count = checkpoint["legacy_event_count"]
@@ -1699,7 +1734,7 @@ class AuditDB:
                         WHERE prev_hash IS NOT NULL AND event_hash IS NOT NULL
                         """
                     ).fetchall()
-                    by_prev: Dict[str, sqlite3.Row] = {}
+                    by_prev: dict[str, sqlite3.Row] = {}
                     for row in rows:
                         if row["prev_hash"] in by_prev:
                             conn.commit()
@@ -1710,8 +1745,8 @@ class AuditDB:
                         by_prev[row["prev_hash"]] = row
 
                     prefix_head = current["anchor"]
-                    prefix_first_event_id: Optional[str] = None
-                    prefix_last_event_id: Optional[str] = None
+                    prefix_first_event_id: str | None = None
+                    prefix_last_event_id: str | None = None
                     for _ in range(external_count):
                         row = by_prev.get(prefix_head)
                         if row is None:
@@ -1720,9 +1755,7 @@ class AuditDB:
                                 "Current hash chain changed during checkpoint comparison",
                                 **details,
                             )
-                        prefix_first_event_id = (
-                            prefix_first_event_id or row["event_id"]
-                        )
+                        prefix_first_event_id = prefix_first_event_id or row["event_id"]
                         prefix_last_event_id = row["event_id"]
                         prefix_head = row["event_hash"]
 
@@ -1765,7 +1798,7 @@ class AuditDB:
 
     # ── Query ─────────────────────────────────────────────────────────────
 
-    def query(self, **filters: Any) -> List[Dict[str, Any]]:
+    def query(self, **filters: Any) -> list[dict[str, Any]]:
         """Query events with optional filters.
 
         Supported filters:
@@ -1820,19 +1853,19 @@ class AuditDB:
     def iter_events(
         self,
         *,
-        agent_type: Optional[str] = None,
-        event_type: Optional[str] = None,
-        session_id: Optional[str] = None,
-        run_id: Optional[str] = None,
-        parent_run_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-        tool_name: Optional[str] = None,
-        since: Optional[str] = None,
-        until: Optional[str] = None,
-        data_accessed: Optional[str] = None,
+        agent_type: str | None = None,
+        event_type: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        parent_run_id: str | None = None,
+        correlation_id: str | None = None,
+        tool_name: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        data_accessed: str | None = None,
         order: str = "rowid",
         batch_size: int = 500,
-    ) -> Iterator[Dict[str, Any]]:
+    ) -> Iterator[dict[str, Any]]:
         """Stream matching events, with no row cap, as canonical event dicts.
 
         ``order`` is ``"rowid"`` (the order events were written, which is the
@@ -1853,14 +1886,20 @@ class AuditDB:
             batch_size, "batch_size", minimum=1, maximum=MAX_QUERY_LIMIT
         )
         filters = {
-            name: value for name, value in (
-                ("agent_type", agent_type), ("event_type", event_type),
-                ("session_id", session_id), ("run_id", run_id),
+            name: value
+            for name, value in (
+                ("agent_type", agent_type),
+                ("event_type", event_type),
+                ("session_id", session_id),
+                ("run_id", run_id),
                 ("parent_run_id", parent_run_id),
-                ("correlation_id", correlation_id), ("tool_name", tool_name),
-                ("since", since), ("until", until),
+                ("correlation_id", correlation_id),
+                ("tool_name", tool_name),
+                ("since", since),
+                ("until", until),
                 ("data_accessed", data_accessed),
-            ) if value is not None
+            )
+            if value is not None
         }
         where_clause, params = _build_filter_clause(filters, self._existing_columns)
         columns, descending = self._ITER_ORDERS[order]
@@ -1869,7 +1908,7 @@ class AuditDB:
         sort_by = ", ".join(f"{column} {direction}" for column in columns)
         cursor_columns = ", ".join(columns)
         if columns == ("rowid",):
-            cursor: Tuple[Any, ...] = (2**63 - 1,) if descending else (-1,)
+            cursor: tuple[Any, ...] = (2**63 - 1,) if descending else (-1,)
         else:
             cursor = ("\U0010ffff", 2**63 - 1) if descending else ("", -1)
         placeholders = ", ".join("?" for _ in columns)
@@ -1888,7 +1927,8 @@ class AuditDB:
                 return
             last = rows[-1]
             cursor = (
-                (last["_rowid"],) if columns == ("rowid",)
+                (last["_rowid"],)
+                if columns == ("rowid",)
                 else (last["timestamp"], last["_rowid"])
             )
 
@@ -1937,13 +1977,13 @@ class AuditDB:
 
     def aggregate(
         self,
-        group_by: List[str],
-        metrics: Optional[List[str]] = None,
-        order_by: Optional[str] = None,
+        group_by: list[str],
+        metrics: list[str] | None = None,
+        order_by: str | None = None,
         descending: bool = True,
         limit: int = 1000,
         **filters: Any,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Grouped aggregate query over events.
 
         Args:
@@ -1978,8 +2018,7 @@ class AuditDB:
         bad_metrics = [m for m in metrics if m not in self._AGG_METRICS]
         if bad_metrics:
             raise ValueError(
-                f"Unknown metric(s) {bad_metrics}. "
-                f"Allowed: {sorted(self._AGG_METRICS)}"
+                f"Unknown metric(s) {bad_metrics}. Allowed: {sorted(self._AGG_METRICS)}"
             )
 
         order_by = order_by or metrics[0]
@@ -1991,11 +2030,13 @@ class AuditDB:
 
         def dimension_sql(name: str) -> str:
             expr = self._AGG_DIMENSIONS[name]
-            return expr if expr in self._existing_columns or not expr.isidentifier() else "NULL"
+            return (
+                expr
+                if expr in self._existing_columns or not expr.isidentifier()
+                else "NULL"
+            )
 
-        select_parts = [
-            f'{dimension_sql(d)} AS "{d}"' for d in group_by
-        ] + [
+        select_parts = [f'{dimension_sql(d)} AS "{d}"' for d in group_by] + [
             f'{self._AGG_METRICS[m]} AS "{m}"' for m in metrics
         ]
 
@@ -2003,7 +2044,8 @@ class AuditDB:
         where_clause, params = _build_filter_clause(filters, self._existing_columns)
         group_clause = (
             "GROUP BY " + ", ".join(dimension_sql(d) for d in group_by)
-            if group_by else ""
+            if group_by
+            else ""
         )
         direction = "DESC" if descending else "ASC"
 
@@ -2021,7 +2063,7 @@ class AuditDB:
 
     # ── Session access ────────────────────────────────────────────────────
 
-    def get_session(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_session(self, session_id: str) -> list[dict[str, Any]]:
         """Return up to 10,000 session events in chronological order."""
         events = self.query(session_id=session_id, limit=10000)
         events.reverse()  # query() returns newest-first; a timeline reads oldest-first
@@ -2029,7 +2071,7 @@ class AuditDB:
 
     # ── Evidence chain ────────────────────────────────────────────────────
 
-    def get_evidence_chain(self, event_id: str) -> List[Dict[str, Any]]:
+    def get_evidence_chain(self, event_id: str) -> list[dict[str, Any]]:
         """Return the full decision path for a given event.
 
         For tool_call / tool_result events that have a non-empty call_id,
@@ -2126,8 +2168,8 @@ class AuditDB:
     # ── Session listing ───────────────────────────────────────────────────
 
     def list_sessions(
-        self, agent_type: Optional[str] = None, limit: int = 50
-    ) -> List[Dict[str, Any]]:
+        self, agent_type: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
         """List distinct sessions, optionally filtered by agent_type.
 
         Returns sessions ordered by most recent activity first, each with:
@@ -2163,7 +2205,7 @@ class AuditDB:
 
     # ── Statistics ────────────────────────────────────────────────────────
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Return aggregate statistics about stored events."""
         with self._connection() as conn:
             total = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
@@ -2182,9 +2224,7 @@ class AuditDB:
             }
 
             # Schema version
-            ver_row = conn.execute(
-                "SELECT MAX(version) FROM schema_version"
-            ).fetchone()
+            ver_row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
             schema_version = ver_row[0] if ver_row and ver_row[0] is not None else 0
 
         return {

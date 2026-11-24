@@ -17,34 +17,33 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      # No dependency cache: a release builds from a clean slate.
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.13"
-          cache: pip
+          enable-cache: false
 
       - name: Verify release tag matches package version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          PACKAGE_VERSION=$(python -c "import pathlib, tomllib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          PACKAGE_VERSION=$(uv version --short --frozen)
           test "$RELEASE_TAG" = "v$PACKAGE_VERSION"
 
-      - name: Install test and release tools
-        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev,release]"
+      - name: Install
+        run: uv sync --locked
 
       - name: Test
-        run: |
-          python -m pip check
-          python -m pytest -q
+        run: uv run pytest -q
 
       - name: Build and validate distributions
         run: |
-          python -m build
-          python -m twine check --strict dist/*
+          uv build
+          uv run --group release twine check --strict dist/*
 
       - name: Smoke-test installed wheel
         run: |
-          python -m venv /tmp/panoptes-release-wheel
+          uv venv --seed /tmp/panoptes-release-wheel
           /tmp/panoptes-release-wheel/bin/pip install dist/*.whl
           cd /tmp
           /tmp/panoptes-release-wheel/bin/panoptes --version

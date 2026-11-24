@@ -22,30 +22,37 @@ from panoptes.hooks import (
     User,
 )
 from panoptes.proxy import ProxyServer
+from panoptes.schema import ValidationError
 
-BODY = {"model": "claude-test", "max_tokens": 8,
-        "messages": [{"role": "user", "content": "hello"}]}
+BODY = {
+    "model": "claude-test",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "hello"}],
+}
 RESPONSE = {
-    "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+    "id": "msg_1",
+    "type": "message",
+    "role": "assistant",
+    "model": "claude-test",
     "content": [{"type": "text", "text": "hi"}],
     "usage": {"input_tokens": 3, "output_tokens": 1},
 }
 SSE_HEAD = (
-    b'event: message_start\n'
+    b"event: message_start\n"
     b'data: {"type":"message_start","message":{"id":"msg_1","type":"message",'
     b'"role":"assistant","content":[],"model":"claude-test","stop_reason":null,'
     b'"usage":{"input_tokens":3,"output_tokens":1}}}\n\n'
-    b'event: content_block_start\n'
+    b"event: content_block_start\n"
     b'data: {"type":"content_block_start","index":0,'
     b'"content_block":{"type":"text","text":""}}\n\n'
-    b'event: content_block_delta\n'
+    b"event: content_block_delta\n"
     b'data: {"type":"content_block_delta","index":0,'
     b'"delta":{"type":"text_delta","text":"hi"}}\n\n'
 )
 SSE_TAIL = (
-    b'event: content_block_stop\n'
+    b"event: content_block_stop\n"
     b'data: {"type":"content_block_stop","index":0}\n\n'
-    b'event: message_delta\n'
+    b"event: message_delta\n"
     b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
     b'"usage":{"output_tokens":9}}\n\n'
     b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
@@ -59,10 +66,10 @@ class FakeUpstream:
         self.requests = []
         self.mode = "json"
         self.stream_body = False
-        self.piece_delay = 0.05            # between the pieces of a stream's tail
-        self.gate = threading.Event()      # releases the tail of a gated stream
+        self.piece_delay = 0.05  # between the pieces of a stream's tail
+        self.gate = threading.Event()  # releases the tail of a gated stream
         self.head_sent = threading.Event()
-        self.stall = threading.Event()     # holds a "stalled" stream silent
+        self.stall = threading.Event()  # holds a "stalled" stream silent
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -71,11 +78,13 @@ class FakeUpstream:
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
-                outer.requests.append({
-                    "path": self.path,
-                    "headers": [(k, v) for k, v in self.headers.items()],
-                    "body": self.rfile.read(length),
-                })
+                outer.requests.append(
+                    {
+                        "path": self.path,
+                        "headers": [(k, v) for k, v in self.headers.items()],
+                        "body": self.rfile.read(length),
+                    }
+                )
                 if outer.mode == "dupkey":
                     payload = b'{"id": "a", "id": "b", "usage": {"input_tokens": 3}}'
                     self.send_response(200)
@@ -98,17 +107,20 @@ class FakeUpstream:
                     self.wfile.write(SSE_HEAD)
                     self.close_connection = True
                 elif outer.mode == "hang":
-                    outer.gate.wait(10)          # never answers in time
+                    outer.gate.wait(10)  # never answers in time
                 elif outer.mode == "middrop":
                     self.send_response(200)
                     self.send_header(
                         "Content-Type",
-                        "text/event-stream" if outer.stream_body else "application/json")
+                        "text/event-stream"
+                        if outer.stream_body
+                        else "application/json",
+                    )
                     self.send_header("Content-Length", "400")
                     self.end_headers()
                     self.wfile.write(b'{"id": "msg_1", "content": [{"ty')
                     self.wfile.flush()
-                    self.close_connection = True   # 400 promised, 35 sent
+                    self.close_connection = True  # 400 promised, 35 sent
                 elif outer.mode == "hugenolen":
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -116,7 +128,9 @@ class FakeUpstream:
                     self.wfile.write(b'{"pad": "' + b"x" * 4096 + b'"}')
                     self.close_connection = True
                 elif outer.mode == "nousage":
-                    payload = json.dumps({k: v for k, v in RESPONSE.items() if k != "usage"}).encode()
+                    payload = json.dumps(
+                        {k: v for k, v in RESPONSE.items() if k != "usage"}
+                    ).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
@@ -146,7 +160,7 @@ class FakeUpstream:
                             self.wfile.write(piece + b"\n\n")
                             self.wfile.flush()
                             time.sleep(0.05)
-                        outer.stall.wait(10)         # then goes silent
+                        outer.stall.wait(10)  # then goes silent
                     except OSError:
                         pass
                 elif outer.mode in ("stream", "gated"):
@@ -180,7 +194,8 @@ class FakeUpstream:
         self.server.daemon_threads = True
         self.port = self.server.server_address[1]
         threading.Thread(
-            target=self.server.serve_forever, kwargs={"poll_interval": 0.05},
+            target=self.server.serve_forever,
+            kwargs={"poll_interval": 0.05},
             daemon=True,
         ).start()
 
@@ -283,7 +298,7 @@ def test_both_hooks_run_once_and_the_exchange_is_settled(make_proxy, upstream):
     assert ex.provider == "anthropic" and ex.upstream_name == "anthropic"
     assert ex.upstream_url == f"http://127.0.0.1:{upstream.port}"
     assert ex.usage == {"tokens_in": 3, "tokens_out": 1}
-    assert ex.estimated_usd_micros is None            # no pricing table
+    assert ex.estimated_usd_micros is None  # no pricing table
     assert ex.duration_ms is not None and ex.duration_ms >= 0
     assert ex.correlation_source == "proxy" and ex.correlation_id == ex.exchange_id
     assert [e["event_type"] for e in ex.response_events] == ["model_response"]
@@ -300,7 +315,9 @@ def test_the_request_body_is_forwarded_byte_for_byte(make_proxy, upstream):
     hooks = Recorder()
     _, client, _ = make_proxy(hooks)
     raw = b'{"model":  "claude-test",  "max_tokens": 8, "messages":[{"role":"user","content":"x"}]}'
-    client.post("/v1/messages", content=raw, headers={"Content-Type": "application/json"})
+    client.post(
+        "/v1/messages", content=raw, headers={"Content-Type": "application/json"}
+    )
     wait_after(hooks)
     assert upstream.requests[0]["body"] == raw
 
@@ -319,7 +336,9 @@ def test_exchange_request_fields_are_read_only_and_repr_is_safe(make_proxy):
 
     hooks = Recorder(before=before)
     _, client, _ = make_proxy(hooks)
-    client.post("/v1/messages", json=BODY, headers={"x-api-key": "sk-ant-SECRETVALUE0123456789"})
+    client.post(
+        "/v1/messages", json=BODY, headers={"x-api-key": "sk-ant-SECRETVALUE0123456789"}
+    )
     wait_after(hooks)
     assert "SECRETVALUE" not in seen["repr"]
 
@@ -333,8 +352,11 @@ def test_repeated_credential_headers_are_all_visible(make_proxy):
 
     hooks = Recorder(before=before)
     _, client, _ = make_proxy(hooks)
-    client.post("/v1/messages", json=BODY,
-                headers=[("Authorization", "Bearer aaa"), ("authorization", "Bearer bbb")])
+    client.post(
+        "/v1/messages",
+        json=BODY,
+        headers=[("Authorization", "Bearer aaa"), ("authorization", "Bearer bbb")],
+    )
     wait_after(hooks)
     assert seen["all"] == ["Bearer aaa", "Bearer bbb"] and seen["first"] == "Bearer aaa"
 
@@ -355,13 +377,20 @@ def test_reject_answers_the_client_and_never_forwards(make_proxy, upstream):
     ex = wait_after(hooks)
     assert upstream.requests == []
     assert (ex.outcome, ex.request_sent, ex.produced_output, ex.status) == (
-        "rejected", False, False, 429)
+        "rejected",
+        False,
+        False,
+        429,
+    )
     assert ex.complete is False and ex.response_events == []
     events = stored(db_path)
     request = next(e for e in events if e["event_type"] == "model_request")
     assert request["outcome"]["status"] == "blocked"
     assert request["attributes"]["hook"] == {
-        "action": "reject", "status": 429, "reason": "budget"}
+        "action": "reject",
+        "status": 429,
+        "reason": "budget",
+    }
     assert not any(e["event_type"] == "model_response" for e in events)
 
 
@@ -372,12 +401,15 @@ def test_reject_default_body_is_the_reason(make_proxy):
     assert response.status_code == 403 and response.json() == {"error": "nope"}
 
 
-@pytest.mark.parametrize("bad", [
-    Reject(200, {"x": 1}, "ok"),                 # status outside 400-599
-    Reject(403, object(), "weird"),              # body not JSON
-    Reject(403, None, "sk-ant-" + "a" * 40),     # secret-shaped reason
-    "forbidden",                                 # not None / Reject
-])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        Reject(200, {"x": 1}, "ok"),  # status outside 400-599
+        Reject(403, object(), "weird"),  # body not JSON
+        Reject(403, None, "sk-ant-" + "a" * 40),  # secret-shaped reason
+        "forbidden",  # not None / Reject
+    ],
+)
 def test_invalid_hook_answers_fail_closed(make_proxy, upstream, bad):
     hooks = Recorder(before=lambda ex: bad)
     _, client, db_path = make_proxy(hooks)
@@ -410,7 +442,7 @@ def test_a_raising_hook_never_means_forward_and_leaks_nothing(make_proxy, upstre
     events = stored(db_path)
     assert {e["agent"]["type"] for e in events} != {"evil"}
     assert "half-set" not in {e["agent"]["session_id"] for e in events}
-    assert ex.identity.agent_type != "evil"       # the seeded identity was recorded
+    assert ex.identity.agent_type != "evil"  # the seeded identity was recorded
     assert {e["attributes"]["identity"]["source"] for e in events} == {"seeded"}
 
 
@@ -421,22 +453,32 @@ def test_a_raising_hook_never_means_forward_and_leaks_nothing(make_proxy, upstre
 
 def test_a_hook_identity_replaces_the_seeded_one_on_every_event(make_proxy):
     identity = Identity(
-        agent_type="claude_code", session_id="sess-1", run_id="run-1",
-        parent_run_id="run-0", user=User(id="u-1", auth_method="oidc"),
+        agent_type="claude_code",
+        session_id="sess-1",
+        run_id="run-1",
+        parent_run_id="run-0",
+        user=User(id="u-1", auth_method="oidc"),
         assurance="vendor-sso",
     )
 
     def before(ex):
         ex.identity = identity
 
-    hooks = Recorder(before=before, after=lambda ex: setattr(
-        ex, "identity", Identity(agent_type="late", session_id="late")))
+    hooks = Recorder(
+        before=before,
+        after=lambda ex: setattr(
+            ex, "identity", Identity(agent_type="late", session_id="late")
+        ),
+    )
     _, client, db_path = make_proxy(hooks)
-    client.post("/v1/messages", json=BODY,
-                headers={"X-Panoptes-Agent": "codex", "X-Panoptes-Session": "claimed"})
+    client.post(
+        "/v1/messages",
+        json=BODY,
+        headers={"X-Panoptes-Agent": "codex", "X-Panoptes-Session": "claimed"},
+    )
 
     ex = wait_after(hooks)
-    assert ex.identity == identity                 # the late assignment was ignored
+    assert ex.identity == identity  # the late assignment was ignored
     events = stored(db_path)
     assert {e["event_type"] for e in events} == {"model_request", "model_response"}
     for e in events:
@@ -445,14 +487,20 @@ def test_a_hook_identity_replaces_the_seeded_one_on_every_event(make_proxy):
         assert e["agent"]["run_id"] == "run-1"
         assert e["agent"]["parent_run_id"] == "run-0"
         assert e["user"] == {"id": "u-1", "auth_method": "oidc"}
-        assert e["attributes"]["identity"] == {"source": "hook", "assurance": "vendor-sso"}
+        assert e["attributes"]["identity"] == {
+            "source": "hook",
+            "assurance": "vendor-sso",
+        }
         assert e["context"]["capture"]["identity_assurance"] == "hook_asserted"
         assert e["attributes"]["exchange_id"] == ex.exchange_id
 
 
 def test_a_hook_identity_without_a_run_id_gets_none_invented(make_proxy):
-    hooks = Recorder(before=lambda ex: setattr(
-        ex, "identity", Identity(agent_type="custom_agent", session_id="s-9")))
+    hooks = Recorder(
+        before=lambda ex: setattr(
+            ex, "identity", Identity(agent_type="custom_agent", session_id="s-9")
+        )
+    )
     _, client, db_path = make_proxy(hooks)
     client.post("/v1/messages", json=BODY)
     wait_after(hooks)
@@ -462,11 +510,11 @@ def test_a_hook_identity_without_a_run_id_gets_none_invented(make_proxy):
 
 
 def test_identity_is_validated_on_assignment():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Identity(agent_type="a" * 300, session_id="s")
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Identity(agent_type="ok", session_id="line\nbreak")
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         User(id="sk-ant-" + "a" * 40)
 
 
@@ -480,16 +528,19 @@ def test_a_hook_replaces_credentials_and_the_invariants_hold(make_proxy, upstrea
         for name in ("authorization", "x-api-key"):
             ex.outbound_headers.pop(name, None)
         ex.outbound_headers["x-api-key"] = "provider-key"
-        ex.outbound_headers["Content-Length"] = "999"      # discarded
+        ex.outbound_headers["Content-Length"] = "999"  # discarded
         ex.outbound_headers["Content-Type"] = "text/plain"  # discarded
-        ex.outbound_headers["Accept-Encoding"] = "br"       # forced to identity
-        ex.outbound_headers["Connection"] = "close"         # hop-by-hop, dropped
+        ex.outbound_headers["Accept-Encoding"] = "br"  # forced to identity
+        ex.outbound_headers["Connection"] = "close"  # hop-by-hop, dropped
         ex.outbound_headers["x-custom"] = "kept"
 
     hooks = Recorder(before=before)
     _, client, _ = make_proxy(hooks)
-    client.post("/v1/messages", json=BODY, headers={
-        "x-api-key": "client-key", "Authorization": "Bearer client-token"})
+    client.post(
+        "/v1/messages",
+        json=BODY,
+        headers={"x-api-key": "client-key", "Authorization": "Bearer client-token"},
+    )
     wait_after(hooks)
 
     assert upstream.header(0, "x-api-key") == ["provider-key"]
@@ -497,15 +548,24 @@ def test_a_hook_replaces_credentials_and_the_invariants_hold(make_proxy, upstrea
     assert upstream.header(0, "x-custom") == ["kept"]
     assert upstream.header(0, "accept-encoding") == ["identity"]
     assert upstream.header(0, "content-type") == ["application/json"]
-    assert upstream.header(0, "content-length") == [str(len(upstream.requests[0]["body"]))]
+    assert upstream.header(0, "content-length") == [
+        str(len(upstream.requests[0]["body"]))
+    ]
     assert "close" not in upstream.header(0, "connection")
 
 
-def test_a_connection_header_cannot_strip_a_header_the_hook_injected(make_proxy, upstream):
-    hooks = Recorder(before=lambda ex: ex.outbound_headers.update({"x-api-key": "injected"}))
+def test_a_connection_header_cannot_strip_a_header_the_hook_injected(
+    make_proxy, upstream
+):
+    hooks = Recorder(
+        before=lambda ex: ex.outbound_headers.update({"x-api-key": "injected"})
+    )
     _, client, _ = make_proxy(hooks)
-    client.post("/v1/messages", json=BODY,
-                headers={"Connection": "x-api-key", "x-api-key": "client"})
+    client.post(
+        "/v1/messages",
+        json=BODY,
+        headers={"Connection": "x-api-key", "x-api-key": "client"},
+    )
     wait_after(hooks)
     assert upstream.header(0, "x-api-key") == ["injected"]
 
@@ -525,25 +585,30 @@ def test_outbound_headers_are_validated_and_case_insensitive():
 QUERY_PATH = "/v1/messages?API_KEY=SEKRET1&x=1&access_token=SEKRET2&key=SEKRET3"
 
 
-def test_query_credentials_are_forwarded_unless_the_hook_drops_them(make_proxy, upstream):
+def test_query_credentials_are_forwarded_unless_the_hook_drops_them(
+    make_proxy, upstream
+):
     seen = {}
-    hooks = Recorder(before=lambda ex: seen.update(
-        creds=ex.query_credentials, path=ex.path))
+    hooks = Recorder(
+        before=lambda ex: seen.update(creds=ex.query_credentials, path=ex.path)
+    )
     _, client, db_path = make_proxy(hooks)
     client.post(QUERY_PATH, json=BODY)
     wait_after(hooks)
 
     assert seen["creds"] == ("SEKRET1", "SEKRET2", "SEKRET3")
     assert seen["path"] == "/v1/messages?x=1"
-    assert upstream.requests[0]["path"] == QUERY_PATH      # a logging hook changes nothing
+    assert upstream.requests[0]["path"] == QUERY_PATH  # a logging hook changes nothing
     blob = json.dumps(stored(db_path))
     assert "SEKRET" not in blob
 
 
-def test_drop_query_credentials_removes_them_from_the_forwarded_url(make_proxy, upstream):
+def test_drop_query_credentials_removes_them_from_the_forwarded_url(
+    make_proxy, upstream
+):
     def before(ex):
         ex.drop_query_credentials()
-        ex.drop_query_credentials()          # idempotent
+        ex.drop_query_credentials()  # idempotent
         assert ex.query_credentials == ("SEKRET1", "SEKRET2", "SEKRET3")
 
     hooks = Recorder(before=before)
@@ -571,7 +636,9 @@ def test_an_after_exchange_exception_is_recorded_as_an_event(make_proxy):
 
     deadline = time.time() + 5
     while time.time() < deadline:
-        errors = [e for e in stored(db_path) if e["event_type"] == "panoptes.hook_error"]
+        errors = [
+            e for e in stored(db_path) if e["event_type"] == "panoptes.hook_error"
+        ]
         if errors:
             break
         time.sleep(0.05)
@@ -587,11 +654,13 @@ def test_an_after_exchange_exception_is_recorded_as_an_event(make_proxy):
     assert client.post("/v1/messages", json=BODY).status_code == 200
 
 
-def test_upstream_connect_failure_reports_request_not_sent(make_proxy, upstream, monkeypatch):
+def test_upstream_connect_failure_reports_request_not_sent(
+    make_proxy, upstream, monkeypatch
+):
     dead = socket.socket()
     dead.bind(("127.0.0.1", 0))
     port = dead.getsockname()[1]
-    dead.close()                                    # nothing listens here now
+    dead.close()  # nothing listens here now
     monkeypatch.setenv("PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{port}")
     hooks = Recorder()
     _, client, _ = make_proxy(hooks)
@@ -611,18 +680,26 @@ def test_a_provider_error_is_forwarded_and_flagged(make_proxy, upstream):
     ex = wait_after(hooks)
     assert (ex.outcome, ex.status, ex.request_sent) == ("forwarded", 500, True)
     assert (ex.provider_error, ex.produced_output) == (True, False)
-    assert ex.estimated_usd_micros == 0              # an error reply is not billed
+    assert ex.estimated_usd_micros == 0  # an error reply is not billed
 
 
 def test_pricing_is_reported_in_whole_micro_dollars(make_proxy, tmp_path):
     from panoptes.pricing import PricingTable
 
-    table = PricingTable.from_dict({
-        "currency": "USD", "version": "t1", "source": "test",
-        "models": {"claude-test": {
-            "input_per_million": "1", "cached_input_per_million": "0.1",
-            "output_per_million": "2"}},
-    })
+    table = PricingTable.from_dict(
+        {
+            "currency": "USD",
+            "version": "t1",
+            "source": "test",
+            "models": {
+                "claude-test": {
+                    "input_per_million": "1",
+                    "cached_input_per_million": "0.1",
+                    "output_per_million": "2",
+                }
+            },
+        }
+    )
     hooks = Recorder()
     _, client, _ = make_proxy(hooks, pricing=table)
     client.post("/v1/messages", json=BODY)
@@ -630,17 +707,24 @@ def test_pricing_is_reported_in_whole_micro_dollars(make_proxy, tmp_path):
     assert isinstance(ex.estimated_usd_micros, int) and ex.estimated_usd_micros > 0
 
 
-
 def test_a_reply_without_usage_is_unpriced_not_free(make_proxy, upstream, tmp_path):
     """No token counts means nothing to price: None, never 0."""
     from panoptes.pricing import PricingTable
 
-    table = PricingTable.from_dict({
-        "currency": "USD", "version": "t1", "source": "test",
-        "models": {"claude-test": {
-            "input_per_million": "1", "cached_input_per_million": "0.1",
-            "output_per_million": "2"}},
-    })
+    table = PricingTable.from_dict(
+        {
+            "currency": "USD",
+            "version": "t1",
+            "source": "test",
+            "models": {
+                "claude-test": {
+                    "input_per_million": "1",
+                    "cached_input_per_million": "0.1",
+                    "output_per_million": "2",
+                }
+            },
+        }
+    )
     upstream.mode = "nousage"
     hooks = Recorder()
     _, client, _ = make_proxy(hooks, pricing=table)
@@ -648,8 +732,11 @@ def test_a_reply_without_usage_is_unpriced_not_free(make_proxy, upstream, tmp_pa
     ex = wait_after(hooks)
     assert ex.upstream_status == 200 and ex.provider_error is False
     assert ex.estimated_usd_micros is None
-    response = [e for e in ex.response_events if e.get("event_type") == "model_response"]
+    response = [
+        e for e in ex.response_events if e.get("event_type") == "model_response"
+    ]
     assert response and (response[0].get("cost") or {}).get("estimated_usd") is None
+
 
 # ---------------------------------------------------------------------------
 # Streaming
@@ -668,16 +755,20 @@ def test_streaming_is_not_buffered_and_after_exchange_never_delays_the_client(
     chunks = []
     with client.stream("POST", "/v1/messages", json=body) as response:
         it = response.iter_bytes()
-        chunks.append(next(it))                      # arrives while the upstream is held
+        chunks.append(next(it))  # arrives while the upstream is held
         assert upstream.head_sent.wait(5) and not hooks.done.is_set()
         upstream.gate.set()
-        chunks.extend(it)                            # the stream ends for the client...
+        chunks.extend(it)  # the stream ends for the client...
     assert b"message_stop" in b"".join(chunks)
-    assert not hooks.done.is_set()                   # ...while after_exchange still blocks
+    assert not hooks.done.is_set()  # ...while after_exchange still blocks
     release.set()
     ex = wait_after(hooks)
     assert (ex.outcome, ex.status, ex.complete, ex.produced_output) == (
-        "forwarded", 200, True, True)
+        "forwarded",
+        200,
+        True,
+        True,
+    )
     assert ex.usage["tokens_out"] == 9
 
 
@@ -690,17 +781,18 @@ def test_a_client_that_leaves_mid_stream_still_yields_usage(make_proxy, upstream
     sock = socket.create_connection(("127.0.0.1", server.port))
     sock.sendall(
         b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
-        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
     )
     assert upstream.head_sent.wait(10)
     sock.recv(4096)
-    abort(sock)                                      # the client walks away
+    abort(sock)  # the client walks away
     time.sleep(0.2)
-    upstream.gate.set()                              # the provider finishes afterwards
+    upstream.gate.set()  # the provider finishes afterwards
 
     ex = wait_after(hooks)
     assert ex.request_sent is True and ex.outcome == "forwarded"
-    assert ex.complete is True                       # Panoptes read the whole stream
+    assert ex.complete is True  # Panoptes read the whole stream
     assert ex.usage["tokens_out"] == 9
 
 
@@ -713,12 +805,13 @@ def test_drain_is_bounded(make_proxy, upstream):
     sock = socket.create_connection(("127.0.0.1", server.port))
     sock.sendall(
         b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
-        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
     )
     assert upstream.head_sent.wait(10)
     sock.recv(4096)
     abort(sock)
-    upstream.gate.set()                              # the tail trickles in past the bound
+    upstream.gate.set()  # the tail trickles in past the bound
     ex = wait_after(hooks)
     assert ex.request_sent is True and ex.complete is False and ex.usage == {}
 
@@ -745,11 +838,17 @@ def test_start_twice_preserves_the_running_proxy(tmp_path, upstream):
 def test_upstreams_override_the_environment_and_name_the_upstream(
     tmp_path, monkeypatch, upstream
 ):
-    monkeypatch.setenv("PANOPTES_UPSTREAM_ANTHROPIC", "http://127.0.0.1:1")  # a dead one
+    monkeypatch.setenv(
+        "PANOPTES_UPSTREAM_ANTHROPIC", "http://127.0.0.1:1"
+    )  # a dead one
     hooks = Recorder()
     server = ProxyServer(
-        port=0, db_path=str(tmp_path / "a.db"), hooks=hooks,
-        upstreams={"anthropic": Upstream(f"http://127.0.0.1:{upstream.port}", name="deepseek")},
+        port=0,
+        db_path=str(tmp_path / "a.db"),
+        hooks=hooks,
+        upstreams={
+            "anthropic": Upstream(f"http://127.0.0.1:{upstream.port}", name="deepseek")
+        },
     )
     port = server.start()
     try:
@@ -761,10 +860,17 @@ def test_upstreams_override_the_environment_and_name_the_upstream(
         server.stop()
 
 
-@pytest.mark.parametrize("url", [
-    "https://api.example.com/v1", "https://u:p@api.example.com", "ftp://x",
-    "https://x?y=1", "https://x#frag", "https://",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.example.com/v1",
+        "https://u:p@api.example.com",
+        "ftp://x",
+        "https://x?y=1",
+        "https://x#frag",
+        "https://",
+    ],
+)
 def test_upstream_must_be_an_origin(url):
     with pytest.raises(ValueError):
         Upstream(url)
@@ -838,7 +944,9 @@ def test_without_hooks_nothing_changes_for_the_request(tmp_path, upstream):
     server = ProxyServer(port=0, db_path=str(tmp_path / "n.db"))
     port = server.start()
     try:
-        r = httpx.post(f"http://127.0.0.1:{port}/v1/messages?key=abc", json=BODY, timeout=15)
+        r = httpx.post(
+            f"http://127.0.0.1:{port}/v1/messages?key=abc", json=BODY, timeout=15
+        )
         assert r.status_code == 200
         assert upstream.requests[0]["path"] == "/v1/messages?key=abc"
     finally:
@@ -904,8 +1012,8 @@ def test_usage_is_empty_unless_the_provider_reported_some(make_proxy, upstream):
     """Zeros would read as 'the provider charged nothing'."""
     seen = {}
     cases = [
-        ("error500", {}),                # a 5xx with a JSON body
-        ("nousage", {}),                 # a 200 without a usage object
+        ("error500", {}),  # a 5xx with a JSON body
+        ("nousage", {}),  # a 200 without a usage object
         ("json", {"tokens_in": 3, "tokens_out": 1}),
     ]
     for mode, expected in cases:
@@ -930,11 +1038,14 @@ def test_usage_is_empty_when_no_response_arrived(make_proxy, upstream, monkeypat
     assert ex.usage == {} and ex.estimated_usd_micros is None
 
 
-@pytest.mark.parametrize("option", [
-    {"policy_failure_mode": "fail_closed"},
-    {"policies_dir": "/nonexistent"},
-    {"provider_keys": {"anthropic": "k"}},
-])
+@pytest.mark.parametrize(
+    "option",
+    [
+        {"policy_failure_mode": "fail_closed"},
+        {"policies_dir": "/nonexistent"},
+        {"provider_keys": {"anthropic": "k"}},
+    ],
+)
 def test_the_legacy_gating_options_no_longer_exist(option):
     with pytest.raises(TypeError):
         ProxyServer(port=0, hooks=ProxyHooks(), **option)
@@ -946,7 +1057,9 @@ def test_a_hooked_stream_is_relayed_not_buffered(make_proxy, upstream):
     hooks = Recorder()
     _, client, _ = make_proxy(hooks)
     started = time.monotonic()
-    with client.stream("POST", "/v1/messages", json=dict(BODY, stream=True)) as response:
+    with client.stream(
+        "POST", "/v1/messages", json=dict(BODY, stream=True)
+    ) as response:
         chunks = response.iter_bytes()
         first = next(chunks)
         elapsed = time.monotonic() - started
@@ -956,11 +1069,15 @@ def test_a_hooked_stream_is_relayed_not_buffered(make_proxy, upstream):
     wait_after(hooks)
 
 
-def test_a_stream_is_relayed_not_buffered_and_recorded_as_passthrough(make_proxy, upstream):
+def test_a_stream_is_relayed_not_buffered_and_recorded_as_passthrough(
+    make_proxy, upstream
+):
     """Nothing is held back for inspection: the stream is audit-only."""
     upstream.mode = "gated"
     _, client, db_path = make_proxy(None)
-    with client.stream("POST", "/v1/messages", json=dict(BODY, stream=True)) as response:
+    with client.stream(
+        "POST", "/v1/messages", json=dict(BODY, stream=True)
+    ) as response:
         chunks = response.iter_bytes()
         assert next(chunks).startswith(b"event: message_start")
         upstream.gate.set()
@@ -985,27 +1102,32 @@ def test_the_drain_bound_is_a_wall_clock_deadline(make_proxy, upstream):
     sock = socket.create_connection(("127.0.0.1", server.port))
     sock.sendall(
         b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
-        + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        + body
     )
     assert upstream.head_sent.wait(10)
     sock.recv(4096)
     abort(sock)
     started = time.monotonic()
-    upstream.gate.set()                              # two pieces, then silence
+    upstream.gate.set()  # two pieces, then silence
 
     ex = wait_after(hooks, timeout=6)
-    assert time.monotonic() - started < 4            # the upstream stays silent for 10 s
+    assert time.monotonic() - started < 4  # the upstream stays silent for 10 s
     assert ex.request_sent is True and ex.complete is False and ex.usage == {}
     assert ex.produced_output is True
 
 
-TOOLS_BODY = dict(BODY, system="the real system prompt",
-                  tools=[{"name": "read_file", "input_schema": {}}])
+TOOLS_BODY = dict(
+    BODY,
+    system="the real system prompt",
+    tools=[{"name": "read_file", "input_schema": {}}],
+)
 
 
 @pytest.mark.parametrize("assign_identity", [True, False])
 def test_a_hook_cannot_change_what_is_recorded(make_proxy, upstream, assign_identity):
     """The upstream gets the original body, so the record must describe it."""
+
     def before(ex):
         ex.request_json["tools"] = [{"name": "tampered_tool", "input_schema": {}}]
         ex.request_json["system"] = "a tampered system prompt"
@@ -1022,7 +1144,7 @@ def test_a_hook_cannot_change_what_is_recorded(make_proxy, upstream, assign_iden
     assert sent["tools"][0]["name"] == "read_file"
     request = next(e for e in stored(db_path) if e["event_type"] == "model_request")
     assert request["action"]["declared_tools"] == ["read_file"]
-    assert request["action"]["messages_count"] == 2          # 1 message + system
+    assert request["action"]["messages_count"] == 2  # 1 message + system
     assert "tampered" not in json.dumps(stored(db_path))
     assert "injected" not in request["raw_request"]
     assert json.loads(request["raw_request"])["system"] == "the real system prompt"
@@ -1030,16 +1152,19 @@ def test_a_hook_cannot_change_what_is_recorded(make_proxy, upstream, assign_iden
 
 @pytest.mark.parametrize("hooked", [True, False])
 def test_credentialed_urls_never_reach_the_logs(tmp_path, upstream, caplog, hooked):
-    for name in ("httpx", "httpcore"):               # undo any earlier proxy's setting
+    for name in ("httpx", "httpcore"):  # undo any earlier proxy's setting
         logging.getLogger(name).setLevel(logging.NOTSET)
     server = ProxyServer(
-        port=0, db_path=str(tmp_path / "log.db"), hooks=Recorder() if hooked else None)
+        port=0, db_path=str(tmp_path / "log.db"), hooks=Recorder() if hooked else None
+    )
     port = server.start()
     try:
         with caplog.at_level(logging.DEBUG):
             r = httpx.post(
                 f"http://127.0.0.1:{port}/v1/messages?key=SEKRETLOG&x=1",
-                json=BODY, timeout=15)
+                json=BODY,
+                timeout=15,
+            )
         assert r.status_code == 200
     finally:
         server.stop()
@@ -1090,12 +1215,14 @@ def test_a_truncated_stream_reports_what_was_read(make_proxy, upstream):
     _, client, db_path = make_proxy(hooks)
 
     response = client.post("/v1/messages", json=dict(BODY, stream=True))
-    assert response.status_code == 200               # the client already had the head
+    assert response.status_code == 200  # the client already had the head
     ex = wait_after(hooks)
     assert ex.outcome == "forwarded" and ex.upstream_status == 200
     assert (ex.request_sent, ex.produced_output) == (True, True)
     assert (ex.complete, ex.usage) == (False, {})
-    response_event = next(e for e in stored(db_path) if e["event_type"] == "model_response")
+    response_event = next(
+        e for e in stored(db_path) if e["event_type"] == "model_response"
+    )
     assert response_event["outcome"]["status"] == "error"
 
 
@@ -1117,7 +1244,9 @@ def test_an_upstream_timeout_reports_a_sent_request_with_no_output(
     assert ex.usage == {} and ex.provider_error is False
 
 
-@pytest.mark.parametrize("stream, outcome", [(False, "upstream_error"), (True, "forwarded")])
+@pytest.mark.parametrize(
+    "stream, outcome", [(False, "upstream_error"), (True, "forwarded")]
+)
 def test_a_connection_dropped_in_the_middle_of_the_body(
     make_proxy, upstream, stream, outcome
 ):
@@ -1129,7 +1258,7 @@ def test_a_connection_dropped_in_the_middle_of_the_body(
     try:
         client.post("/v1/messages", json=dict(BODY, stream=stream))
     except httpx.HTTPError:
-        pass                                         # the client's own view varies
+        pass  # the client's own view varies
     ex = wait_after(hooks)
     assert ex.outcome == outcome and ex.upstream_status == 200
     assert (ex.request_sent, ex.produced_output, ex.complete) == (True, True, False)
@@ -1155,18 +1284,26 @@ def test_concurrent_starts_own_one_listener_and_allow_restart(tmp_path, upstream
             ports = list(pool.map(lambda _: start(), range(4)))
         assert sum(port is not None for port in ports) == 1
         port = next(port for port in ports if port is not None)
-        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+        assert (
+            httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code
+            == 200
+        )
         server.stop()
         server.stop()
         assert db.query(event_type="model_request")
         port = server.start()
-        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+        assert (
+            httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code
+            == 200
+        )
     finally:
         server.stop()
         db.close()
 
 
-def test_reenter_and_repeated_settlement_do_not_repeat_hooks(tmp_path, upstream, monkeypatch):
+def test_reenter_and_repeated_settlement_do_not_repeat_hooks(
+    tmp_path, upstream, monkeypatch
+):
     from panoptes._hooked import HookedExchangeMixin
 
     original = HookedExchangeMixin._finish_run
@@ -1185,7 +1322,10 @@ def test_reenter_and_repeated_settlement_do_not_repeat_hooks(tmp_path, upstream,
     server = ProxyServer(port=0, db_path=str(tmp_path / "a.db"), hooks=hooks)
     try:
         port = server.start()
-        assert httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code == 200
+        assert (
+            httpx.post(f"http://127.0.0.1:{port}/v1/messages", json=BODY).status_code
+            == 200
+        )
         assert checked.wait(10)
         assert len(hooks.before_calls) == len(hooks.after_calls) == 1
     finally:

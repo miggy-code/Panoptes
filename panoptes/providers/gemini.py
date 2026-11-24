@@ -10,38 +10,44 @@ from urllib.parse import urlparse
 from .base import (
     Provider,
     SSEParseError,
+    _optional_usage_counts,
     _parse_sse_events,
     _route_matches,
     _strict_json_loads,
     _usage_count,
-    _optional_usage_counts,
 )
 
 # Gemini's OpenAI-compatible routes (/v1beta/openai/...) are deliberately
 # absent: their payloads are OpenAI-shaped and this parser would see no tools.
 _ROUTES = (
-    re.compile(r"/v1(?:beta|alpha)?/models/[^/:]+:(?:generateContent|streamGenerateContent)"),
+    re.compile(
+        r"/v1(?:beta|alpha)?/models/[^/:]+:(?:generateContent|streamGenerateContent)"
+    ),
 )
 
 _MODEL_IN_ROUTE = re.compile(r"/models/([^/:]+):")
 
-_GEMINI_PART_FIELDS = frozenset({
-    "text",
-    "inlineData",
-    "fileData",
-    "functionCall",
-    "functionResponse",
-    "executableCode",
-    "codeExecutionResult",
-    "toolCall",
-    "toolResponse",
-})
-_GEMINI_PART_METADATA = frozenset({
-    "thought",
-    "thoughtSignature",
-    "partMetadata",
-    "videoMetadata",
-})
+_GEMINI_PART_FIELDS = frozenset(
+    {
+        "text",
+        "inlineData",
+        "fileData",
+        "functionCall",
+        "functionResponse",
+        "executableCode",
+        "codeExecutionResult",
+        "toolCall",
+        "toolResponse",
+    }
+)
+_GEMINI_PART_METADATA = frozenset(
+    {
+        "thought",
+        "thoughtSignature",
+        "partMetadata",
+        "videoMetadata",
+    }
+)
 
 
 def _required_text(value: Any, *, source: str) -> str:
@@ -80,9 +86,7 @@ def _gemini_parts(payload: dict, *, source: str) -> list[dict]:
             )
         for part_index, part in enumerate(raw_parts):
             if not isinstance(part, dict):
-                raise SSEParseError(
-                    f"{source} part {part_index} must be an object"
-                )
+                raise SSEParseError(f"{source} part {part_index} must be an object")
             unknown = set(part) - _GEMINI_PART_FIELDS - _GEMINI_PART_METADATA
             if unknown:
                 raise SSEParseError(
@@ -112,7 +116,8 @@ def _gemini_tool_parameters(item: dict) -> dict:
     return {
         key: value
         for key, value in item.items()
-        if key not in {
+        if key
+        not in {
             "id",
             "toolType",
             "tool_type",
@@ -149,7 +154,8 @@ class GeminiProvider(Provider):
         tools = body.get("tools")
         return {
             "model": body.get("model", "unknown"),
-            "messages_count": len(contents) + (1 if body.get("system_instruction") else 0),
+            "messages_count": len(contents)
+            + (1 if body.get("system_instruction") else 0),
             "tools_count": len(tools) if isinstance(tools, list) else 0,
             # Streaming is signalled by the endpoint path — see is_streaming().
             "stream": False,
@@ -166,9 +172,7 @@ class GeminiProvider(Provider):
                 "functionDeclarations"
             )
             if isinstance(declarations, list):
-                names.extend(
-                    d.get("name") for d in declarations if isinstance(d, dict)
-                )
+                names.extend(d.get("name") for d in declarations if isinstance(d, dict))
             else:
                 names.extend(tool.keys())  # e.g. google_search, code_execution
         return (
@@ -186,7 +190,9 @@ class GeminiProvider(Provider):
         if not isinstance(body, dict):
             return 0
         contents = body.get("contents", [])
-        return sum(1 for c in contents if isinstance(c, dict) and c.get("role") == "model")
+        return sum(
+            1 for c in contents if isinstance(c, dict) and c.get("role") == "model"
+        )
 
     def extract_tool_calls(
         self,
@@ -204,9 +210,7 @@ class GeminiProvider(Provider):
             if "codeExecutionResult" in part:
                 result = part["codeExecutionResult"]
                 if not isinstance(result, dict):
-                    raise SSEParseError(
-                        "Gemini codeExecutionResult must be an object"
-                    )
+                    raise SSEParseError("Gemini codeExecutionResult must be an object")
                 result_id = _optional_id(
                     result.get("id"),
                     source="Gemini codeExecutionResult id",
@@ -250,17 +254,19 @@ class GeminiProvider(Provider):
                 args = fc.get("args", {})
                 if not isinstance(args, dict):
                     raise SSEParseError("Gemini functionCall args must be an object")
-                events.append({
-                    "tool_name": name,
-                    "parameters": args,
-                    # Gemini 3 emits an id for correlated function calls;
-                    # older responses may omit it. Never fabricate the
-                    # universal-schema correlation identifier.
-                    "call_id": _optional_id(
-                        fc.get("id"),
-                        source="Gemini functionCall id",
-                    ),
-                })
+                events.append(
+                    {
+                        "tool_name": name,
+                        "parameters": args,
+                        # Gemini 3 emits an id for correlated function calls;
+                        # older responses may omit it. Never fabricate the
+                        # universal-schema correlation identifier.
+                        "call_id": _optional_id(
+                            fc.get("id"),
+                            source="Gemini functionCall id",
+                        ),
+                    }
+                )
             elif "executableCode" in part:
                 code = part["executableCode"]
                 if not isinstance(code, dict):
@@ -287,28 +293,31 @@ class GeminiProvider(Provider):
                 else:
                     result = code_results.pop(call_id, None)
                 outcome = result.get("outcome") if result else None
-                events.append({
-                    "tool_name": "code_execution",
-                    "parameters": {
-                        "language": language,
-                        "code": source_code,
-                    },
-                    "call_id": call_id,
-                    "execution_scope": "provider",
-                    "provider_item_type": "executableCode",
-                    "outcome_status": (
-                        "success"
-                        if outcome == "OUTCOME_OK"
-                        else "error"
-                        if outcome in (
-                            "OUTCOME_FAILED",
-                            "OUTCOME_DEADLINE_EXCEEDED",
-                        )
-                        else "pending"
-                    ),
-                    "server_result": result.get("output") if result else None,
-                    "server_result_type": "codeExecutionResult",
-                })
+                events.append(
+                    {
+                        "tool_name": "code_execution",
+                        "parameters": {
+                            "language": language,
+                            "code": source_code,
+                        },
+                        "call_id": call_id,
+                        "execution_scope": "provider",
+                        "provider_item_type": "executableCode",
+                        "outcome_status": (
+                            "success"
+                            if outcome == "OUTCOME_OK"
+                            else "error"
+                            if outcome
+                            in (
+                                "OUTCOME_FAILED",
+                                "OUTCOME_DEADLINE_EXCEEDED",
+                            )
+                            else "pending"
+                        ),
+                        "server_result": result.get("output") if result else None,
+                        "server_result_type": "codeExecutionResult",
+                    }
+                )
             elif "toolCall" in part:
                 call = part["toolCall"]
                 if not isinstance(call, dict):
@@ -330,27 +339,30 @@ class GeminiProvider(Provider):
                     result
                     and (
                         result.get("error")
-                        or result.get("status")
-                        in ("ERROR", "FAILED", "CANCELLED")
+                        or result.get("status") in ("ERROR", "FAILED", "CANCELLED")
                     )
                 )
-                events.append({
-                    "tool_name": _gemini_tool_type(
-                        call,
-                        source="Gemini toolCall",
-                    ),
-                    "parameters": _gemini_tool_parameters(call),
-                    "call_id": call_id,
-                    "execution_scope": "provider",
-                    "provider_item_type": "toolCall",
-                    "outcome_status": (
-                        "error"
-                        if result_failed
-                        else "success" if result else "pending"
-                    ),
-                    "server_result": result,
-                    "server_result_type": "toolResponse",
-                })
+                events.append(
+                    {
+                        "tool_name": _gemini_tool_type(
+                            call,
+                            source="Gemini toolCall",
+                        ),
+                        "parameters": _gemini_tool_parameters(call),
+                        "call_id": call_id,
+                        "execution_scope": "provider",
+                        "provider_item_type": "toolCall",
+                        "outcome_status": (
+                            "error"
+                            if result_failed
+                            else "success"
+                            if result
+                            else "pending"
+                        ),
+                        "server_result": result,
+                        "server_result_type": "toolResponse",
+                    }
+                )
         if (
             code_results
             or tool_results
@@ -381,21 +393,21 @@ class GeminiProvider(Provider):
                 if "functionResponse" in part:
                     fr = part["functionResponse"]
                     if not isinstance(fr, dict):
-                        raise SSEParseError(
-                            "Gemini functionResponse must be an object"
-                        )
-                    events.append({
-                        "tool_name": _required_text(
-                            fr.get("name"),
-                            source="Gemini functionResponse name",
-                        ),
-                        "result": fr.get("response", ""),
-                        "call_id": _optional_id(
-                            fr.get("id"),
-                            source="Gemini functionResponse id",
-                        ),
-                        "is_error": bool(fr.get("error")),
-                    })
+                        raise SSEParseError("Gemini functionResponse must be an object")
+                    events.append(
+                        {
+                            "tool_name": _required_text(
+                                fr.get("name"),
+                                source="Gemini functionResponse name",
+                            ),
+                            "result": fr.get("response", ""),
+                            "call_id": _optional_id(
+                                fr.get("id"),
+                                source="Gemini functionResponse id",
+                            ),
+                            "is_error": bool(fr.get("error")),
+                        }
+                    )
         return events
 
     def extract_requested_tools(self, req_body: dict) -> dict[str, list[str]]:
@@ -421,9 +433,7 @@ class GeminiProvider(Provider):
             raise SSEParseError("Gemini request tools must be a list")
         for index, tool in enumerate(tools):
             if not isinstance(tool, dict):
-                raise SSEParseError(
-                    f"Gemini request tool {index} must be an object"
-                )
+                raise SSEParseError(f"Gemini request tool {index} must be an object")
             if not tool:
                 raise SSEParseError(f"Gemini request tool {index} is empty")
             for tool_type, config in tool.items():
@@ -486,9 +496,7 @@ class GeminiProvider(Provider):
             any(label != "codeExecution" for label in server_side)
             and not exact_server_visibility
         ):
-            unknown.append(
-                "visibility:server_side_invocations_not_requested"
-            )
+            unknown.append("visibility:server_side_invocations_not_requested")
         return {
             "requested_tools": requested,
             "client_side_tools": client_side,
@@ -501,11 +509,14 @@ class GeminiProvider(Provider):
         usage = resp_body.get("usageMetadata", {})
         return {
             "tokens_in": _usage_count(usage, "promptTokenCount"),
-            **_optional_usage_counts(usage, {
-                "thoughtsTokenCount": "reasoning_tokens",
-                "cachedContentTokenCount": "cached_input_tokens",
-                "toolUsePromptTokenCount": "tool_prompt_tokens",
-            }),
+            **_optional_usage_counts(
+                usage,
+                {
+                    "thoughtsTokenCount": "reasoning_tokens",
+                    "cachedContentTokenCount": "cached_input_tokens",
+                    "toolUsePromptTokenCount": "tool_prompt_tokens",
+                },
+            ),
             # Thinking tokens are billed as output but counted separately.
             "tokens_out": (
                 _usage_count(usage, "candidatesTokenCount")
@@ -576,11 +587,7 @@ def _reassemble_gemini_sse(raw: bytes) -> dict:
 
             payload_field = next(iter(set(part) & _GEMINI_PART_FIELDS))
             payload = part[payload_field]
-            correlated_id = (
-                payload.get("id")
-                if isinstance(payload, dict)
-                else None
-            )
+            correlated_id = payload.get("id") if isinstance(payload, dict) else None
             if isinstance(correlated_id, str) and correlated_id:
                 key = (payload_field, correlated_id)
                 earlier = seen_correlated_parts.get(key)
@@ -611,8 +618,10 @@ def _reassemble_gemini_sse(raw: bytes) -> dict:
         finish_reason = None
         if last.get("candidates"):
             finish_reason = last["candidates"][0].get("finishReason")
-        result["candidates"] = [{
-            "content": {"parts": parts, "role": "model"},
-            "finishReason": finish_reason,
-        }]
+        result["candidates"] = [
+            {
+                "content": {"parts": parts, "role": "model"},
+                "finishReason": finish_reason,
+            }
+        ]
     return result

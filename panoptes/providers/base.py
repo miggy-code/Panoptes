@@ -136,9 +136,13 @@ def _optional_usage_counts(usage: Any, fields: dict[str, str]) -> dict:
     """Preserve valid reported counts, leaving unavailable metrics absent."""
     if not isinstance(usage, dict):
         return {}
-    return {name: value for source, name in fields.items()
-            if isinstance((value := usage.get(source)), int)
-            and not isinstance(value, bool) and value >= 0}
+    return {
+        name: value
+        for source, name in fields.items()
+        if isinstance((value := usage.get(source)), int)
+        and not isinstance(value, bool)
+        and value >= 0
+    }
 
 
 MAX_DECLARED_TOOLS = 256
@@ -149,8 +153,11 @@ def _digest(value: Any) -> str | None:
     if value in (None, "", [], {}):
         return None
     canonical = json.dumps(
-        value, sort_keys=True, ensure_ascii=False,
-        separators=(",", ":"), default=str,
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -246,9 +253,11 @@ class Provider(ABC):
         history_hash = _digest(turns[:-1]) if len(turns) > 1 else None
         if history_hash:
             result["history_sha256"] = history_hash
-        names = list(dict.fromkeys(
-            name[:256] for name in tools if isinstance(name, str) and name
-        ))[:MAX_DECLARED_TOOLS]
+        names = list(
+            dict.fromkeys(
+                name[:256] for name in tools if isinstance(name, str) and name
+            )
+        )[:MAX_DECLARED_TOOLS]
         if names:
             result["declared_tools"] = names
         return result
@@ -280,7 +289,9 @@ class Provider(ABC):
         if not isinstance(body, dict):
             return 0
         messages = body.get("messages", [])
-        return sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant")
+        return sum(
+            1 for m in messages if isinstance(m, dict) and m.get("role") == "assistant"
+        )
 
     def extract_tool_calls(
         self,

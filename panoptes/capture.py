@@ -10,25 +10,27 @@ provenance or cryptographic proof of the reported identity or execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Tuple
+from typing import Any
 
 from .schema import ALLOWED_EVENT_TYPES
 
 CAPTURE_PROVENANCE = "adapter_asserted"
 CAPTURE_PROVENANCE_AUTHENTICATED = False
-_RESERVED_CAPTURE_FIELDS = frozenset({
-    "adapter",
-    "fidelity",
-    "observed_events",
-    "observation_boundary",
-    "identity_assurance",
-    "execution_observed",
-    "enforcement_mandatory",
-    "enforcement_points",
-    "notes",
-    "provenance",
-    "authenticated",
-})
+_RESERVED_CAPTURE_FIELDS = frozenset(
+    {
+        "adapter",
+        "fidelity",
+        "observed_events",
+        "observation_boundary",
+        "identity_assurance",
+        "execution_observed",
+        "enforcement_mandatory",
+        "enforcement_points",
+        "notes",
+        "provenance",
+        "authenticated",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -37,12 +39,12 @@ class CaptureCapabilities:
 
     adapter: str
     fidelity: str
-    observed_events: Tuple[str, ...]
+    observed_events: tuple[str, ...]
     observation_boundary: str
     identity_assurance: str = "unverified"
     execution_observed: bool = False
     enforcement_mandatory: bool = False
-    enforcement_points: Tuple[str, ...] = ()
+    enforcement_points: tuple[str, ...] = ()
     notes: str = ""
 
     def __post_init__(self) -> None:
@@ -71,12 +73,9 @@ class CaptureCapabilities:
                 f"{sorted(unknown_events)}"
             )
         if not isinstance(self.enforcement_points, tuple) or not all(
-            isinstance(point, str) and point
-            for point in self.enforcement_points
+            isinstance(point, str) and point for point in self.enforcement_points
         ):
-            raise ValueError(
-                "enforcement_points must be a tuple of non-empty strings"
-            )
+            raise ValueError("enforcement_points must be a tuple of non-empty strings")
         if not isinstance(self.notes, str):
             raise ValueError("notes must be a string")
 
@@ -89,8 +88,7 @@ class CaptureCapabilities:
         conflicts = _RESERVED_CAPTURE_FIELDS.intersection(extra)
         if conflicts:
             raise ValueError(
-                "capture extras cannot override reserved fields: "
-                f"{sorted(conflicts)}"
+                f"capture extras cannot override reserved fields: {sorted(conflicts)}"
             )
         capture = {
             "adapter": self.adapter,
@@ -106,7 +104,9 @@ class CaptureCapabilities:
         }
         if self.notes:
             capture["notes"] = self.notes
-        capture.update({key: value for key, value in extra.items() if value is not None})
+        capture.update(
+            {key: value for key, value in extra.items() if value is not None}
+        )
         return capture
 
 

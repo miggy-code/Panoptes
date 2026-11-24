@@ -71,9 +71,7 @@ def test_verify_exits_nonzero_after_tampering(tmp_path):
     assert exc.value.code == 1
 
 
-def test_verify_checkpoint_cli_accepts_prefix_and_rejects_forgery(
-    tmp_path, capsys
-):
+def test_verify_checkpoint_cli_accepts_prefix_and_rejects_forgery(tmp_path, capsys):
     db_path = tmp_path / "audit.db"
     checkpoint_path = tmp_path / "checkpoint.json"
     db = AuditDB(str(db_path))
@@ -83,13 +81,15 @@ def test_verify_checkpoint_cli_accepts_prefix_and_rejects_forgery(
     db.insert_event(_event("event-2"))
     db.close()
 
-    main([
-        "verify",
-        "--db-path",
-        str(db_path),
-        "--checkpoint",
-        str(checkpoint_path),
-    ])
+    main(
+        [
+            "verify",
+            "--db-path",
+            str(db_path),
+            "--checkpoint",
+            str(checkpoint_path),
+        ]
+    )
     verified = json.loads(capsys.readouterr().out)
     assert verified["valid"] is True
     assert verified["exact"] is False
@@ -98,13 +98,15 @@ def test_verify_checkpoint_cli_accepts_prefix_and_rejects_forgery(
     checkpoint["head"] = "0" * 64
     checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
     with pytest.raises(SystemExit) as exc:
-        main([
-            "verify",
-            "--db-path",
-            str(db_path),
-            "--checkpoint",
-            str(checkpoint_path),
-        ])
+        main(
+            [
+                "verify",
+                "--db-path",
+                str(db_path),
+                "--checkpoint",
+                str(checkpoint_path),
+            ]
+        )
     assert exc.value.code == 1
 
 
@@ -195,11 +197,16 @@ def test_verify_never_re_anchors_a_stripped_chain(tmp_path, capsys):
         AuditDB(str(db_path))
 
 
-@pytest.mark.parametrize("command, count_label", [
-    (["session", "s1"], "4 of 4 events"),
-    (["evidence", "proposal"], "4 steps"),
-])
-def test_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, capsys, command, count_label):
+@pytest.mark.parametrize(
+    "command, count_label",
+    [
+        (["session", "s1"], "4 of 4 events"),
+        (["evidence", "proposal"], "4 steps"),
+    ],
+)
+def test_timeline_keeps_order_correlations_and_execution_boundaries(
+    tmp_path, capsys, command, count_label
+):
     from panoptes.capture import PROXY_CAPABILITIES
 
     db_path = tmp_path / "audit.db"
@@ -214,10 +221,14 @@ def test_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, ca
         event = _event(event_id)
         event["event_type"] = kind
         event["action"] = {
-            "tool_name": "bash", "call_id": "call-1",
+            "tool_name": "bash",
+            "call_id": "call-1",
             "parameters": {"command": "echo hello"},
         }
-        event["outcome"] = {"status": status, "summary": "Run bash\n\x1b[31m sk-proj-fake-secret-01234567890123456789"}
+        event["outcome"] = {
+            "status": status,
+            "summary": "Run bash\n\x1b[31m sk-proj-fake-secret-01234567890123456789",
+        }
         event["context"] = {"capture": PROXY_CAPABILITIES.as_context()}
         event["attributes"] = {"exchange_id": "exchange-1"}
         event["correlation_id"] = "correlation-1"
@@ -226,10 +237,16 @@ def test_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, ca
         if kind == "tool_call":
             event["action"]["execution_scope"] = {}
         if kind == "decision_point":
-            event["context"].update({
-                "decision_kind": "tool_authorization", "source_event_id": "proposal",
-                "policy": {"action": "block", "matched_policies": [{"policy_name": "no-bash"}]},
-            })
+            event["context"].update(
+                {
+                    "decision_kind": "tool_authorization",
+                    "source_event_id": "proposal",
+                    "policy": {
+                        "action": "block",
+                        "matched_policies": [{"policy_name": "no-bash"}],
+                    },
+                }
+            )
         if kind == "tool_result":
             event["action"]["duration_ms"] = 123
             event["context"]["capture"]["inspection_status"] = "incomplete"
@@ -241,14 +258,21 @@ def test_timeline_keeps_order_correlations_and_execution_boundaries(tmp_path, ca
     main([*command, "--db-path", str(db_path)])
     output = capsys.readouterr().out
     assert count_label in output
-    assert output.index("id=request") < output.index("id=proposal") < output.index("id=decision") < output.index("id=result")
+    assert (
+        output.index("id=request")
+        < output.index("id=proposal")
+        < output.index("id=decision")
+        < output.index("id=result")
+    )
     assert "authorization bash  BLOCKED" in output
     assert "execution=not observed" in output
     assert "execution=client-reported" in output
     assert "(123 ms)" in output
     assert "event policy=block [no-bash]" in output
     assert "command=echo hello" in output
-    assert "call=call-1" in output and "source=proposal" in output and "run=r1" in output
+    assert (
+        "call=call-1" in output and "source=proposal" in output and "run=r1" in output
+    )
     assert "exchange=exchange-1" in output and "correlation=correlation-1" in output
     assert "inspection=incomplete" in output
     assert "\x1b" not in output
@@ -278,15 +302,18 @@ def test_session_partial_selection_json_and_empty_session(tmp_path, capsys):
     assert data["partial"] is False
 
 
-@pytest.mark.parametrize("argv", [
-    ["token", "list"],
-    ["policy", "check"],
-    ["policy", "list"],
-    ["proxy", "--inject-credentials"],
-    ["proxy", "--policies-dir", "p"],
-    ["proxy", "--policy-failure-mode", "fail_closed"],
-    ["doctor", "--credentials-file", "keys.yaml"],
-])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["token", "list"],
+        ["policy", "check"],
+        ["policy", "list"],
+        ["proxy", "--inject-credentials"],
+        ["proxy", "--policies-dir", "p"],
+        ["proxy", "--policy-failure-mode", "fail_closed"],
+        ["doctor", "--credentials-file", "keys.yaml"],
+    ],
+)
 def test_the_gateway_commands_and_options_are_gone(argv, capsys):
     with pytest.raises(SystemExit) as exc:
         main(argv)
@@ -304,12 +331,16 @@ def test_credential_injection_is_not_part_of_the_package():
         ProxyServer(port=0, provider_keys={"openai": "k"})
 
 
-def test_doctor_checks_storage_and_capture_without_writing(tmp_path, monkeypatch, capsys):
+def test_doctor_checks_storage_and_capture_without_writing(
+    tmp_path, monkeypatch, capsys
+):
     db_path = tmp_path / "audit.db"
     _write_events(db_path, "recent-event")
     before = db_path.read_bytes()
     mode = db_path.stat().st_mode
-    monkeypatch.setattr(AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events"))
+    monkeypatch.setattr(
+        AuditDB, "insert_events", lambda *args: pytest.fail("doctor wrote audit events")
+    )
 
     main(["doctor", "--db-path", str(db_path)])
 
@@ -341,7 +372,9 @@ def test_doctor_flags_a_database_with_no_recorded_activity(tmp_path, capsys):
 def test_export_otel_missing_extra_explains_installation(monkeypatch, capsys):
     import sys
 
-    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", None)
+    monkeypatch.setitem(
+        sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", None
+    )
     with pytest.raises(SystemExit) as exc:
         main(["export-otel", "--endpoint", "http://127.0.0.1:1/v1/traces"])
     assert exc.value.code == 2

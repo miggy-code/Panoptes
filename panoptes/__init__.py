@@ -9,9 +9,9 @@ schema conformance does not prove identity or local execution.
 from importlib.metadata import PackageNotFoundError, version
 
 from .capture import (
-    CaptureCapabilities,
     HERMES_CAPABILITIES,
     PROXY_CAPABILITIES,
+    CaptureCapabilities,
 )
 from .db import (
     AuditDB,

@@ -40,7 +40,9 @@ def test_clean_identifiers_pass_unchanged(db):
 
 
 def test_default_mode_still_redacts_a_target_in_place(db):
-    db.insert_event(make_event(action={"tool_name": "fetch", "target": URL_WITH_SECRET}))
+    db.insert_event(
+        make_event(action={"tool_name": "fetch", "target": URL_WITH_SECRET})
+    )
     assert "hunter2" not in db.query()[0]["action"]["target"]
 
 
@@ -66,19 +68,23 @@ def test_strict_refuses_an_agent_version_that_would_be_rewritten(db):
 
 
 def test_strict_still_redacts_free_text(db):
-    event = make_event(outcome={
-        "status": "success",
-        "summary": "used sk-proj-fakefakefakefake0123456789 here",
-    })
+    event = make_event(
+        outcome={
+            "status": "success",
+            "summary": "used sk-proj-fakefakefakefake0123456789 here",
+        }
+    )
     db.insert_event(event, strict=True)
     assert "sk-proj" not in db.query()[0]["outcome"]["summary"]
 
 
 def test_strict_paths_cover_caller_named_fields(db):
-    event = make_event(attributes={
-        "policy_version": "v1",
-        "rule_ids": ["ok", "Bearer abcdefghijklmnopqrstuvwxyz0123456789"],
-    })
+    event = make_event(
+        attributes={
+            "policy_version": "v1",
+            "rule_ids": ["ok", "Bearer abcdefghijklmnopqrstuvwxyz0123456789"],
+        }
+    )
     db.insert_event(event, strict=True)  # attributes are free-form by default
     with pytest.raises(IdentifierRewriteError, match=r"attributes.rule_ids\[\]"):
         db.insert_event(
@@ -87,9 +93,12 @@ def test_strict_paths_cover_caller_named_fields(db):
         )
     with pytest.raises(IdentifierRewriteError, match="attributes.policy_version"):
         db.insert_event(
-            make_event(event_id="strict-3", attributes={
-                "policy_version": "https://u:p4ssw0rd@h/x",
-            }),
+            make_event(
+                event_id="strict-3",
+                attributes={
+                    "policy_version": "https://u:p4ssw0rd@h/x",
+                },
+            ),
             strict_paths=("attributes.policy_version",),
         )
 
