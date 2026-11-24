@@ -47,6 +47,9 @@ event stronger provenance than its capture fields state.
   reject duplicate JSON object keys. Otherwise the client and the audit trail
   could read different values. Panoptes withholds a buffered reply that has
   duplicate keys.
+- **No unrecorded requests.** If Panoptes cannot build a request's audit
+  events, it answers HTTP 500 and forwards nothing. Otherwise an input that
+  breaks event construction would pass through unseen.
 - **Streams pass through.** Panoptes sends stream data to the client before it
   inspects it. Stream capture has a size limit and is marked incomplete when it
   is cut short.

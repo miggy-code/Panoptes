@@ -92,6 +92,8 @@ Panoptes *fails closed* on traffic that it cannot record correctly:
   and file uploads.
 - It refuses requests that are malformed, too large, or have duplicate JSON
   keys.
+- It refuses a request with HTTP 500 when it cannot build the request's audit
+  events. Forwarding it would leave the exchange unrecorded.
 - It replaces a buffered reply with HTTP 502 when the reply has a duplicate
   JSON key. The client and the audit trail could read different values.
 - It replaces a buffered reply with HTTP 502 when the reply is larger than the

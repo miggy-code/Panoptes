@@ -13,8 +13,10 @@ import time
 import uuid
 from email.message import Message
 
+import httpx
 import pytest
 
+from panoptes.hooks import ProxyHooks
 from panoptes.providers import detect as detect_provider
 from panoptes.providers.anthropic import (
     AnthropicProvider,
@@ -1847,3 +1849,63 @@ def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
         assert server.start() > 0
     finally:
         server.stop()
+
+
+# ---------------------------------------------------------------------------
+# The exchange pipeline, against a real proxy and a fake upstream
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_BODY = {
+    "model": "claude-test",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "hello"}],
+}
+
+
+class _CountingHooks(ProxyHooks):
+    def __init__(self) -> None:
+        self.before: list = []
+        self.after: list = []
+
+    def before_forward(self, exchange):
+        self.before.append(exchange)
+
+    def after_exchange(self, exchange):
+        self.after.append(exchange)
+
+
+@pytest.fixture
+def proxy_url(tmp_path, upstream):
+    """Start a proxy (hooks optional) and return its base URL and database."""
+    servers = []
+
+    def start(hooks=None):
+        db_path = tmp_path / "audit.db"
+        server = ProxyServer(port=0, db_path=str(db_path), hooks=hooks)
+        servers.append(server)
+        return f"http://127.0.0.1:{server.start()}", db_path
+
+    yield start
+    for server in servers:
+        server.stop()
+
+
+@pytest.mark.parametrize("hooked", [False, True], ids=["observed", "hooked"])
+def test_a_request_whose_events_cannot_be_built_is_refused(
+    proxy_url, upstream, monkeypatch, hooked
+):
+    def broken_fingerprint(self, body):
+        raise RuntimeError("fingerprint bug")
+
+    monkeypatch.setattr(AnthropicProvider, "request_fingerprint", broken_fingerprint)
+    hooks = _CountingHooks() if hooked else None
+    base, _ = proxy_url(hooks)
+
+    response = httpx.post(f"{base}/v1/messages", json=ANTHROPIC_BODY, timeout=10)
+
+    # Forwarding it would leave the exchange unrecorded.
+    assert response.status_code == 500
+    assert response.json() == {"error": "The request could not be recorded"}
+    assert upstream.requests == []
+    if hooks is not None:
+        assert hooks.before == hooks.after == []

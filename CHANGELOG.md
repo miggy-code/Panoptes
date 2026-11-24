@@ -5,6 +5,14 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **A request whose audit events cannot be built is refused.** An unexpected
+  error while building request events used to be logged and ignored. The
+  proxy then forwarded the request with an empty context, and in hook mode it
+  dropped the connection without a reply. Both modes now answer HTTP 500 and
+  forward nothing.
+
 ### Documentation
 
 - Rewrite the README, SECURITY, RELEASING, AGENTS, and lifecycle docs in

@@ -894,7 +894,11 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 )
                 return
             except Exception:
-                log.exception("Request event construction failed — continuing")
+                # Forwarding would leave the exchange unrecorded, so any input
+                # that broke event construction could pass unseen.
+                log.exception("Request events could not be built")
+                self._send_json_error(500, "The request could not be recorded")
+                return
             if hooks is not None:
                 run = self._enter_exchange(
                     method=method,
