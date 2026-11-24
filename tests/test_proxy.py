@@ -7,14 +7,30 @@ Covers:
   - Request and response event construction and persistence
 """
 
+import gzip
 import io
 import json
-import time
+import socket
 import uuid
 from email.message import Message
 
+import httpx
 import pytest
 
+from panoptes._events import _parse_sse_response
+from panoptes._forward import (
+    Forwarder,
+    ForwardReport,
+    Outbound,
+    UpstreamTarget,
+    check_content_encoding,
+    default_outbound_headers,
+    filter_hop_by_hop,
+    upstream_client,
+)
+from panoptes._request import merge_headers, read_body, route
+from panoptes.db import AuditDB
+from panoptes.hooks import ProxyHooks
 from panoptes.providers import detect as detect_provider
 from panoptes.providers.anthropic import (
     AnthropicProvider,
@@ -28,13 +44,12 @@ from panoptes.providers.openai import (
 from panoptes.proxy import (
     AuditEventWriter,
     AuditWriteError,
-    ProxyHandler,
+    NoUpstreamError,
     ProxyServer,
     RequestBodyTooLarge,
     RequestFramingError,
+    ResponseInspectionError,
     UpstreamBodyTooLarge,
-    _filter_headers,
-    _parse_sse_response,
     detect_agent_type,
 )
 from panoptes.schema import ValidationError
@@ -55,6 +70,67 @@ class _AuditDBStub:
 
     def query(self, _filters: dict | None = None) -> list[dict]:
         return list(self.events)
+
+
+# ---------------------------------------------------------------------------
+# A real proxy against the fake upstream (tests/fake_upstream.py)
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_BODY = {
+    "model": "claude-test",
+    "max_tokens": 8,
+    "messages": [{"role": "user", "content": "hello"}],
+}
+
+
+class _CountingHooks(ProxyHooks):
+    def __init__(self) -> None:
+        self.before: list = []
+        self.after: list = []
+
+    def before_forward(self, exchange):
+        self.before.append(exchange)
+
+    def after_exchange(self, exchange):
+        self.after.append(exchange)
+
+
+class _Proxy:
+    """A running proxy. ``recorded()`` stops it, so every write has landed."""
+
+    def __init__(self, db_path, hooks=None) -> None:
+        self.db_path = db_path
+        self.server = ProxyServer(port=0, db_path=str(db_path), hooks=hooks)
+        self.url = f"http://127.0.0.1:{self.server.start()}"
+
+    def recorded(self, event_type=None) -> list[dict]:
+        self.server.stop()
+        db = AuditDB.open_readonly(str(self.db_path))
+        try:
+            events = list(db.iter_events())
+        finally:
+            db.close()
+        return [e for e in events if event_type in (None, e["event_type"])]
+
+
+@pytest.fixture
+def proxy(tmp_path, upstream):
+    """Start a proxy against the fake upstream; hooks are optional."""
+    started: list[_Proxy] = []
+
+    def start(hooks=None) -> _Proxy:
+        started.append(_Proxy(tmp_path / f"audit-{len(started)}.db", hooks))
+        return started[-1]
+
+    yield start
+    for running in started:
+        running.server.stop()
+
+
+def _unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def test_provider_detection_prefers_routed_path_and_handles_malformed_messages():
@@ -117,11 +193,9 @@ def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
 
     with pytest.raises(SSEParseError, match="cross-dialect"):
         writer.build_response_events(
-            path="/v1/chat/completions",
-            req_body=req_body,
-            resp_status=200,
-            resp_headers={},
-            resp_body={
+            exchange_ctx,
+            status=200,
+            body={
                 "object": "response",
                 "output": [
                     {
@@ -132,7 +206,6 @@ def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
                 ],
             },
             duration_ms=20,
-            exchange_ctx=exchange_ctx,
         )
 
 
@@ -204,33 +277,29 @@ def test_sse_parser_surfaces_malformed_or_ambiguous_events():
 
 
 def test_request_body_framing_and_size_are_strict():
-    class _Handler:
-        max_request_body_bytes = 4
-
-        def __init__(self, headers, body=b""):
-            self.headers = headers
-            self.rfile = io.BytesIO(body)
+    def read(headers, body=b""):
+        return read_body(headers, io.BytesIO(body), limit=4)
 
     duplicate = Message()
     duplicate.add_header("Content-Length", "1")
     duplicate.add_header("Content-Length", "1")
     with pytest.raises(RequestFramingError, match="Multiple"):
-        ProxyHandler._read_body(_Handler(duplicate, b"x"))
+        read(duplicate, b"x")
 
     chunked = Message()
     chunked.add_header("Transfer-Encoding", "chunked")
     with pytest.raises(RequestFramingError, match="not supported"):
-        ProxyHandler._read_body(_Handler(chunked, b"1\r\nx\r\n0\r\n\r\n"))
+        read(chunked, b"1\r\nx\r\n0\r\n\r\n")
 
     oversized = Message()
     oversized.add_header("Content-Length", "5")
     with pytest.raises(RequestBodyTooLarge):
-        ProxyHandler._read_body(_Handler(oversized, b"12345"))
+        read(oversized, b"12345")
 
     incomplete = Message()
     incomplete.add_header("Content-Length", "4")
     with pytest.raises(RequestFramingError, match="ended before"):
-        ProxyHandler._read_body(_Handler(incomplete, b"12"))
+        read(incomplete, b"12")
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.10", "proxy.local"])
@@ -256,10 +325,7 @@ def test_proxy_start_failure_releases_partial_resources(monkeypatch):
     def _fail_server(*args, **kwargs):
         raise OSError("bind failed")
 
-    monkeypatch.setattr(
-        "panoptes.proxy._BoundedThreadingHTTPServer",
-        _fail_server,
-    )
+    monkeypatch.setattr("panoptes.proxy.BoundedThreadingHTTPServer", _fail_server)
     server = ProxyServer(port=0)
 
     with pytest.raises(OSError, match="bind failed"):
@@ -273,24 +339,13 @@ def test_proxy_start_failure_releases_partial_resources(monkeypatch):
     assert server.writer is None
 
 
-def test_handler_owned_http_client_ignores_proxy_environment(monkeypatch):
-    captured = {}
-    sentinel = object()
-
-    def _client(**kwargs):
-        captured.update(kwargs)
-        return sentinel
-
-    monkeypatch.setattr("panoptes.proxy.httpx.Client", _client)
-
-    class _Handler:
-        http_client = None
-        upstream_timeout = 12.0
-
-    client, owned = ProxyHandler._get_client(_Handler())
-    assert client is sentinel
-    assert owned is True
-    assert captured["trust_env"] is False
+def test_upstream_client_ignores_proxy_environment(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    client = upstream_client(5.0)
+    try:
+        assert client.trust_env is False
+    finally:
+        client.close()
 
 
 def test_proxy_does_not_merge_headerless_requests_into_one_session():
@@ -317,16 +372,12 @@ def test_proxy_does_not_merge_headerless_requests_into_one_session():
         run_id="run-3",
     )
 
-    assert first["session_id"] != second["session_id"]
-    assert explicit["session_id"] == "session-explicit"
+    assert first.session_id != second.session_id
+    assert explicit.session_id == "session-explicit"
 
 
 def test_proxy_does_not_forward_internal_identity_headers():
-    class _Handler:
-        def _build_fwd_headers(self, headers):
-            return ProxyHandler._build_fwd_headers(self, headers)
-
-    forwarded = _Handler()._build_fwd_headers(
+    forwarded = default_outbound_headers(
         {
             "Host": "localhost",
             "Authorization": "Bearer upstream-token",
@@ -426,7 +477,7 @@ def test_turn_number_in_context():
         run_id=uuid.uuid4().hex,
     )
 
-    assert ctx["turn_number"] == 2, f"Expected turn_number=2, got {ctx['turn_number']}"
+    assert ctx.turn_number == 2
     for e in req_events:
         assert e["context"]["turn_number"] == 2
 
@@ -483,13 +534,7 @@ def test_call_id_on_tool_events():
         run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/chat/completions",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body=resp_body,
-        duration_ms=100,
-        exchange_ctx=ctx,
+        ctx, status=200, body=resp_body, duration_ms=100
     )
 
     tool_results = [e for e in req_events if e["event_type"] == "tool_result"]
@@ -598,11 +643,9 @@ def test_provider_hosted_action_records_upstream_execution_truth():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1/responses",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "object": "response",
             "output": [
                 {
@@ -614,7 +657,6 @@ def test_provider_hosted_action_records_upstream_execution_truth():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -634,11 +676,9 @@ def test_provider_hosted_result_is_redacted_and_bounded():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1/messages",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "content": [
                 {
                     "type": "server_tool_use",
@@ -654,7 +694,6 @@ def test_provider_hosted_result_is_redacted_and_bounded():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -677,11 +716,9 @@ def test_protocols_without_call_ids_remain_valid():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1beta/models/gemini-test:generateContent",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "candidates": [
                 {
                     "content": {
@@ -698,7 +735,6 @@ def test_protocols_without_call_ids_remain_valid():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -711,90 +747,56 @@ def test_protocols_without_call_ids_remain_valid():
 # ---------------------------------------------------------------------------
 
 
-def test_reverse_proxy_routing():
-    """_parse_target routes relative paths to correct upstreams."""
+@pytest.fixture
+def default_upstreams(monkeypatch):
+    """Route to each provider's public API, whatever the shell exports."""
+    for provider in ("ANTHROPIC", "OPENAI", "GEMINI"):
+        monkeypatch.delenv(f"PANOPTES_UPSTREAM_{provider}", raising=False)
 
-    class MockHandler:
-        """Minimal mock that satisfies _parse_target's attribute accesses."""
 
-        def _parse_target(self):
-            return ProxyHandler._parse_target(self)
+def test_reverse_proxy_routing(default_upstreams):
+    """Origin-form paths route to the provider that owns them."""
+    target, name = route("/v1/messages", {})
+    assert (target.scheme, target.host, target.port) == (
+        "https",
+        "api.anthropic.com",
+        443,
+    )
+    assert name == "anthropic"
 
-    h = MockHandler()
+    target, _ = route("/v1/messages?beta=true", {})
+    assert target.host == "api.anthropic.com"
 
-    # Anthropic
-    h.path = "/v1/messages"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.anthropic.com", f"Got {host}"
-    assert scheme == "https"
-    assert port == 443
-    assert path == "/v1/messages"
-
-    # Anthropic with query string
-    h.path = "/v1/messages?beta=true"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.anthropic.com"
-    assert "?" in path
-
-    # OpenAI chat completions
-    h.path = "/v1/chat/completions"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.openai.com", f"Got {host}"
-
-    # OpenAI models
-    h.path = "/v1/models"
-    scheme, host, port, path = h._parse_target()
-    assert host == "api.openai.com"
-
-    # Gemini generateContent
-    h.path = "/v1beta/models/gemini-pro:generateContent"
-    scheme, host, port, path = h._parse_target()
-    assert "googleapis" in host, f"Got {host}"
-
-    # Gemini streamGenerateContent
-    h.path = "/v1beta/models/gemini-pro:streamGenerateContent"
-    scheme, host, port, path = h._parse_target()
-    assert "googleapis" in host
+    assert route("/v1/chat/completions", {})[0].host == "api.openai.com"
+    assert route("/v1/models", {})[0].host == "api.openai.com"
+    for path in (
+        "/v1beta/models/gemini-pro:generateContent",
+        "/v1beta/models/gemini-pro:streamGenerateContent",
+    ):
+        assert "googleapis" in route(path, {})[0].host
 
     # Absolute-form targets are never accepted by the reverse proxy.
-    h.path = "http://api.openai.com/v1/chat/completions"
     with pytest.raises(ValueError, match="Absolute-form"):
-        h._parse_target()
+        route("http://api.openai.com/v1/chat/completions", {})
 
 
 def test_reverse_proxy_no_upstream_raises():
     """Unmatched provider paths are rejected."""
-    from panoptes.proxy import NoUpstreamError
-
-    class MockHandler:
-        def _parse_target(self):
-            return ProxyHandler._parse_target(self)
-
-    h = MockHandler()
-    h.path = "/unknown/endpoint"
     with pytest.raises(NoUpstreamError):
-        h._parse_target()
+        route("/unknown/endpoint", {})
 
 
-def test_proxy_errors_and_request_logs_do_not_expose_query_secrets(caplog):
-    from panoptes.proxy import NoUpstreamError
-
-    class MockHandler:
-        path = "/unknown/endpoint?key=gemini-secret"
-        requestline = "POST /unknown/endpoint?key=gemini-secret HTTP/1.1"
-        command = "POST"
-        request_version = "HTTP/1.1"
-
-        def _parse_target(self):
-            return ProxyHandler._parse_target(self)
-
-    h = MockHandler()
-    with pytest.raises(NoUpstreamError) as exc_info:
-        h._parse_target()
-    assert "gemini-secret" not in str(exc_info.value)
-
+def test_proxy_errors_and_request_logs_do_not_expose_query_secrets(proxy, caplog):
     caplog.set_level("INFO", logger="panoptes")
-    ProxyHandler.log_message(h, '"%s" %s %s', h.requestline, "502", "-")
+    running = proxy()
+
+    response = httpx.post(
+        f"{running.url}/unknown/endpoint?key=gemini-secret", json={}, timeout=10
+    )
+    running.server.stop()  # every log line is written
+
+    assert response.status_code == 502
+    assert "gemini-secret" not in response.text
     assert "gemini-secret" not in caplog.text
     assert "/unknown/endpoint" in caplog.text
 
@@ -1192,150 +1194,80 @@ def test_openai_responses_rejects_incomplete_function_call_stream():
         OpenAIProvider().reassemble_sse(raw)
 
 
-@pytest.mark.parametrize(
-    ("path", "request_body", "response_headers", "response_body"),
-    [
-        (
-            "/v1/chat/completions",
-            {"model": "gpt-test", "messages": [], "stream": True},
-            {"content-type": "text/event-stream"},
-            b'data: {"choices": []}\n\ndata: {not-json}\n\n',
-        ),
-    ],
-)
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
 def test_an_uninspectable_response_is_delivered_and_recorded_as_incomplete(
-    path, request_body, response_headers, response_body
+    proxy, upstream, stream
 ):
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)
-    req_events, exchange_ctx = writer.build_request_events(
-        path=path,
-        method="POST",
-        req_headers={},
-        req_body=request_body,
-        run_id="inspection-run",
-    )
+    malformed = b'data: {"choices": []}\n\ndata: {not-json}\n\n'
+    upstream.mode = "raw"
+    upstream.raw = (200, [("Content-Type", "text/event-stream")], malformed)
+    running = proxy()
 
-    class _Handler:
-        def __init__(self):
-            self.writer = writer
-            self.wfile = io.BytesIO()
-            self.status = None
-            self.headers = []
-
-        def _forward_request(self, *args, **kwargs):
-            return 200, response_headers, response_body
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            self.headers.append((key, value))
-
-        def end_headers(self):
-            pass
-
-    handler = _Handler()
-    ProxyHandler._handle_buffered(
-        handler,
-        method="POST",
-        scheme="https",
-        host="api.openai.com",
-        port=443,
-        path=path,
-        req_headers={},
-        body=json.dumps(request_body).encode(),
-        req_body=request_body,
-        req_events=req_events,
-        exchange_ctx=exchange_ctx,
-        t0=time.monotonic(),
+    response = httpx.post(
+        f"{running.url}/v1/chat/completions",
+        json={"model": "gpt-test", "messages": [], "stream": stream},
+        timeout=10,
     )
 
     # Panoptes records what it could not read; it does not withhold the reply.
-    assert handler.status == 200
-    assert handler.wfile.getvalue() == response_body
-    response_event = next(
-        event for event in db.events if event["event_type"] == "model_response"
+    assert response.status_code == 200
+    assert response.content == malformed
+    [recorded] = running.recorded("model_response")
+    assert recorded["outcome"]["status"] == "error"
+    assert recorded["context"]["capture"]["inspection_status"] == "incomplete"
+
+
+class _Sink:
+    """A client connection that keeps what a stream relayed to it."""
+
+    def __init__(self) -> None:
+        self.status: int | None = None
+        self.headers: dict[str, str] = {}
+        self.body = bytearray()
+
+    def start_stream(self, status, headers):
+        self.status, self.headers = status, dict(headers)
+
+    def write_stream(self, chunk):
+        self.body.extend(chunk)
+
+    def flush_stream(self):
+        pass
+
+
+_TARGET = UpstreamTarget("https", "api.openai.com", 443)
+_OUTBOUND = Outbound({}, "/v1/responses")
+
+
+def _forwarder(make_response, *, buffered=1024, audit=1024) -> Forwarder:
+    """A Forwarder whose upstream answers every request with make_response()."""
+    transport = httpx.MockTransport(lambda request: make_response())
+    return Forwarder(
+        httpx.Client(transport=transport),
+        max_buffered_response_bytes=buffered,
+        max_audit_stream_bytes=audit,
     )
-    assert response_event["outcome"]["status"] == "error"
-    assert response_event["context"]["capture"]["inspection_status"] == "incomplete"
 
 
 def test_buffered_and_stream_audit_bodies_are_bounded():
-    class _Response:
-        status_code = 200
-        headers = {}
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def iter_bytes(self):
-            yield b"abc"
-            yield b"def"
-
-    class _Client:
-        def stream(self, *args, **kwargs):
-            return _Response()
-
-    class _BufferedHandler:
-        http_client = _Client()
-        max_buffered_response_bytes = 5
-
-        def _get_client(self):
-            return self.http_client, False
-
-        def _build_fwd_headers(self, headers):
-            return ProxyHandler._build_fwd_headers(self, headers)
+    def chunked():
+        return httpx.Response(200, content=iter([b"abc", b"def"]))
 
     with pytest.raises(UpstreamBodyTooLarge):
-        ProxyHandler._forward_request(
-            _BufferedHandler(),
-            "POST",
-            "https",
-            "api.openai.com",
-            443,
-            "/v1/responses",
-            {},
-            b"{}",
+        _forwarder(chunked, buffered=5).buffered(
+            "POST", _TARGET, _OUTBOUND, b"{}", ForwardReport()
         )
 
-    class _StreamingHandler(_BufferedHandler):
-        max_audit_stream_bytes = 4
-
-        def __init__(self):
-            self.wfile = io.BytesIO()
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            pass
-
-        def end_headers(self):
-            pass
-
-    streaming = _StreamingHandler()
-    status, _, audit_bytes, truncated = ProxyHandler._forward_streaming(
-        streaming,
-        "POST",
-        "https",
-        "api.openai.com",
-        443,
-        "/v1/responses",
-        {},
-        b"{}",
+    sink = _Sink()
+    reply = _forwarder(chunked, audit=4).stream(
+        "POST", _TARGET, _OUTBOUND, b"{}", ForwardReport(), sink, drain_seconds=0
     )
-    assert status == 200
-    assert audit_bytes == b"abcd"
-    assert truncated is True
-    assert streaming.wfile.getvalue() == b"abcdef"
+    assert (reply.status, reply.body, reply.truncated) == (200, b"abcd", True)
+    assert bytes(sink.body) == b"abcdef"  # the client still gets every byte
 
 
-def test_decoded_response_headers_and_connection_nominated_headers_are_removed():
-    filtered = _filter_headers(
+def test_connection_nominated_headers_are_removed():
+    filtered = filter_hop_by_hop(
         {
             "Connection": "X-Internal, Keep-Alive",
             "X-Internal": "must-not-cross",
@@ -1343,92 +1275,32 @@ def test_decoded_response_headers_and_connection_nominated_headers_are_removed()
             "Content-Type": "application/json",
         }
     )
-    assert "Connection" not in filtered
-    assert "X-Internal" not in filtered
-    assert "Keep-Alive" not in filtered
-    assert filtered["Content-Type"] == "application/json"
+    assert filtered == {"Content-Type": "application/json"}
 
-    class _Response:
-        status_code = 200
-        headers = {
-            "content-type": "application/json",
-            "content-encoding": "gzip",
-            "content-length": "2",
-        }
 
-        def __enter__(self):
-            return self
+def test_relayed_headers_describe_the_decoded_body():
+    def gzipped():
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json", "content-encoding": "gzip"},
+            content=gzip.compress(b"{}"),
+        )
 
-        def __exit__(self, *args):
-            return False
+    def framing(headers):
+        return {key.lower() for key in headers} & {"content-encoding", "content-length"}
 
-        def iter_bytes(self):
-            # httpx exposes decoded bytes here even when upstream headers still
-            # describe the encoded representation.
-            yield b"{}"
-
-    class _Client:
-        def stream(self, *args, **kwargs):
-            return _Response()
-
-    class _Handler:
-        http_client = _Client()
-        max_buffered_response_bytes = 100
-
-        def _get_client(self):
-            return self.http_client, False
-
-        def _build_fwd_headers(self, headers):
-            return ProxyHandler._build_fwd_headers(self, headers)
-
-    _, headers, body = ProxyHandler._forward_request(
-        _Handler(),
-        "POST",
-        "https",
-        "api.openai.com",
-        443,
-        "/v1/responses",
-        {},
-        b"{}",
+    reply = _forwarder(gzipped).buffered(
+        "POST", _TARGET, _OUTBOUND, b"{}", ForwardReport()
     )
-    assert body == b"{}"
-    assert all(key.lower() != "content-encoding" for key in headers)
+    assert reply.body == b"{}"
+    assert framing(reply.headers) == set()
 
-    class _StreamingHandler(_Handler):
-        max_audit_stream_bytes = 100
-
-        def __init__(self):
-            self.wfile = io.BytesIO()
-            self.sent_headers = []
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            self.sent_headers.append((key, value))
-
-        def end_headers(self):
-            pass
-
-    streaming = _StreamingHandler()
-    _, returned_headers, _, _ = ProxyHandler._forward_streaming(
-        streaming,
-        "POST",
-        "https",
-        "api.openai.com",
-        443,
-        "/v1/responses",
-        {},
-        b"{}",
+    sink = _Sink()
+    reply = _forwarder(gzipped).stream(
+        "POST", _TARGET, _OUTBOUND, b"{}", ForwardReport(), sink, drain_seconds=0
     )
-    assert all(
-        key.lower() not in {"content-encoding", "content-length"}
-        for key, _ in streaming.sent_headers
-    )
-    assert all(
-        key.lower() not in {"content-encoding", "content-length"}
-        for key in returned_headers
-    )
+    assert bytes(sink.body) == b"{}"
+    assert framing(sink.headers) == framing(reply.headers) == set()
 
 
 def test_proxy_validates_normalized_identity_before_forwarding():
@@ -1442,159 +1314,45 @@ def test_proxy_validates_normalized_identity_before_forwarding():
         )
 
 
-def test_proxy_rejects_duplicate_request_object_keys_before_forwarding():
-    class _Handler:
-        headers = {}
-        writer = AuditEventWriter(_AuditDBStub())
+def test_proxy_rejects_duplicate_request_object_keys_before_forwarding(proxy, upstream):
+    running = proxy()
 
-        def __init__(self):
-            self.forwarded = False
-            self.error = None
-
-        def _parse_target(self):
-            return "https", "api.openai.com", 443, "/v1/responses"
-
-        def _read_body(self):
-            return b'{"model":"gpt-safe","model":"gpt-confused","input":"hello"}'
-
-        def _send_json_error(self, status, message, extra=None):
-            self.error = (status, message, extra)
-
-        def _handle_buffered(self, **kwargs):
-            self.forwarded = True
-
-    handler = _Handler()
-    ProxyHandler._handle_request(handler, "POST")
-
-    assert handler.forwarded is False
-    assert handler.error[0] == 400
-    assert "unambiguous" in handler.error[1]
-
-
-def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery():
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)
-    req_body = {"model": "gpt-test", "input": "hello"}
-    req_events, exchange_ctx = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body=req_body,
+    response = httpx.post(
+        f"{running.url}/v1/responses",
+        content=b'{"model":"gpt-safe","model":"gpt-confused","input":"hello"}',
+        headers={"Content-Type": "application/json"},
+        timeout=10,
     )
-    exchange_ctx["_request_events_persisted"] = True
+
+    assert response.status_code == 400
+    assert "unambiguous" in response.json()["error"]
+    assert upstream.requests == []
+
+
+def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery(
+    proxy, upstream
+):
     ambiguous = (
         b'{"object":"response","output":[],'
         b'"output":[{"type":"function_call","name":"hidden",'
         b'"arguments":"{}"}]}'
     )
+    upstream.mode = "raw"
+    upstream.raw = (200, [("Content-Type", "application/json")], ambiguous)
+    running = proxy()
 
-    class _Handler:
-        def __init__(self):
-            self.writer = writer
-            self.wfile = io.BytesIO()
-            self.status = None
-            self.headers = []
-
-        def _forward_request(self, *args, **kwargs):
-            return 200, {"content-type": "application/json"}, ambiguous
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            self.headers.append((key, value))
-
-        def end_headers(self):
-            pass
-
-    handler = _Handler()
-    ProxyHandler._handle_buffered(
-        handler,
-        method="POST",
-        scheme="https",
-        host="api.openai.com",
-        port=443,
-        path="/v1/responses",
-        req_headers={},
-        body=json.dumps(req_body).encode(),
-        req_body=req_body,
-        req_events=req_events,
-        exchange_ctx=exchange_ctx,
-        t0=time.monotonic(),
+    response = httpx.post(
+        f"{running.url}/v1/responses",
+        json={"model": "gpt-test", "input": "hello"},
+        timeout=10,
     )
 
-    assert handler.status == 502
-    assert handler.wfile.getvalue() != ambiguous
-    response_event = next(
-        event for event in db.events if event["event_type"] == "model_response"
-    )
-    assert response_event["outcome"]["status"] == "blocked"
-    assert response_event["context"]["capture"]["response_delivered"] is False
-
-
-def test_response_event_construction_failure_gets_explicit_fallback(monkeypatch):
-    db = _AuditDBStub()
-    writer = AuditEventWriter(db)
-    req_body = {"model": "gpt-test", "input": "hello"}
-    req_events, exchange_ctx = writer.build_request_events(
-        path="/v1/responses",
-        method="POST",
-        req_headers={},
-        req_body=req_body,
-    )
-    exchange_ctx["_request_events_persisted"] = True
-
-    def _fail_extraction(self, resp_body, *, path=None):
-        raise RuntimeError("provider extraction exploded")
-
-    monkeypatch.setattr(
-        OpenAIProvider,
-        "extract_tool_calls",
-        _fail_extraction,
-    )
-    upstream = b'{"object":"response","output":[]}'
-
-    class _Handler:
-        def __init__(self):
-            self.writer = writer
-            self.wfile = io.BytesIO()
-            self.status = None
-
-        def _forward_request(self, *args, **kwargs):
-            return 200, {"content-type": "application/json"}, upstream
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            pass
-
-        def end_headers(self):
-            pass
-
-    handler = _Handler()
-    ProxyHandler._handle_buffered(
-        handler,
-        method="POST",
-        scheme="https",
-        host="api.openai.com",
-        port=443,
-        path="/v1/responses",
-        req_headers={},
-        body=json.dumps(req_body).encode(),
-        req_body=req_body,
-        req_events=req_events,
-        exchange_ctx=exchange_ctx,
-        t0=time.monotonic(),
-    )
-
-    assert handler.status == 200
-    response_event = next(
-        event for event in db.events if event["event_type"] == "model_response"
-    )
-    assert response_event["outcome"]["status"] == "error"
-    assert response_event["context"]["capture"]["inspection_status"] == "incomplete"
-    assert handler.wfile.getvalue() == upstream
+    assert response.status_code == 502
+    assert response.headers["x-panoptes-inspection-blocked"] == "true"
+    assert response.content != ambiguous
+    [recorded] = running.recorded("model_response")
+    assert recorded["outcome"]["status"] == "blocked"
+    assert recorded["context"]["capture"]["response_delivered"] is False
 
 
 def test_audit_writer_raises_when_batch_and_fallback_cannot_persist_all_events():
@@ -1642,13 +1400,7 @@ def test_request_and_response_events_are_written_together():
         run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/messages",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body=resp_body,
-        duration_ms=200,
-        exchange_ctx=ctx,
+        ctx, status=200, body=resp_body, duration_ms=200
     )
     writer.write(req_events + resp_events)
 
@@ -1672,9 +1424,7 @@ def test_upstream_client_never_stores_cookies():
     """One client serves every session, so it must not replay Set-Cookie."""
     import httpx
 
-    from panoptes.proxy import _upstream_client
-
-    client = _upstream_client(5.0)
+    client = upstream_client(5.0)
     try:
         request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
         response = httpx.Response(
@@ -1687,27 +1437,23 @@ def test_upstream_client_never_stores_cookies():
 
 
 def test_forwarded_accept_encoding_is_replaced_case_insensitively():
-    fwd = ProxyHandler._build_fwd_headers(
-        None, {"accept-encoding": "gzip, br", "content-type": "application/json"}
+    fwd = default_outbound_headers(
+        {"accept-encoding": "gzip, br", "content-type": "application/json"}
     )
     assert [k for k in fwd if k.lower() == "accept-encoding"] == ["Accept-Encoding"]
     assert fwd["Accept-Encoding"] == "identity"
 
 
 def test_undecodable_upstream_content_encoding_is_refused():
-    from panoptes.proxy import ResponseInspectionError, _check_content_encoding
-
-    _check_content_encoding({"Content-Encoding": "gzip"})
-    _check_content_encoding({})
+    check_content_encoding(httpx.Headers({"Content-Encoding": "gzip"}))
+    check_content_encoding(httpx.Headers())
     for coding in ("br", "zstd", "gzip, br"):
         with pytest.raises(ResponseInspectionError):
-            _check_content_encoding({"Content-Encoding": coding})
+            check_content_encoding(httpx.Headers({"Content-Encoding": coding}))
 
 
 def test_repeated_request_headers_are_combined():
-    from panoptes.proxy import _merged_headers
-
-    merged = _merged_headers(
+    merged = merge_headers(
         [
             ("anthropic-beta", "beta-one"),
             ("Anthropic-Beta", "beta-two"),
@@ -1847,3 +1593,78 @@ def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
         assert server.start() > 0
     finally:
         server.stop()
+
+
+# ---------------------------------------------------------------------------
+# The exchange pipeline, against a real proxy and a fake upstream
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("hooked", [False, True], ids=["observed", "hooked"])
+def test_a_request_whose_events_cannot_be_built_is_refused(
+    proxy, upstream, monkeypatch, hooked
+):
+    def broken_fingerprint(self, body):
+        raise RuntimeError("fingerprint bug")
+
+    monkeypatch.setattr(AnthropicProvider, "request_fingerprint", broken_fingerprint)
+    hooks = _CountingHooks() if hooked else None
+    running = proxy(hooks)
+
+    response = httpx.post(f"{running.url}/v1/messages", json=ANTHROPIC_BODY, timeout=10)
+
+    # Forwarding it would leave the exchange unrecorded.
+    assert response.status_code == 500
+    assert response.json() == {"error": "The request could not be recorded"}
+    assert upstream.requests == []
+    if hooks is not None:
+        assert hooks.before == hooks.after == []
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
+def test_an_unreachable_upstream_is_recorded_the_same_way_in_both_paths(
+    proxy, monkeypatch, stream
+):
+    monkeypatch.setenv(
+        "PANOPTES_UPSTREAM_ANTHROPIC", f"http://127.0.0.1:{_unused_port()}"
+    )
+    running = proxy()
+
+    response = httpx.post(
+        f"{running.url}/v1/messages",
+        json=dict(ANTHROPIC_BODY, stream=stream),
+        timeout=10,
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"error": "Bad Gateway"}
+    [recorded] = running.recorded("model_response")
+    assert recorded["action"]["status_code"] == 502
+    assert recorded["outcome"]["status"] == "error"
+    assert recorded["outcome"]["summary"] == "Server error HTTP 502"
+    # The gateway error is what happened, not an inspection limit.
+    assert "inspection_status" not in recorded["context"]["capture"]
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streamed"])
+def test_response_events_that_fail_to_build_leave_an_incomplete_record(
+    proxy, upstream, monkeypatch, stream
+):
+    def broken_extraction(self, resp_body, *, path=None):
+        raise RuntimeError("provider extraction exploded")
+
+    monkeypatch.setattr(AnthropicProvider, "extract_tool_calls", broken_extraction)
+    upstream.mode = "stream" if stream else "json"
+    running = proxy()
+
+    response = httpx.post(
+        f"{running.url}/v1/messages",
+        json=dict(ANTHROPIC_BODY, stream=stream),
+        timeout=10,
+    )
+
+    assert response.status_code == 200  # delivered: Panoptes only observes
+    [recorded] = running.recorded("model_response")
+    assert recorded["outcome"]["status"] == "error"
+    assert "Response event construction failed" in recorded["outcome"]["summary"]
+    assert recorded["context"]["capture"]["inspection_status"] == "incomplete"

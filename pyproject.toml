@@ -76,6 +76,10 @@ extend-exclude = ["*.md"]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]  # the formatter owns line length
 
+[tool.ruff.lint.isort]
+# Test helpers in tests/ are imported as top-level modules.
+known-local-folder = ["fake_upstream"]
+
 [tool.mypy]
 python_version = "3.10"
 files = ["panoptes"]

@@ -120,13 +120,7 @@ def test_openai_buffered_dialect_is_bound_to_requested_endpoint():
     )
     with pytest.raises(SSEParseError, match="cross-dialect|mixes"):
         writer.build_response_events(
-            path="/v1/chat/completions",
-            req_body=request,
-            resp_status=200,
-            resp_headers={"content-type": "application/json"},
-            resp_body=disguised_chat,
-            duration_ms=5,
-            exchange_ctx=exchange,
+            exchange, status=200, body=disguised_chat, duration_ms=5
         )
 
 
@@ -544,13 +538,7 @@ def test_gemini_tools_cross_the_universal_schema_without_fake_empty_ids():
         ],
     }
     response_events = writer.build_response_events(
-        path="/v1beta/models/gemini-test:generateContent",
-        req_body=request,
-        resp_status=200,
-        resp_headers={"content-type": "application/json"},
-        resp_body=response,
-        duration_ms=5,
-        exchange_ctx=exchange,
+        exchange, status=200, body=response, duration_ms=5
     )
     tool_call = next(
         event for event in response_events if event["event_type"] == "tool_call"

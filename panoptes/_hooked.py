@@ -1,9 +1,10 @@
-"""Hook machinery for the reverse proxy (see docs/hooks.md).
+"""The hook lifecycle of a proxied exchange (see docs/hooks.md).
 
-The proxy forwards and records; everything that exists only because a hook may
-decide lives here: the per-exchange run state, what the forwarding code
-observed, and the handler methods that enter an exchange, run
-``before_forward``, and settle it for ``after_exchange``. Private to the proxy.
+``HookedLifecycle`` is the ``Lifecycle`` a server uses when it has
+``ProxyHooks``. It builds the ``Exchange`` a hook sees, runs ``before_forward``
+and acts on its answer, and settles the exchange for ``after_exchange``
+exactly once. Everything that exists only because a hook may decide lives
+here. Private to the proxy.
 """
 
 from __future__ import annotations
@@ -11,17 +12,17 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
-import socket
-import threading
 import time
+from collections.abc import Mapping
 from enum import Enum, auto
-from http.server import BaseHTTPRequestHandler
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import httpx
-
-from panoptes._events import AuditEventWriter, AuditWriteError, provider_reported_usage
+from panoptes._events import AuditWriteError, provider_reported_usage
+from panoptes._exchange import send_json
+from panoptes._forward import Outbound, default_outbound_headers
+from panoptes._request import strip_query_credentials
 from panoptes.hooks import (
+    QUERY_CREDENTIAL_PARAMS,
     STATIC_HOP_BY_HOP,
     Exchange,
     Identity,
@@ -31,14 +32,13 @@ from panoptes.hooks import (
     reject_response,
 )
 
-# The mixin only works on top of a request handler. Type checkers see that
-# base; at runtime ProxyHandler supplies it, so the MRO stays unchanged.
 if TYPE_CHECKING:
-    _HandlerBase = BaseHTTPRequestHandler
-else:
-    _HandlerBase = object
+    from panoptes._exchange import ProxyExchange
 
 log = logging.getLogger("panoptes")
+
+# Outcomes in which the request never left Panoptes.
+_NOT_SENT = ("rejected", "hook_error", "not_forwarded")
 
 
 def _mark_preflight_blocked(events: list[dict]) -> None:
@@ -55,79 +55,29 @@ def _mark_preflight_blocked(events: list[dict]) -> None:
         capture["delivery_status"] = "blocked_before_upstream"
 
 
-def _upstream_url(scheme: str, host: str, port: int, path: str) -> str:
-    """Build an upstream URL, preserving IPv6 literal authority syntax."""
-    authority_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
-    return f"{scheme}://{authority_host}:{port}{path}"
+def _mark_hook_blocked(events: list[dict], hook: dict) -> None:
+    _mark_preflight_blocked(events)
+    for event in events:
+        event.setdefault("attributes", {})["hook"] = dict(hook)
 
 
-def _may_have_reached_upstream(exc: BaseException) -> bool:
-    """False only for failures that happen before any request byte is written."""
-    return not isinstance(
-        exc,
-        (
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
-            httpx.PoolTimeout,
-            httpx.UnsupportedProtocol,
-            httpx.LocalProtocolError,
-            httpx.InvalidURL,
-        ),
-    )
-
-
-def _start_drain_timer(
-    resp: Any, seconds: float
-) -> tuple[threading.Timer, threading.Event]:
-    """Cut the upstream read after *seconds*, however silent the upstream is.
-
-    A deadline checked only when a chunk arrives is no bound at all: a stalled
-    upstream would hold the request slot until the read timeout.
-    """
-    expired = threading.Event()
-    network_stream = resp.extensions.get("network_stream")
-    get_extra = getattr(network_stream, "get_extra_info", None)
-    sock = get_extra("socket") if callable(get_extra) else None
-
-    def expire() -> None:
-        expired.set()
-        try:
-            if sock is not None:
-                sock.shutdown(socket.SHUT_RDWR)
-            else:
-                resp.close()
-        except Exception:
-            pass
-
-    timer = threading.Timer(seconds, expire)
-    timer.daemon = True
-    timer.start()
-    return timer, expired
-
-
-def _answer_if_client_present(handler: Any, status: int, message: str) -> None:
-    """Send an error reply; a client that has left must not change the outcome."""
-    try:
-        handler._send_json_error(status, message)
-    except OSError:
-        log.warning("Client disconnected before the %s reply was written", status)
-
-
-def _report_of(handler: Any) -> _ForwardReport:
-    run = getattr(handler, "_run", None)
-    return run.report if run is not None else _ForwardReport()
-
-
-@dataclasses.dataclass
-class _ForwardReport:
-    """What the forwarding code observed, for ``Exchange`` to report."""
-
-    request_sent: bool = False
-    answered: bool = False  # the upstream sent a response head
-    upstream_status: int | None = None  # the status the upstream itself sent
-    upstream_error: bool = False  # no usable upstream response
-    body_bytes: int = 0
-    client_gone: bool = False
+def final_outbound_headers(
+    hook_headers: OutboundHeaders, client_headers: Mapping[str, str]
+) -> dict[str, str]:
+    """The hook's headers plus the invariants Panoptes always re-applies."""
+    client = {k.lower(): (k, v) for k, v in client_headers.items()}
+    headers = {
+        name: value
+        for name, value in hook_headers.as_dict().items()
+        if name.lower() not in STATIC_HOP_BY_HOP
+        and name.lower()
+        not in ("host", "content-length", "content-type", "accept-encoding")
+    }
+    if "content-type" in client:
+        name, value = client["content-type"]
+        headers[name] = value
+    headers["Accept-Encoding"] = "identity"
+    return headers
 
 
 class _HookPhase(Enum):
@@ -137,28 +87,15 @@ class _HookPhase(Enum):
 
 
 @dataclasses.dataclass
-class _ExchangeRun:
-    """Proxy-side state of one exchange that entered ``before_forward``."""
+class _HookRun:
+    """What the hooks of one exchange have seen and are owed."""
 
     exchange: Exchange
-    hooks: ProxyHooks
-    writer: AuditEventWriter
-    t0: float
-    client_headers: dict
-    req_body: dict | None  # the original, never the copy a hook can edit
-    seeded_events: list
+    seeded_events: list[dict]  # the request events before any hook acted
     seeded_identity: Identity
-    events: list
-    ctx: dict
-    report: _ForwardReport = dataclasses.field(default_factory=_ForwardReport)
-    fwd_headers: dict | None = None
-    forward_path: str | None = None
-    raw_path: str = ""
     phase: _HookPhase = _HookPhase.PREPARED
-    outcome: str | None = None
-    status: int | None = None
     complete: bool = False
-    response_events: list = dataclasses.field(default_factory=list)
+    response_events: list[dict] = dataclasses.field(default_factory=list)
     usage: dict = dataclasses.field(default_factory=dict)
     cost_micros: int | None = None
 
@@ -174,240 +111,99 @@ class _ExchangeRun:
         return True
 
 
-class HookedExchangeMixin(_HandlerBase):
-    """The hook-handling half of ``ProxyHandler``.
+class HookedLifecycle:
+    """Runs a consumer's ``ProxyHooks`` around one exchange.
 
-    The attributes and methods declared below are provided by ``ProxyHandler``.
+    Fails closed: a hook that raises or returns something unusable means the
+    request is not forwarded, and so does a request intent that cannot be
+    stored.
     """
 
-    hook_slow_seconds: float
-    _run: _ExchangeRun | None
-    _upstream_name: str
+    records_identity_source = True
 
-    if TYPE_CHECKING:
+    def __init__(
+        self, hooks: ProxyHooks, *, slow_seconds: float, drain_seconds: float
+    ) -> None:
+        self._hooks = hooks
+        self._slow_seconds = slow_seconds
+        # Hooks are owed usage even if the client leaves.
+        self.drain_seconds = drain_seconds
+        self._run: _HookRun | None = None
 
-        def _build_fwd_headers(self, headers: dict[str, str]) -> dict[str, str]: ...
+    def split_query_credentials(self, raw_path: str) -> tuple[str, tuple[str, ...]]:
+        # Routing and every record use the stripped path. What is forwarded is
+        # the hook's choice (Exchange.drop_query_credentials()).
+        return strip_query_credentials(raw_path, QUERY_CREDENTIAL_PARAMS, fold=True)
 
-        def _send_json_error(
-            self, status: int, message: str, extra: dict | None = None
-        ) -> None: ...
-
-    # ------------------------------------------------------------------
-    # Hook seam (docs/hooks.md)
-    # ------------------------------------------------------------------
-
-    def _enter_exchange(
-        self,
-        *,
-        method: str,
-        path: str,
-        raw_path: str,
-        target: tuple[str, str, int],
-        req_headers: dict[str, str],
-        body: bytes,
-        req_body: dict | None,
-        req_events: list[dict],
-        exchange_ctx: dict,
-        query_credentials: list[str],
-        t0: float,
-        hooks: ProxyHooks,
-        writer: AuditEventWriter,
-    ) -> _ExchangeRun:
-        seeded = Identity(
-            agent_type=exchange_ctx["agent_type"],
-            session_id=exchange_ctx["session_id"],
-            run_id=exchange_ctx["run_id"],
-        )
-        exchange = Exchange(
-            exchange_id=exchange_ctx["exchange_id"],
-            correlation_id=exchange_ctx["correlation_id"],
-            correlation_source=exchange_ctx["correlation_source"],
-            provider=exchange_ctx["req_format"],
-            upstream_name=self._upstream_name,
-            upstream_url=_upstream_url(*target, ""),
-            method=method,
-            path=path,
-            request_headers=RequestHeaders(list(self.headers.items())),
-            query_credentials=tuple(query_credentials),
-            request_body=body,
-            request_json=copy.deepcopy(req_body),
-            request_events=copy.deepcopy(req_events),
-            identity=seeded,
-            outbound_headers=OutboundHeaders(self._build_fwd_headers(req_headers)),
-        )
-        run = _ExchangeRun(
+    def admit(self, ex: ProxyExchange) -> Outbound | None:
+        exchange = self._new_exchange(ex)
+        run = _HookRun(
             exchange=exchange,
-            hooks=hooks,
-            writer=writer,
-            t0=t0,
-            client_headers=req_headers,
-            req_body=req_body,
-            seeded_events=copy.deepcopy(req_events),
-            seeded_identity=seeded,
-            events=req_events,
-            ctx=exchange_ctx,
-            forward_path=path,
-            raw_path=raw_path,
+            seeded_events=copy.deepcopy(ex.request_events),
+            seeded_identity=exchange.identity,
         )
         self._run = run
-        return run
-
-    def _run_before_forward(self, run: _ExchangeRun) -> bool:
-        """Run ``before_forward`` and act on its answer. True means forward."""
-        exchange = run.exchange
-        writer = run.writer
         run.enter()  # after_exchange is owed from here
-        started = time.monotonic()
-        failure: Exception | None = None
-        reject: tuple[int, bytes, str] | None = None
-        try:
-            result = run.hooks.before_forward(exchange)
-            if result is not None:
-                reject = reject_response(result)
-        except Exception as exc:
-            failure = exc
-            log.exception("before_forward raised")
-        finally:
-            exchange._freeze_identity()
-            self._warn_if_slow("before_forward", started)
+        reject, failure = self._before_forward(exchange)
 
-        events, ctx, outbound = run.events, run.ctx, None
+        outbound: Outbound | None = None
         if failure is None:
             try:
+                events, context = ex.request_events, ex.context
                 if exchange._identity_assigned:
-                    events, ctx = writer.build_request_events(
-                        path=run.ctx["path"],
+                    events, context = ex.config.writer.build_request_events(
+                        path=ex.context.path,
                         method=exchange.method,
-                        req_headers=run.client_headers,
-                        req_body=run.req_body,
+                        req_headers=ex.request.headers,
+                        req_body=ex.request.json,
                         hook_mode=True,
                         hook_identity=exchange.identity,
                         exchange_id=exchange.exchange_id,
                     )
                 if reject is None:
-                    outbound = self._final_outbound_headers(run)
+                    outbound = self._outbound(ex, exchange)
+                ex.request_events, ex.context = events, context
             except Exception as exc:
                 failure = exc
                 log.exception("A hook returned an unusable identity or headers")
+
         if failure is not None:
-            self._hook_failed(run, failure)
-            return False
-
-        run.events, run.ctx = events, ctx
+            self._refuse_after_error(ex, run, failure)
+            return None
         if reject is not None:
-            status, encoded, reason = reject
-            hook = {"action": "reject", "status": status, "reason": reason}
-            self._mark_hook_blocked(events, hook)
-            self._write_best_effort(run, events, "Hook rejection audit was not durable")
-            run.outcome, run.status = "rejected", status
-            self._send_json_bytes(status, encoded)
-            return False
-
-        run.fwd_headers = outbound
-        if not exchange._drop_query_credentials:
-            run.forward_path = run.raw_path
-        # The request intent is durable before it leaves the process.
-        try:
-            writer.write(events)
-            ctx["_request_events_persisted"] = True
-        except AuditWriteError:
-            log.exception("Request-intent audit could not be persisted")
-            run.outcome, run.status = "not_forwarded", 503
-            self._send_json_error(
+            self._refuse(ex, reject)
+            return None
+        if not ex.record_request_intent():
+            ex.outcome, ex.status = "not_forwarded", 503
+            send_json(
+                ex.client,
                 503,
-                "Request denied because its audit record could not be persisted",
-                {"audit_error": True},
+                {
+                    "error": "Request denied because its audit record could not "
+                    "be persisted",
+                    "audit_error": True,
+                },
             )
-            return False
-        return True
+            return None
+        return outbound
 
-    def _final_outbound_headers(self, run: _ExchangeRun) -> dict[str, str]:
-        """The hook's headers plus the invariants Panoptes always re-applies."""
-        client = {k.lower(): (k, v) for k, v in run.client_headers.items()}
-        headers = {
-            name: value
-            for name, value in run.exchange.outbound_headers.as_dict().items()
-            if name.lower() not in STATIC_HOP_BY_HOP
-            and name.lower()
-            not in ("host", "content-length", "content-type", "accept-encoding")
-        }
-        if "content-type" in client:
-            name, value = client["content-type"]
-            headers[name] = value
-        headers["Accept-Encoding"] = "identity"
-        return headers
-
-    def _hook_failed(self, run: _ExchangeRun, exc: BaseException) -> None:
-        """A failing hook never means "forward anyway"."""
-        exchange = run.exchange
-        exchange._settle(identity=run.seeded_identity)
-        events = copy.deepcopy(run.seeded_events)
-        run.events = events
-        self._mark_hook_blocked(
-            events, {"action": "error", "error_type": type(exc).__name__}
-        )
-        self._write_best_effort(run, events, "Hook error audit was not durable")
-        run.outcome, run.status = "hook_error", 502
-        self._send_json_error(502, "The request could not be processed")
-
-    @staticmethod
-    def _mark_hook_blocked(events: list[dict], hook: dict) -> None:
-        _mark_preflight_blocked(events)
-        for event in events:
-            event.setdefault("attributes", {})["hook"] = dict(hook)
-
-    def _write_best_effort(
-        self, run: _ExchangeRun, events: list[dict], message: str
-    ) -> None:
-        try:
-            run.writer.write(events)
-        except AuditWriteError:
-            log.exception(message)
-
-    def _send_json_bytes(self, status: int, encoded: bytes) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
-
-    def _warn_if_slow(self, hook: str, started: float) -> None:
-        elapsed = time.monotonic() - started
-        if elapsed > self.hook_slow_seconds:
-            log.warning(
-                "%s took %.1fs (hook_slow_seconds=%s); a slow hook holds a "
-                "request slot",
-                hook,
-                elapsed,
-                self.hook_slow_seconds,
-            )
-
-    def _set_outcome(self, outcome: str, status: int | None) -> None:
-        run = getattr(self, "_run", None)
-        if run is not None:
-            run.outcome, run.status = outcome, status
-
-    def _note_response(
+    def note_response(
         self,
-        resp_events: list[dict],
-        exchange_ctx: dict,
-        resp_body: dict | None,
+        ex: ProxyExchange,
+        events: list[dict],
+        body: dict | None,
         *,
+        status: int,
         read_in_full: bool,
-        inspection_error: str | None,
+        inspected: bool,
     ) -> None:
-        """Record what the response events say, for ``after_exchange``."""
-        run = getattr(self, "_run", None)
-        if run is None:
-            return
-        report = run.report
+        """Keep what ``after_exchange`` reports about the response."""
+        run = self._entered()
+        report = ex.report
         run.complete = bool(
-            report.answered
-            and not report.upstream_error
-            and read_in_full
-            and inspection_error is None
+            report.answered and not report.upstream_error and read_in_full and inspected
         )
-        run.response_events = copy.deepcopy(resp_events)
+        run.response_events = copy.deepcopy(events)
         # The provider's own word only: nothing for an error reply, a missing
         # response, or a body that carried no usage object.
         ok = (
@@ -415,8 +211,8 @@ class HookedExchangeMixin(_HandlerBase):
             and report.upstream_status < 400
             and not report.upstream_error
         )
-        if ok and provider_reported_usage(resp_body):
-            for event in resp_events:
+        if ok and provider_reported_usage(body):
+            for event in events:
                 if event.get("event_type") == "model_response":
                     run.usage = {
                         key: value
@@ -426,27 +222,22 @@ class HookedExchangeMixin(_HandlerBase):
                     }
                     break
         if report.upstream_status is not None:
-            run.cost_micros = exchange_ctx.get("cost_micros")
+            run.cost_micros = ex.config.writer.estimate_cost_micros(
+                ex.context, status, body
+            )
 
-    def _finish_run(self) -> None:
+    def finish(self, ex: ProxyExchange) -> None:
         """Settle the exchange and call ``after_exchange`` exactly once."""
-        run = getattr(self, "_run", None)
+        run = self._run
         if run is None or not run.claim_finish():
             return
         exchange = run.exchange
-        report = run.report
-        outcome = run.outcome or "aborted"
+        report = ex.report
+        outcome = ex.outcome or "aborted"
         usage = run.usage
-        sent = report.request_sent and outcome not in (
-            "rejected",
-            "hook_error",
-            "not_forwarded",
-        )
-        status = run.status
         # What the provider did, not what the client was told: Panoptes may
         # answer 502 to a 200 the provider billed.
         upstream_status = report.upstream_status
-        provider_error = upstream_status is not None and upstream_status >= 400
         produced = (
             upstream_status is not None
             and upstream_status < 400
@@ -454,25 +245,122 @@ class HookedExchangeMixin(_HandlerBase):
         ) or (isinstance(usage.get("tokens_out"), int) and usage["tokens_out"] > 0)
         exchange._settle(
             outcome=outcome,
-            request_sent=sent,
+            request_sent=report.request_sent and outcome not in _NOT_SENT,
             produced_output=bool(produced),
-            status=status,
+            status=ex.status,
             upstream_status=upstream_status,
             complete=bool(run.complete and outcome == "forwarded"),
             response_events=run.response_events,
             usage=usage,
             estimated_usd_micros=run.cost_micros,
-            provider_error=bool(provider_error),
-            duration_ms=int((time.monotonic() - run.t0) * 1000),
+            provider_error=upstream_status is not None and upstream_status >= 400,
+            duration_ms=ex.elapsed_ms(),
         )
         started = time.monotonic()
         try:
-            run.hooks.after_exchange(exchange)
+            self._hooks.after_exchange(exchange)
         except Exception as exc:
             log.exception("after_exchange raised")
+            writer = ex.config.writer
             try:
-                run.writer.write([run.writer.build_hook_error_event(run.ctx, exc)])
+                writer.write([writer.build_hook_error_event(ex.context, exc)])
             except Exception:
                 log.exception("Could not record the after_exchange failure")
         finally:
             self._warn_if_slow("after_exchange", started)
+
+    # ------------------------------------------------------------------
+
+    def _before_forward(
+        self, exchange: Exchange
+    ) -> tuple[tuple[int, bytes, str] | None, Exception | None]:
+        """Ask the hook. Returns its rejection, if any, or what it raised."""
+        started = time.monotonic()
+        try:
+            result = self._hooks.before_forward(exchange)
+            return (reject_response(result) if result is not None else None), None
+        except Exception as exc:
+            log.exception("before_forward raised")
+            return None, exc
+        finally:
+            exchange._freeze_identity()
+            self._warn_if_slow("before_forward", started)
+
+    def _new_exchange(self, ex: ProxyExchange) -> Exchange:
+        """The ``Exchange`` a hook sees, seeded with what Panoptes derived."""
+        context, request = ex.context, ex.request
+        return Exchange(
+            exchange_id=context.exchange_id,
+            correlation_id=context.correlation_id,
+            correlation_source=context.correlation_source,
+            provider=context.provider,
+            upstream_name=request.upstream_name,
+            upstream_url=request.target.url(""),
+            method=request.method,
+            path=request.path,
+            request_headers=RequestHeaders(list(request.header_items)),
+            query_credentials=request.query_credentials,
+            request_body=request.body,
+            request_json=copy.deepcopy(request.json),
+            request_events=copy.deepcopy(ex.request_events),
+            identity=Identity(
+                agent_type=context.agent_type,
+                session_id=context.session_id,
+                run_id=context.run_id,
+            ),
+            outbound_headers=OutboundHeaders(default_outbound_headers(request.headers)),
+        )
+
+    @staticmethod
+    def _outbound(ex: ProxyExchange, exchange: Exchange) -> Outbound:
+        headers = final_outbound_headers(exchange.outbound_headers, ex.request.headers)
+        path = (
+            ex.request.path if exchange._drop_query_credentials else ex.request.raw_path
+        )
+        return Outbound(headers, path)
+
+    def _refuse(self, ex: ProxyExchange, reject: tuple[int, bytes, str]) -> None:
+        status, encoded, reason = reject
+        events = ex.request_events
+        _mark_hook_blocked(
+            events, {"action": "reject", "status": status, "reason": reason}
+        )
+        self._write_best_effort(ex, events, "Hook rejection audit was not durable")
+        ex.outcome, ex.status = "rejected", status
+        ex.client.send_reply(status, {"Content-Type": "application/json"}, encoded)
+
+    def _refuse_after_error(
+        self, ex: ProxyExchange, run: _HookRun, exc: BaseException
+    ) -> None:
+        """A failing hook never means "forward anyway"."""
+        run.exchange._settle(identity=run.seeded_identity)
+        events = copy.deepcopy(run.seeded_events)
+        _mark_hook_blocked(
+            events, {"action": "error", "error_type": type(exc).__name__}
+        )
+        self._write_best_effort(ex, events, "Hook error audit was not durable")
+        ex.outcome, ex.status = "hook_error", 502
+        send_json(ex.client, 502, {"error": "The request could not be processed"})
+
+    @staticmethod
+    def _write_best_effort(ex: ProxyExchange, events: list[dict], message: str) -> None:
+        try:
+            ex.config.writer.write(events)
+        except AuditWriteError:
+            log.exception(message)
+
+    def _entered(self) -> _HookRun:
+        if self._run is None:
+            raise RuntimeError("the exchange was never admitted")
+        return self._run
+
+    def _warn_if_slow(self, hook: str, started: float) -> None:
+        elapsed = time.monotonic() - started
+        if elapsed > self._slow_seconds:
+            log.warning(
+                "%s took %.1fs (hook_slow_seconds=%s); a slow hook holds a "
+                "request slot",
+                hook,
+                elapsed,
+                self._slow_seconds,
+            )

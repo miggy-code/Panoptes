@@ -6,10 +6,11 @@ how a provider reply is parsed for them. Nothing here talks to a network.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, TypeGuard
 
 import panoptes.providers as _providers
 from panoptes.capture import PROXY_CAPABILITIES
@@ -39,7 +40,7 @@ _RAW_MAX = 64 * 1024  # 64 KB cap on stored raw payloads
 _USAGE_KEYS = ("usage", "usageMetadata", "usage_metadata")
 
 
-def provider_reported_usage(resp_body: Any) -> bool:
+def provider_reported_usage(resp_body: Any) -> TypeGuard[dict]:
     """Whether a parsed response carries a usage object of the provider's own."""
     return isinstance(resp_body, dict) and any(
         isinstance(resp_body.get(key), dict) and resp_body.get(key)
@@ -57,6 +58,31 @@ class ResponseInspectionError(RuntimeError):
 
 class AmbiguousResponseError(ResponseInspectionError):
     """Raised when response JSON has parser-differential ambiguity."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ExchangeContext:
+    """What every event of one exchange shares: ids, identity, request shape.
+
+    ``AuditEventWriter.build_request_events`` creates it. When a hook assigns
+    an identity the writer builds a new context; nothing mutates one.
+    """
+
+    exchange_id: str
+    run_id: str | None  # a hook-assigned identity may carry none
+    session_id: str
+    agent_type: str
+    provider: str  # the wire protocol, e.g. "anthropic"
+    path: str
+    model: Any  # as the request named it; client data, not validated
+    streaming: bool
+    turn_number: int
+    correlation_id: str
+    correlation_source: str  # "client" (asserted by header) or "proxy"
+    parent_run_id: str | None = None
+    user: dict[str, str] | None = None
+    identity_attr: dict[str, str | None] | None = None  # hook mode only
+    identity_assured: bool = False  # a hook asserted the identity
 
 
 def _cap_raw(body: dict | None) -> str | None:
@@ -145,15 +171,15 @@ def _parse_sse_response(
 def _parse_provider_response(
     raw: bytes,
     resp_headers: dict[str, str],
-    exchange_ctx: dict,
+    context: ExchangeContext,
 ) -> dict:
     """Parse a complete provider response or raise ``ResponseInspectionError``."""
     if not raw or not raw.strip():
         raise ResponseInspectionError("successful upstream response body was empty")
 
-    req_format = exchange_ctx.get("req_format", "unknown")
-    path = exchange_ctx.get("path")
-    streaming = bool(exchange_ctx.get("req_info", {}).get("stream"))
+    req_format = context.provider
+    path = context.path
+    streaming = context.streaming
     content_type = _lower_keys(resp_headers).get("content-type", "").lower()
     stripped = raw.lstrip()
     looks_like_sse = "text/event-stream" in content_type or stripped.startswith(
@@ -240,17 +266,7 @@ class AuditEventWriter:
             raise ValueError("max_tool_events_per_exchange must be positive")
         self.db = db
         self.pricing = pricing
-        self._session_id: str | None = None
         self.max_tool_events_per_exchange = max_tool_events_per_exchange
-
-    @property
-    def session_id(self) -> str:
-        if self._session_id is None:
-            self._session_id = uuid.uuid4().hex[:16]
-        return self._session_id
-
-    def set_session_id(self, sid: str) -> None:
-        self._session_id = sid
 
     # ------------------------------------------------------------------
     # Build helpers
@@ -261,89 +277,54 @@ class AuditEventWriter:
         return PROXY_CAPABILITIES.as_context(stream_delivery=stream_delivery)
 
     def _make_base_event(
-        self,
-        event_type: str,
-        *,
-        run_id: str | None,
-        session_id: str,
-        agent_type: str,
-        turn_number: int,
-        streaming: bool,
-        correlation_id: str | None = None,
-        correlation_source: str | None = None,
-        exchange_id: str | None = None,
-        parent_run_id: str | None = None,
-        user: dict | None = None,
-        identity_attr: dict | None = None,
-        identity_assured: bool = False,
+        self, event_type: str, context: ExchangeContext, *, streaming: bool
     ) -> dict:
         capture = self._capture_metadata(streaming)
-        if identity_assured:
+        if context.identity_assured:
             # An embedder asserted this identity; Panoptes cannot know how it
             # was established.
             capture["identity_assurance"] = "hook_asserted"
-        if correlation_id is not None and correlation_source == "client":
+        if context.correlation_source == "client":
             # A client assertion for joining this exchange to an external journal;
             # it never changes agent type, session, or identity assurance.
-            capture["client_correlation_id"] = correlation_id
+            capture["client_correlation_id"] = context.correlation_id
         event: dict[str, Any] = {
             "event_id": uuid.uuid4().hex,
             "timestamp": utcnow_iso(),
-            "agent": {"type": agent_type, "session_id": session_id},
+            "agent": {"type": context.agent_type, "session_id": context.session_id},
             "event_type": event_type,
             "action": {},
             "outcome": {},
             "context": {
-                "turn_number": turn_number,
+                "turn_number": context.turn_number,
                 "capture": capture,
             },
             "cost": {},
-        }
-        if run_id is not None:
-            event["agent"]["run_id"] = run_id
-        if parent_run_id is not None:
-            event["agent"]["parent_run_id"] = parent_run_id
-        if user:
-            event["user"] = dict(user)
-        if correlation_id is not None:
             # First-class since schema v5. The capture copy above is kept for
             # readers of earlier events.
-            event["correlation_id"] = correlation_id
-        if exchange_id is not None:
+            "correlation_id": context.correlation_id,
             # A client may reuse a correlation id across requests; the exchange
             # id is unique to this one and is what joins its events exactly.
-            event["attributes"] = {
-                "exchange_id": exchange_id,
-                "correlation_source": correlation_source,
-            }
-            if identity_attr is not None:
-                event["attributes"]["identity"] = dict(identity_attr)
+            "attributes": {
+                "exchange_id": context.exchange_id,
+                "correlation_source": context.correlation_source,
+            },
+        }
+        if context.run_id is not None:
+            event["agent"]["run_id"] = context.run_id
+        if context.parent_run_id is not None:
+            event["agent"]["parent_run_id"] = context.parent_run_id
+        if context.user:
+            event["user"] = dict(context.user)
+        if context.identity_attr is not None:
+            event["attributes"]["identity"] = dict(context.identity_attr)
         return event
 
-    @staticmethod
-    def _base_kwargs(exchange_ctx: dict) -> dict:
-        """Event-identity arguments carried by an exchange context."""
-        return {
-            "run_id": exchange_ctx["run_id"],
-            "session_id": exchange_ctx["session_id"],
-            "agent_type": exchange_ctx["agent_type"],
-            "turn_number": exchange_ctx.get("turn_number", 0),
-            "correlation_id": exchange_ctx.get("correlation_id"),
-            "correlation_source": exchange_ctx.get("correlation_source"),
-            "exchange_id": exchange_ctx.get("exchange_id"),
-            "parent_run_id": exchange_ctx.get("parent_run_id"),
-            "user": exchange_ctx.get("user"),
-            "identity_attr": exchange_ctx.get("identity_attr"),
-            "identity_assured": bool(exchange_ctx.get("identity_assured")),
-        }
-
-    def build_hook_error_event(self, exchange_ctx: dict, exc: BaseException) -> dict:
+    def build_hook_error_event(
+        self, context: ExchangeContext, exc: BaseException
+    ) -> dict:
         """The ``panoptes.hook_error`` event for an ``after_exchange`` failure."""
-        event = self._make_base_event(
-            "panoptes.hook_error",
-            streaming=False,
-            **self._base_kwargs(exchange_ctx),
-        )
+        event = self._make_base_event("panoptes.hook_error", context, streaming=False)
         event["outcome"] = {"status": "error", "summary": "after_exchange raised"}
         event["attributes"].update(
             {
@@ -367,11 +348,11 @@ class AuditEventWriter:
         hook_mode: bool = False,
         hook_identity: Identity | None = None,
         exchange_id: str | None = None,
-    ) -> tuple[list[dict], dict]:
+    ) -> tuple[list[dict], ExchangeContext]:
         """Build request-side audit events (model_request + tool_result).
 
-        Returns (events, exchange_ctx). Pass exchange_ctx to build_response_events
-        to share run_id, session_id, agent_type, req_format, and turn_number.
+        Returns the events and the exchange's context. Pass the context to
+        ``build_response_events`` so both sides share one identity.
 
         ``hook_mode`` records how the identity was established; a
         ``hook_identity`` replaces the seeded one wholesale and its ``run_id``
@@ -381,7 +362,6 @@ class AuditEventWriter:
             run_id = uuid.uuid4().hex
 
         provider = _providers.detect(path, req_body)
-        req_format = provider.name
         agent_type = detect_agent_type(path, req_headers, req_body)
         req_info = provider.extract_request_info(req_body, path=path)
         requested_tools = (
@@ -414,11 +394,7 @@ class AuditEventWriter:
         # Merging unrelated clients into one process-wide session corrupts
         # timelines and evidence chains; continuity requires the documented
         # x-panoptes-session header.
-        session_id = (
-            _lower_keys(req_headers).get("x-panoptes-session")
-            or self._session_id
-            or run_id
-        )
+        session_id = _lower_keys(req_headers).get("x-panoptes-session") or run_id
         parent_run_id: str | None = None
         user: dict | None = None
         identity_attr: dict | None = None
@@ -455,28 +431,27 @@ class AuditEventWriter:
             correlation_id = exchange_id
             correlation_source = "proxy"
 
-        exchange_ctx = {
-            "run_id": run_id,
-            "session_id": session_id,
-            "agent_type": agent_type,
-            "path": path,
-            "req_format": req_format,
-            "req_info": req_info,
-            "turn_number": turn_number,
-            "correlation_id": correlation_id,
-            "correlation_source": correlation_source,
-            "exchange_id": exchange_id,
-            "parent_run_id": parent_run_id,
-            "user": user,
-            "identity_attr": identity_attr,
-            "identity_assured": hook_identity is not None,
-        }
+        context = ExchangeContext(
+            exchange_id=exchange_id,
+            run_id=run_id,
+            session_id=session_id,
+            agent_type=agent_type,
+            provider=provider.name,
+            path=path,
+            model=req_info["model"],
+            streaming=req_info["stream"],
+            turn_number=turn_number,
+            correlation_id=correlation_id,
+            correlation_source=correlation_source,
+            parent_run_id=parent_run_id,
+            user=user,
+            identity_attr=identity_attr,
+            identity_assured=hook_identity is not None,
+        )
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
-                event_type,
-                streaming=req_info["stream"],
-                **self._base_kwargs(exchange_ctx),
+                event_type, context, streaming=context.streaming
             )
 
         events: list[dict] = []
@@ -545,47 +520,44 @@ class AuditEventWriter:
         normalized_events = [normalize_event(event) for event in events]
         for event in normalized_events:
             validate_event(event)
-        return normalized_events, exchange_ctx
+        return normalized_events, context
+
+    @staticmethod
+    def _provider(context: ExchangeContext) -> _providers.Provider:
+        return next(
+            (p for p in _providers.REGISTRY if p.name == context.provider),
+            _providers._UNKNOWN,
+        )
+
+    def estimate_cost_micros(
+        self, context: ExchangeContext, status: int, body: dict | None
+    ) -> int | None:
+        """What the response cost in USD micros, or None when unpriced.
+
+        An error reply is not billed. No usage object means no token counts to
+        price: unpriced, not free.
+        """
+        if status >= 400:
+            return 0
+        if self.pricing is None or not provider_reported_usage(body):
+            return None
+        usage = self._provider(context).extract_usage(body)
+        return self.pricing.cost_micros(context.model, usage)
 
     def build_response_events(
         self,
+        context: ExchangeContext,
         *,
-        path: str,
-        req_body: dict | None,
-        resp_status: int,
-        resp_headers: dict[str, str],
-        resp_body: dict | None,
+        status: int,
+        body: dict | None,
         duration_ms: int,
-        exchange_ctx: dict,
     ) -> list[dict]:
         """Build response-side audit events (model_response + tool_call)."""
-        # Fill what a caller-built context may omit; a hook-set identity can
-        # legitimately carry no run_id, so only a missing key is defaulted.
-        exchange_ctx.setdefault("run_id", uuid.uuid4().hex)
-        exchange_ctx["session_id"] = exchange_ctx.get("session_id") or self.session_id
-        exchange_ctx.setdefault("agent_type", "unknown")
-
-        # Resolve provider for tool extraction (re-detect only if ctx is missing it)
-        req_format = exchange_ctx.get("req_format")
-        if req_format is None:
-            provider = _providers.detect(path, req_body)
-        else:
-            provider = next(
-                (p for p in _providers.REGISTRY if p.name == req_format),
-                _providers._UNKNOWN,
-            )
-        req_info = exchange_ctx.get("req_info")
-        if req_info is None:
-            req_info = provider.extract_request_info(req_body, path=path)
-            # Streaming can be signalled by the path (Gemini), not just the body;
-            # always re-derive it here to match the logic in build_request_events.
-            req_info["stream"] = provider.is_streaming(path, req_body)
+        provider = self._provider(context)
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
-                event_type,
-                streaming=bool(req_info.get("stream", False)),
-                **self._base_kwargs(exchange_ctx),
+                event_type, context, streaming=context.streaming
             )
 
         events: list[dict] = []
@@ -593,40 +565,34 @@ class AuditEventWriter:
         # model_response event
         resp_event = _base("model_response")
         resp_event["action"] = {
-            "model": req_info["model"],
-            "status_code": resp_status,
+            "model": context.model,
+            "status_code": status,
             "duration_ms": duration_ms,
         }
-        if resp_status < 400:
+        if status < 400:
             resp_event["outcome"] = {
                 "status": "success",
-                "summary": f"HTTP {resp_status}",
+                "summary": f"HTTP {status}",
             }
-        elif resp_status < 500:
+        elif status < 500:
             resp_event["outcome"] = {
                 "status": "error",
-                "summary": f"Client error HTTP {resp_status}",
+                "summary": f"Client error HTTP {status}",
             }
         else:
             resp_event["outcome"] = {
                 "status": "error",
-                "summary": f"Server error HTTP {resp_status}",
+                "summary": f"Server error HTTP {status}",
             }
 
-        if isinstance(resp_body, dict):
-            resp_event["cost"] = provider.extract_usage(resp_body)
-        if resp_status >= 400:
-            # An error response from the provider is not billed.
-            exchange_ctx["cost_micros"] = 0
-        elif self.pricing is not None and provider_reported_usage(resp_body):
-            # No usage object means no token counts to price: unpriced, not free.
-            micros = self.pricing.cost_micros(req_info["model"], resp_event["cost"])
-            if micros is not None:
-                resp_event["cost"]["estimated_usd"] = micros / 1_000_000
-                resp_event["cost"]["pricing_version"] = self.pricing.version
-                exchange_ctx["cost_micros"] = micros
+        if isinstance(body, dict):
+            resp_event["cost"] = provider.extract_usage(body)
+        micros = self.estimate_cost_micros(context, status, body)
+        if micros is not None and status < 400:
+            resp_event["cost"]["estimated_usd"] = micros / 1_000_000
+            resp_event["cost"]["pricing_version"] = self.pricing.version
 
-        resp_event["raw_response"] = _cap_raw(resp_body)
+        resp_event["raw_response"] = _cap_raw(body)
         if isinstance(resp_event["raw_response"], str) and resp_event[
             "raw_response"
         ].endswith("...[truncated]"):
@@ -634,8 +600,8 @@ class AuditEventWriter:
         events.append(resp_event)
 
         # tool_call events (from response body)
-        if isinstance(resp_body, dict):
-            tool_calls = provider.extract_tool_calls(resp_body, path=path)
+        if isinstance(body, dict):
+            tool_calls = provider.extract_tool_calls(body, path=context.path)
             if len(tool_calls) > self.max_tool_events_per_exchange:
                 raise ValidationError(
                     "tool call count exceeds the per-exchange limit of "
@@ -779,7 +745,7 @@ class AuditEventWriter:
         Backward-compatible wrapper — generates a fresh run_id per call.
         """
         run_id = uuid.uuid4().hex
-        req_events, exchange_ctx = self.build_request_events(
+        req_events, context = self.build_request_events(
             path=path,
             method=method,
             req_headers=req_headers,
@@ -787,13 +753,7 @@ class AuditEventWriter:
             run_id=run_id,
         )
         resp_events = self.build_response_events(
-            path=path,
-            req_body=req_body,
-            resp_status=resp_status,
-            resp_headers=resp_headers,
-            resp_body=resp_body,
-            duration_ms=duration_ms,
-            exchange_ctx=exchange_ctx,
+            context, status=resp_status, body=resp_body, duration_ms=duration_ms
         )
         all_events = req_events + resp_events
         self.write(all_events)

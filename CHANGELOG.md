@@ -5,6 +5,30 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Changed
+
+- A streamed request whose upstream fails before the response head is now
+  recorded like a buffered one: the gateway status and error body. It was
+  recorded as "Audit capture limit reached". An upstream stream with an
+  unsupported `Content-Encoding` now gets the same reply as a buffered one,
+  `502 {"error": "Unsafe upstream response framing"}`, instead of
+  `"Bad Gateway"`.
+- A streamed response whose events cannot be built now leaves an explicit
+  incomplete record, as a buffered one already did.
+- After the last streamed byte, the proxy half-closes the client connection
+  with or without hooks, so the client sees the end of the stream before the
+  audit write. Before, only hook mode did this.
+- Every proxy error reply is JSON. An unexpected request-parsing error used to
+  get the standard library's HTML page.
+
+### Fixed
+
+- **A request whose audit events cannot be built is refused.** An unexpected
+  error while building request events used to be logged and ignored. The
+  proxy then forwarded the request with an empty context, and in hook mode it
+  dropped the connection without a reply. Both modes now answer HTTP 500 and
+  forward nothing.
+
 ### Documentation
 
 - Rewrite the README, SECURITY, RELEASING, AGENTS, and lifecycle docs in
@@ -24,6 +48,12 @@ All notable changes to Panoptes are recorded here. Releases follow
   `uv sync --locked`. The `dev` and `release` extras are removed; users install
   the package as before.
 - Add ruff (lint and format) and mypy checks. CI runs both on every push.
+- Split the proxy by side of the exchange. `_request` reads and routes the
+  client request, `_forward` talks to the upstream, `_exchange` runs one
+  exchange, and `_hooked` adds the hook lifecycle. Hook mode is chosen once
+  per server start. The exchange context is a frozen dataclass.
+  `panoptes.proxy` now declares `__all__` and no longer re-exports private
+  helpers.
 
 ## [0.3.0] - 2026-11-06
 

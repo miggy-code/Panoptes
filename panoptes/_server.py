@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.server
 import threading
+from collections.abc import Callable
 
 
 class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -18,7 +19,7 @@ class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
     def __init__(
         self,
         server_address: tuple[str, int],
-        request_handler: type[http.server.BaseHTTPRequestHandler],
+        request_handler: Callable[..., http.server.BaseHTTPRequestHandler],
         *,
         client_socket_timeout_seconds: float,
         max_concurrent_requests: int,
