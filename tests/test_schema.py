@@ -17,7 +17,6 @@ import pytest
 from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import AuditDB
 from panoptes.schema import (
-    DATA_ACCESS_CLASSIFIERS,
     MAX_COST_INTEGER,
     ValidationError,
     _derive_data_accessed,
@@ -40,23 +39,42 @@ def test_redaction_recognizes_sensitive_keys_and_preserves_safe_fields():
     sensitive = {
         key: "private value"
         for key in (
-            "auth", "Authorization", "password", "passwd", "pwd", "secret",
-            "token", "credential", "credentials", "api_key", "apiKey",
-            "api-key", "private_key", "access_key", "db_password",
-            "aws_secret_key", "refresh-token", "access_token", "auth_header",
+            "auth",
+            "Authorization",
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "token",
+            "credential",
+            "credentials",
+            "api_key",
+            "apiKey",
+            "api-key",
+            "private_key",
+            "access_key",
+            "db_password",
+            "aws_secret_key",
+            "refresh-token",
+            "access_token",
+            "auth_header",
         )
     }
     safe = {
-        "author": "Alice", "authors": ["Alice", "Bob"],
+        "author": "Alice",
+        "authors": ["Alice", "Bob"],
         "authentication_docs": "https://example.com/auth",
-        "cwd": "/tmp", "tokenizer": "bpe",
+        "cwd": "/tmp",
+        "tokenizer": "bpe",
     }
     assert redact_secrets({**sensitive, **safe}) == {
-        **dict.fromkeys(sensitive, "[REDACTED]"), **safe,
+        **dict.fromkeys(sensitive, "[REDACTED]"),
+        **safe,
     }
 
 
 # ── DATA_ACCESS_CLASSIFIERS / _derive_data_accessed ───────────────────────────
+
 
 def test_derive_prod_tag():
     """Commands/paths containing 'prod' or 'production' get the 'prod' tag."""
@@ -119,7 +137,14 @@ def test_derive_kubectl_prod_gets_both_tags():
 def test_derive_secrets_tag():
     """References to credential files get the 'secrets' tag."""
 
-    for path in [".env", "id_rsa", "server.pem", "private.key", "/etc/passwd", "/etc/shadow"]:
+    for path in [
+        ".env",
+        "id_rsa",
+        "server.pem",
+        "private.key",
+        "/etc/passwd",
+        "/etc/shadow",
+    ]:
         action = {
             "tool_name": "Read",
             "parameters": {"file_path": path},
@@ -127,15 +152,17 @@ def test_derive_secrets_tag():
             "data_accessed": [],
         }
         tags = _derive_data_accessed(action, "tool_call")
-        assert "secrets" in tags, (
-            f"Expected 'secrets' from path {path!r}, got {tags}"
-        )
+        assert "secrets" in tags, f"Expected 'secrets' from path {path!r}, got {tags}"
 
 
 def test_derive_database_tag():
     """Database CLI commands get the 'database' tag."""
 
-    for cmd in ["psql -U admin prod_db", "mysql -h db.internal orders", "redis-cli ping"]:
+    for cmd in [
+        "psql -U admin prod_db",
+        "mysql -h db.internal orders",
+        "redis-cli ping",
+    ]:
         action = {
             "tool_name": "bash",
             "parameters": {"command": cmd},
@@ -143,9 +170,7 @@ def test_derive_database_tag():
             "data_accessed": [],
         }
         tags = _derive_data_accessed(action, "tool_call")
-        assert "database" in tags, (
-            f"Expected 'database' from cmd {cmd!r}, got {tags}"
-        )
+        assert "database" in tags, f"Expected 'database' from cmd {cmd!r}, got {tags}"
 
 
 def test_derive_network_tag():
@@ -259,6 +284,7 @@ def test_derive_scans_parameter_keys():
 
 # ── extract_index_fields: call_id ─────────────────────────────────────────────
 
+
 def test_extract_call_id_explicit():
     """extract_index_fields uses action.call_id when present."""
 
@@ -318,6 +344,7 @@ def test_extract_call_id_empty_when_neither():
 
 
 # ── normalize_event: end-to-end data_accessed derivation ─────────────────────
+
 
 def test_normalize_derives_data_accessed():
     """normalize_event auto-populates data_accessed for tool events."""
@@ -429,16 +456,18 @@ def test_normalize_redacts_every_persisted_content_field():
     }
 
     normalized = normalize_event(raw)
-    serialized = str({
-        "agent": normalized["agent"],
-        "user": normalized["user"],
-        "action": normalized["action"],
-        "outcome": normalized["outcome"],
-        "context": normalized["context"],
-        "cost": normalized["cost"],
-        "raw_request": normalized["raw_request"],
-        "raw_response": normalized["raw_response"],
-    })
+    serialized = str(
+        {
+            "agent": normalized["agent"],
+            "user": normalized["user"],
+            "action": normalized["action"],
+            "outcome": normalized["outcome"],
+            "context": normalized["context"],
+            "cost": normalized["cost"],
+            "raw_request": normalized["raw_request"],
+            "raw_response": normalized["raw_response"],
+        }
+    )
 
     assert "abcdefghijklmnopqrstuvwxyz" not in serialized
     assert "[REDACTED]" in serialized
@@ -467,16 +496,18 @@ def test_redacts_bare_keys_credential_urls_and_signed_queries():
 def test_redacts_secret_bearing_mapping_keys_without_collisions():
     first = "sk-proj-fakefakefakefakefakefake012345"
     second = "sk-proj-fakefakefakefakefakefake543210"
-    normalized = normalize_event({
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "tool_call",
-        "action": {
-            "tool_name": "terminal",
-            "parameters": {first: "one", second: "two"},
-        },
-        "outcome": {"status": "pending"},
-        "context": {},
-    })
+    normalized = normalize_event(
+        {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "terminal",
+                "parameters": {first: "one", second: "two"},
+            },
+            "outcome": {"status": "pending"},
+            "context": {},
+        }
+    )
 
     serialized = str(normalized)
     assert first not in serialized
@@ -487,17 +518,17 @@ def test_redacts_secret_bearing_mapping_keys_without_collisions():
 def test_redacts_long_pem_before_truncating_user_message():
     private_key = (
         "prefix "
-        "-----BEGIN PRIVATE KEY-----"
-        + ("A" * 800)
-        + "-----END PRIVATE KEY----- suffix"
+        "-----BEGIN PRIVATE KEY-----" + ("A" * 800) + "-----END PRIVATE KEY----- suffix"
     )
-    normalized = normalize_event({
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "model_request",
-        "action": {},
-        "outcome": {"status": "success"},
-        "context": {"user_message": private_key},
-    })
+    normalized = normalize_event(
+        {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "model_request",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {"user_message": private_key},
+        }
+    )
 
     message = normalized["context"]["user_message"]
     assert "BEGIN PRIVATE KEY" not in message
@@ -752,7 +783,9 @@ def test_agent_step_derives_visibility_tags_and_requires_tool_identity():
     except ValidationError:
         pass
     else:
-        raise AssertionError("agent_step with a malformed tool identity must be invalid")
+        raise AssertionError(
+            "agent_step with a malformed tool identity must be invalid"
+        )
 
 
 def test_normalization_is_idempotent_for_derived_access_metadata():
@@ -779,30 +812,34 @@ def test_normalization_is_idempotent_for_derived_access_metadata():
 
 
 def test_normalization_recomputes_instead_of_trusting_derived_access_metadata():
-    normalized = normalize_event({
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "tool_call",
-        "action": {
-            "tool_name": "read_file",
-            "parameters": {"path": "README.md"},
-            "derived_data_accessed": ["forged-authoritative"],
-        },
-        "outcome": {"status": "pending"},
-        "context": {},
-    })
+    normalized = normalize_event(
+        {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "tool_call",
+            "action": {
+                "tool_name": "read_file",
+                "parameters": {"path": "README.md"},
+                "derived_data_accessed": ["forged-authoritative"],
+            },
+            "outcome": {"status": "pending"},
+            "context": {},
+        }
+    )
 
     assert normalized["action"]["derived_data_accessed"] == []
     assert "forged-authoritative" not in normalized["action"]["data_accessed"]
 
 
 def test_event_schema_version_enforces_the_versioned_contract():
-    event = normalize_event({
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "agent_step",
-        "action": {"tool_names": []},
-        "outcome": {"status": "pending"},
-        "context": {"schema_version": 1},
-    })
+    event = normalize_event(
+        {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "agent_step",
+            "action": {"tool_names": []},
+            "outcome": {"status": "pending"},
+            "context": {"schema_version": 1},
+        }
+    )
 
     try:
         validate_event(event)
@@ -819,13 +856,15 @@ def test_capture_metadata_is_key_aware_but_preserves_safe_authorization_label():
         token=secret,
         diagnostics={"api_key": "sk-proj-fakefakefakefakefakefake012345"},
     )
-    normalized = normalize_event({
-        "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-        "event_type": "decision_point",
-        "action": {},
-        "outcome": {"status": "success"},
-        "context": {"capture": capture},
-    })
+    normalized = normalize_event(
+        {
+            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+            "event_type": "decision_point",
+            "action": {},
+            "outcome": {"status": "success"},
+            "context": {"capture": capture},
+        }
+    )
 
     stored_capture = normalized["context"]["capture"]
     assert stored_capture["authorization_check"] == "pre_execution"
@@ -852,13 +891,17 @@ def test_capture_core_field_types_and_event_names_are_validated():
     ]
 
     for invalid_capture in invalid_captures:
-        _assert_validation_error(lambda capture=invalid_capture: normalize_event({
-            "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
-            "event_type": "decision_point",
-            "action": {},
-            "outcome": {"status": "success"},
-            "context": {"capture": capture},
-        }))
+        _assert_validation_error(
+            lambda capture=invalid_capture: normalize_event(
+                {
+                    "agent": {"type": "hermes", "session_id": "s1", "run_id": "r1"},
+                    "event_type": "decision_point",
+                    "action": {},
+                    "outcome": {"status": "success"},
+                    "context": {"capture": capture},
+                }
+            )
+        )
 
 
 def test_secret_shaped_structural_identifiers_are_rejected_before_redaction():
@@ -901,14 +944,16 @@ def test_secret_shaped_structural_identifiers_are_rejected_before_redaction():
     ]
 
     for invalid_event in invalid_events:
-        _assert_validation_error(
-            lambda event=invalid_event: normalize_event(event)
-        )
+        _assert_validation_error(lambda event=invalid_event: normalize_event(event))
 
-    _assert_validation_error(lambda: validate_event({
-        **base,
-        "event_id": "[REDACTED]",
-    }))
+    _assert_validation_error(
+        lambda: validate_event(
+            {
+                **base,
+                "event_id": "[REDACTED]",
+            }
+        )
+    )
 
 
 def test_validated_structural_identifiers_survive_normalization_unchanged():

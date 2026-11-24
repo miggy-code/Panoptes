@@ -53,20 +53,27 @@ class PricingTable:
     models: dict[str, dict[str, Decimal]]
 
     @classmethod
-    def load(cls, path: str) -> "PricingTable":
+    def load(cls, path: str) -> PricingTable:
         try:
             with open(os.path.expanduser(path), encoding="utf-8") as handle:
                 raw = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
-            raise PricingError(f"cannot read pricing file: {type(exc).__name__}") from None
+            raise PricingError(
+                f"cannot read pricing file: {type(exc).__name__}"
+            ) from None
         return cls.from_dict(raw)
 
     @classmethod
-    def from_dict(cls, raw: Any) -> "PricingTable":
+    def from_dict(cls, raw: Any) -> PricingTable:
         if not isinstance(raw, dict) or raw.get("currency") != "USD":
             raise PricingError("pricing table must be a USD object")
         version, source = raw.get("version"), raw.get("source")
-        if not isinstance(version, str) or not version or not isinstance(source, str) or not source:
+        if (
+            not isinstance(version, str)
+            or not version
+            or not isinstance(source, str)
+            or not source
+        ):
             raise PricingError("pricing table needs a version and a source")
         models: dict[str, dict[str, Decimal]] = {}
         for name, rate in (raw.get("models") or {}).items():
@@ -79,7 +86,9 @@ class PricingTable:
                 try:
                     value = Decimal(str(rate[field]))
                 except (KeyError, InvalidOperation):
-                    raise PricingError(f"rate for {name} lacks a valid {field}") from None
+                    raise PricingError(
+                        f"rate for {name} lacks a valid {field}"
+                    ) from None
                 if not value.is_finite() or value < 0:
                     raise PricingError(f"rate for {name} has an invalid {field}")
                 parsed[field] = value
@@ -106,9 +115,15 @@ class PricingTable:
         """
         rate = self.models.get(model or "")
         tokens_in, tokens_out = cost.get("tokens_in"), cost.get("tokens_out")
-        if rate is None or any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in (tokens_in, tokens_out)):
+        if rate is None or any(
+            isinstance(v, bool) or not isinstance(v, int) or v < 0
+            for v in (tokens_in, tokens_out)
+        ):
             return None
-        cached, tool_prompt = _count(cost, "cached_input_tokens"), _count(cost, "tool_prompt_tokens")
+        cached, tool_prompt = (
+            _count(cost, "cached_input_tokens"),
+            _count(cost, "tool_prompt_tokens"),
+        )
         writes = _count(cost, "cache_creation_input_tokens")
         if None in (cached, tool_prompt, writes) or cached + writes > tokens_in:
             return None
@@ -117,7 +132,8 @@ class PricingTable:
             return None
         # A rate in USD per million tokens times a token count is exactly micro-dollars.
         micros = (
-            Fraction(tokens_in - cached - writes + tool_prompt) * Fraction(rate["input_per_million"])
+            Fraction(tokens_in - cached - writes + tool_prompt)
+            * Fraction(rate["input_per_million"])
             + Fraction(cached) * Fraction(rate["cached_input_per_million"])
             + Fraction(tokens_out) * Fraction(rate["output_per_million"])
         )
@@ -150,7 +166,9 @@ def _write_split(cost: dict, writes: int) -> tuple[int, int] | None | object:
 _SPLIT_FIELDS = ("cache_creation_5m_input_tokens", "cache_creation_1h_input_tokens")
 
 
-def _cache_write_cost(rate: dict[str, Decimal], writes: int, split: tuple[int, int] | None) -> Fraction | None:
+def _cache_write_cost(
+    rate: dict[str, Decimal], writes: int, split: tuple[int, int] | None
+) -> Fraction | None:
     """Exact cost of ``writes`` cache-write tokens in micro-dollars, or None when unknown."""
     write_rate = rate.get("cache_write_per_million")
     hour_rate = rate.get("cache_write_1h_per_million")
@@ -163,4 +181,6 @@ def _cache_write_cost(rate: dict[str, Decimal], writes: int, split: tuple[int, i
     five, hour = split
     if (five and write_rate is None) or (hour and hour_rate is None):
         return None
-    return Fraction(five) * Fraction(write_rate or 0) + Fraction(hour) * Fraction(hour_rate or 0)
+    return Fraction(five) * Fraction(write_rate or 0) + Fraction(hour) * Fraction(
+        hour_rate or 0
+    )

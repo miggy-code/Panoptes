@@ -15,9 +15,19 @@ from email.message import Message
 
 import pytest
 
+from panoptes.providers import detect as detect_provider
+from panoptes.providers.anthropic import (
+    AnthropicProvider,
+    _reassemble_anthropic_sse,
+)
+from panoptes.providers.base import SSEParseError, _parse_sse_events
+from panoptes.providers.openai import (
+    OpenAIProvider,
+    _reassemble_openai_sse,
+)
 from panoptes.proxy import (
-    AuditWriteError,
     AuditEventWriter,
+    AuditWriteError,
     ProxyHandler,
     ProxyServer,
     RequestBodyTooLarge,
@@ -27,22 +37,12 @@ from panoptes.proxy import (
     _parse_sse_response,
     detect_agent_type,
 )
-from panoptes.providers import detect as detect_provider
-from panoptes.providers.base import SSEParseError, _parse_sse_events
-from panoptes.providers.anthropic import (
-    AnthropicProvider,
-    _reassemble_anthropic_sse,
-)
-from panoptes.providers.openai import (
-    OpenAIProvider,
-    _reassemble_openai_sse,
-)
 from panoptes.schema import ValidationError
-
 
 # ---------------------------------------------------------------------------
 # Minimal in-memory DB stub for unit tests
 # ---------------------------------------------------------------------------
+
 
 class _AuditDBStub:
     """Simple in-memory list store used in proxy unit tests."""
@@ -72,22 +72,26 @@ def test_openai_responses_api_extracts_calls_results_and_usage():
     provider = OpenAIProvider()
     request = {
         "model": "gpt-test",
-        "input": [{
-            "type": "function_call_output",
-            "call_id": "call_123",
-            "output": "sunny",
-        }],
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_123",
+                "output": "sunny",
+            }
+        ],
         "tools": [{"type": "function", "name": "weather"}],
     }
     response = {
         "object": "response",
-        "output": [{
-            "id": "fc_123",
-            "type": "function_call",
-            "call_id": "call_123",
-            "name": "weather",
-            "arguments": '{"city":"Lima"}',
-        }],
+        "output": [
+            {
+                "id": "fc_123",
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "weather",
+                "arguments": '{"city":"Lima"}',
+            }
+        ],
         "usage": {"input_tokens": 20, "output_tokens": 7},
     }
 
@@ -119,11 +123,13 @@ def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
             resp_headers={},
             resp_body={
                 "object": "response",
-                "output": [{
-                    "type": "function_call",
-                    "name": "hidden",
-                    "arguments": "{}",
-                }],
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "hidden",
+                        "arguments": "{}",
+                    }
+                ],
             },
             duration_ms=20,
             exchange_ctx=exchange_ctx,
@@ -134,12 +140,14 @@ def test_openai_responses_stream_uses_completed_response():
     completed = {
         "id": "resp_123",
         "object": "response",
-        "output": [{
-            "type": "function_call",
-            "call_id": "call_123",
-            "name": "weather",
-            "arguments": '{"city":"Lima"}',
-        }],
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "weather",
+                "arguments": '{"city":"Lima"}',
+            }
+        ],
         "usage": {"input_tokens": 20, "output_tokens": 7},
     }
     raw = (
@@ -153,26 +161,32 @@ def test_openai_responses_stream_uses_completed_response():
 def test_agent_identity_requires_evidence_not_provider_guessing():
     body = {"model": "gpt-test", "messages": []}
     assert detect_agent_type("/v1/chat/completions", {}, body) == "unknown"
-    assert detect_agent_type(
-        "/v1beta/models/gemini-pro:generateContent",
-        {},
-        {"contents": []},
-    ) == "unknown"
-    assert detect_agent_type(
-        "/v1/chat/completions",
-        {"user-agent": "openai-codex/1.0"},
-        body,
-    ) == "codex"
+    assert (
+        detect_agent_type(
+            "/v1beta/models/gemini-pro:generateContent",
+            {},
+            {"contents": []},
+        )
+        == "unknown"
+    )
+    assert (
+        detect_agent_type(
+            "/v1/chat/completions",
+            {"user-agent": "openai-codex/1.0"},
+            body,
+        )
+        == "codex"
+    )
 
 
 def test_sse_parser_honors_eventsource_framing_and_multiline_data():
     raw = (
         b": keepalive\r\n"
         b"event: message\r\n"
-        b"data:{\"kind\":\r\n"
-        b"data: \"tool\"}\r\n"
+        b'data:{"kind":\r\n'
+        b'data: "tool"}\r\n'
         b"\r\n"
-        b"data: {\"sequence\": 2}\n\n"
+        b'data: {"sequence": 2}\n\n'
     )
 
     assert _parse_sse_events(raw) == [
@@ -183,10 +197,7 @@ def test_sse_parser_honors_eventsource_framing_and_multiline_data():
 
 def test_sse_parser_surfaces_malformed_or_ambiguous_events():
     with pytest.raises(SSEParseError, match="invalid JSON"):
-        _parse_sse_events(
-            b'data: {"safe": true\n'
-            b'data: {"hidden_tool": true}\n\n'
-        )
+        _parse_sse_events(b'data: {"safe": true\ndata: {"hidden_tool": true}\n\n')
 
     with pytest.raises(SSEParseError, match="invalid UTF-8"):
         _parse_sse_events(b"data: \xff\n\n")
@@ -285,17 +296,25 @@ def test_handler_owned_http_client_ignores_proxy_environment(monkeypatch):
 def test_proxy_does_not_merge_headerless_requests_into_one_session():
     writer = AuditEventWriter(_AuditDBStub())
     _, first = writer.build_request_events(
-        path="/v1/chat/completions", method="POST", req_headers={},
-        req_body={"model": "gpt-test", "messages": []}, run_id="run-1",
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body={"model": "gpt-test", "messages": []},
+        run_id="run-1",
     )
     _, second = writer.build_request_events(
-        path="/v1/chat/completions", method="POST", req_headers={},
-        req_body={"model": "gpt-test", "messages": []}, run_id="run-2",
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body={"model": "gpt-test", "messages": []},
+        run_id="run-2",
     )
     _, explicit = writer.build_request_events(
-        path="/v1/chat/completions", method="POST",
+        path="/v1/chat/completions",
+        method="POST",
         req_headers={"x-panoptes-session": "session-explicit"},
-        req_body={"model": "gpt-test", "messages": []}, run_id="run-3",
+        req_body={"model": "gpt-test", "messages": []},
+        run_id="run-3",
     )
 
     assert first["session_id"] != second["session_id"]
@@ -307,12 +326,14 @@ def test_proxy_does_not_forward_internal_identity_headers():
         def _build_fwd_headers(self, headers):
             return ProxyHandler._build_fwd_headers(self, headers)
 
-    forwarded = _Handler()._build_fwd_headers({
-        "Host": "localhost",
-        "Authorization": "Bearer upstream-token",
-        "X-Panoptes-Agent": "codex",
-        "x-panoptes-session": "session-1",
-    })
+    forwarded = _Handler()._build_fwd_headers(
+        {
+            "Host": "localhost",
+            "Authorization": "Bearer upstream-token",
+            "X-Panoptes-Agent": "codex",
+            "x-panoptes-session": "session-1",
+        }
+    )
 
     assert forwarded["Authorization"] == "Bearer upstream-token"
     assert not any(key.lower().startswith("x-panoptes-") for key in forwarded)
@@ -332,16 +353,30 @@ def test_shared_run_id():
         "model": "gpt-4",
         "messages": [
             {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "call_abc", "type": "function",
-                 "function": {"name": "bash", "arguments": '{"cmd": "ls"}'}}
-            ]},
-            {"role": "tool", "tool_call_id": "call_abc", "name": "bash", "content": "file.txt"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": '{"cmd": "ls"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_abc",
+                "name": "bash",
+                "content": "file.txt",
+            },
         ],
         "stream": False,
     }
     resp_body = {
-        "choices": [{"message": {"role": "assistant", "content": "Done", "tool_calls": []}}],
+        "choices": [
+            {"message": {"role": "assistant", "content": "Done", "tool_calls": []}}
+        ],
         "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
     }
 
@@ -409,27 +444,52 @@ def test_call_id_on_tool_events():
     req_body = {
         "model": "gpt-4",
         "messages": [
-            {"role": "tool", "tool_call_id": "call_xyz", "name": "read_file", "content": "data"},
+            {
+                "role": "tool",
+                "tool_call_id": "call_xyz",
+                "name": "read_file",
+                "content": "data",
+            },
         ],
         "stream": False,
     }
     resp_body = {
-        "choices": [{"message": {"role": "assistant", "tool_calls": [
-            {"id": "call_new", "type": "function",
-             "function": {"name": "write_file", "arguments": '{"path": "/tmp/x"}'}}
-        ]}}],
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_new",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": '{"path": "/tmp/x"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     }
 
     run_id = uuid.uuid4().hex
     req_events, ctx = writer.build_request_events(
-        path="/v1/chat/completions", method="POST",
-        req_headers={}, req_body=req_body, run_id=run_id,
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+        run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/chat/completions", req_body=req_body,
-        resp_status=200, resp_headers={}, resp_body=resp_body,
-        duration_ms=100, exchange_ctx=ctx,
+        path="/v1/chat/completions",
+        req_body=req_body,
+        resp_status=200,
+        resp_headers={},
+        resp_body=resp_body,
+        duration_ms=100,
+        exchange_ctx=ctx,
     )
 
     tool_results = [e for e in req_events if e["event_type"] == "tool_result"]
@@ -445,9 +505,7 @@ def test_call_id_on_tool_events():
 
 def test_proxy_redacts_tool_result_before_summary_truncation():
     private_key = (
-        "-----BEGIN PRIVATE KEY-----"
-        + ("A" * 800)
-        + "-----END PRIVATE KEY-----"
+        "-----BEGIN PRIVATE KEY-----" + ("A" * 800) + "-----END PRIVATE KEY-----"
     )
     writer = AuditEventWriter(_AuditDBStub())
     events, _ = writer.build_request_events(
@@ -456,12 +514,14 @@ def test_proxy_redacts_tool_result_before_summary_truncation():
         req_headers={},
         req_body={
             "model": "gpt-test",
-            "messages": [{
-                "role": "tool",
-                "tool_call_id": "call-secret",
-                "name": "read_secret",
-                "content": private_key,
-            }],
+            "messages": [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-secret",
+                    "name": "read_secret",
+                    "content": private_key,
+                }
+            ],
         },
     )
     tool_result = next(
@@ -504,10 +564,7 @@ def test_request_event_exposes_complete_tool_capability_summary():
     ]
     assert action["client_side_tools"] == ["function:local_tool"]
     assert action["server_side_tools"] == ["web_search_preview", "mcp"]
-    assert (
-        "server_url:https://mcp.example.test"
-        in action["requested_tool_targets"]
-    )
+    assert "server_url:https://mcp.example.test" in action["requested_tool_targets"]
 
 
 def test_request_tool_capability_count_is_bounded():
@@ -547,20 +604,20 @@ def test_provider_hosted_action_records_upstream_execution_truth():
         resp_headers={},
         resp_body={
             "object": "response",
-            "output": [{
-                "id": "ws_1",
-                "type": "web_search_call",
-                "status": "completed",
-                "action": {"query": "Panoptes"},
-            }],
+            "output": [
+                {
+                    "id": "ws_1",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"query": "Panoptes"},
+                }
+            ],
         },
         duration_ms=20,
         exchange_ctx=exchange_ctx,
     )
 
-    tool_call = next(
-        event for event in events if event["event_type"] == "tool_call"
-    )
+    tool_call = next(event for event in events if event["event_type"] == "tool_call")
     assert tool_call["action"]["execution_scope"] == "provider"
     assert tool_call["action"]["provider_item_type"] == "web_search_call"
     assert tool_call["outcome"]["status"] == "success"
@@ -600,9 +657,7 @@ def test_provider_hosted_result_is_redacted_and_bounded():
         exchange_ctx=exchange_ctx,
     )
 
-    tool_call = next(
-        event for event in events if event["event_type"] == "tool_call"
-    )
+    tool_call = next(event for event in events if event["event_type"] == "tool_call")
     assert tool_call["outcome"]["status"] == "success"
     assert len(tool_call["action"]["server_result_summary"]) == 500
     assert tool_call["action"]["server_result_complete"] is False
@@ -627,24 +682,26 @@ def test_protocols_without_call_ids_remain_valid():
         resp_status=200,
         resp_headers={},
         resp_body={
-            "candidates": [{
-                "content": {
-                    "parts": [{
-                        "functionCall": {
-                            "name": "weather",
-                            "args": {"city": "Lima"},
-                        },
-                    }],
-                },
-            }],
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "weather",
+                                    "args": {"city": "Lima"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
         },
         duration_ms=20,
         exchange_ctx=exchange_ctx,
     )
 
-    tool_call = next(
-        event for event in events if event["event_type"] == "tool_call"
-    )
+    tool_call = next(event for event in events if event["event_type"] == "tool_call")
     assert tool_call["action"]["call_id"] is None
     assert tool_call["action"]["target"] is None
 
@@ -656,8 +713,10 @@ def test_protocols_without_call_ids_remain_valid():
 
 def test_reverse_proxy_routing():
     """_parse_target routes relative paths to correct upstreams."""
+
     class MockHandler:
         """Minimal mock that satisfies _parse_target's attribute accesses."""
+
         def _parse_target(self):
             return ProxyHandler._parse_target(self)
 
@@ -749,65 +808,73 @@ def _anthropic_sse_bytes(text_content: str = "Hello world!") -> bytes:
     """Build synthetic Anthropic SSE stream bytes."""
     words = text_content.split(" ")
     lines = [
-        b'event: message_start',
+        b"event: message_start",
         (
             b'data: {"type":"message_start","message":{"id":"msg_xxx","type":"message",'
             b'"role":"assistant","content":[],"model":"claude-opus-4-5",'
             b'"stop_reason":null,"stop_sequence":null,'
             b'"usage":{"input_tokens":25,"output_tokens":1}}}'
         ),
-        b'',
-        b'event: content_block_start',
+        b"",
+        b"event: content_block_start",
         b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-        b'',
+        b"",
     ]
     for i, word in enumerate(words):
         sep = " " if i < len(words) - 1 else ""
         delta_text = word + sep
-        lines.append(b'event: content_block_delta')
+        lines.append(b"event: content_block_delta")
         lines.append(
-            json.dumps({"type": "content_block_delta", "index": 0,
-                        "delta": {"type": "text_delta", "text": delta_text}}).encode()
+            json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": delta_text},
+                }
+            )
+            .encode()
             .replace(b'"', b'"')
         )
-        lines.append(b'')
+        lines.append(b"")
     lines += [
-        b'event: content_block_stop',
+        b"event: content_block_stop",
         b'data: {"type":"content_block_stop","index":0}',
-        b'',
-        b'event: message_delta',
+        b"",
+        b"event: message_delta",
         b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}',
-        b'',
-        b'event: message_stop',
+        b"",
+        b"event: message_stop",
         b'data: {"type":"message_stop"}',
     ]
-    return b'\n'.join(lines)
+    return b"\n".join(lines)
 
 
 def test_sse_parsing_anthropic_text():
     """Anthropic SSE: text content blocks are reassembled correctly."""
-    sse = b"\n".join([
-        b'event: message_start',
-        b'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}',
-        b'',
-        b'event: content_block_start',
-        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-        b'',
-        b'event: content_block_delta',
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}',
-        b'',
-        b'event: content_block_delta',
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world!"}}',
-        b'',
-        b'event: content_block_stop',
-        b'data: {"type":"content_block_stop","index":0}',
-        b'',
-        b'event: message_delta',
-        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}',
-        b'',
-        b'event: message_stop',
-        b'data: {"type":"message_stop"}',
-    ])
+    sse = b"\n".join(
+        [
+            b"event: message_start",
+            b'data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}',
+            b"",
+            b"event: content_block_start",
+            b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            b"",
+            b"event: content_block_delta",
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}',
+            b"",
+            b"event: content_block_delta",
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world!"}}',
+            b"",
+            b"event: content_block_stop",
+            b'data: {"type":"content_block_stop","index":0}',
+            b"",
+            b"event: message_delta",
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}',
+            b"",
+            b"event: message_stop",
+            b'data: {"type":"message_stop"}',
+        ]
+    )
 
     events = _parse_sse_events(sse)
     # Should parse: message_start, content_block_start, 2x delta, content_block_stop, message_delta, message_stop
@@ -827,15 +894,17 @@ def test_sse_parsing_anthropic_text():
 
 def test_sse_parsing_anthropic_tool_use():
     """Anthropic SSE: tool_use blocks with input_json_delta reassemble correctly."""
-    sse = b"\n".join([
-        b'data: {"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":1}}}',
-        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_abc","name":"calculator","input":{}}}',
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"expr\\""}}',
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":": \\"2+2\\"}"}}',
-        b'data: {"type":"content_block_stop","index":0}',
-        b'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":50}}',
-        b'data: {"type":"message_stop"}',
-    ])
+    sse = b"\n".join(
+        [
+            b'data: {"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":1}}}',
+            b'data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_abc","name":"calculator","input":{}}}',
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"expr\\""}}',
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":": \\"2+2\\"}"}}',
+            b'data: {"type":"content_block_stop","index":0}',
+            b'data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":50}}',
+            b'data: {"type":"message_stop"}',
+        ]
+    )
 
     events = _parse_sse_events(sse)
     result = _reassemble_anthropic_sse(events)
@@ -852,14 +921,16 @@ def test_sse_parsing_anthropic_tool_use():
 
 def test_sse_parsing_anthropic_via_parse_sse_response():
     """_parse_sse_response dispatches to Anthropic reassembly for 'anthropic' format."""
-    sse = b"\n".join([
-        b'data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}}',
-        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
-        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}',
-        b'data: {"type":"content_block_stop","index":0}',
-        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}',
-        b'data: {"type":"message_stop"}',
-    ])
+    sse = b"\n".join(
+        [
+            b'data: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude-3","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":1}}}',
+            b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}',
+            b'data: {"type":"content_block_stop","index":0}',
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}',
+            b'data: {"type":"message_stop"}',
+        ]
+    )
     result = _parse_sse_response(sse, "anthropic")
     assert result is not None
     assert result["content"][0]["text"] == "Hi"
@@ -927,10 +998,7 @@ def test_sse_parsing_anthropic_via_parse_sse_response():
     ],
 )
 def test_anthropic_reassembly_rejects_overwrite_and_incomplete_tool_blocks(events):
-    raw = b"".join(
-        b"data:" + json.dumps(event).encode() + b"\n\n"
-        for event in events
-    )
+    raw = b"".join(b"data:" + json.dumps(event).encode() + b"\n\n" for event in events)
     with pytest.raises(SSEParseError):
         AnthropicProvider().reassemble_sse(raw)
 
@@ -942,16 +1010,20 @@ def test_anthropic_reassembly_rejects_overwrite_and_incomplete_tool_blocks(event
 
 def test_sse_parsing_openai_text():
     """OpenAI SSE: text content chunks reassemble correctly."""
-    sse = b"\n".join([
-        b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}',
-        b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}',
-        b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":" world!"},"finish_reason":null}]}',
-        b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}',
-        b'data: [DONE]',
-    ])
+    sse = b"\n".join(
+        [
+            b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}',
+            b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}',
+            b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":" world!"},"finish_reason":null}]}',
+            b'data: {"id":"chatcmpl-x","object":"chat.completion.chunk","created":1000,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}',
+            b"data: [DONE]",
+        ]
+    )
 
     events = _parse_sse_events(sse)
-    assert len(events) == 4, f"Expected 4 parsed chunks (ignoring [DONE]), got {len(events)}"
+    assert len(events) == 4, (
+        f"Expected 4 parsed chunks (ignoring [DONE]), got {len(events)}"
+    )
 
     result = _reassemble_openai_sse(events)
     assert result["id"] == "chatcmpl-x"
@@ -965,12 +1037,14 @@ def test_sse_parsing_openai_text():
 
 def test_sse_parsing_openai_tool_calls():
     """OpenAI SSE: tool_call arguments accumulate correctly across chunks."""
-    sse = b"\n".join([
-        b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"calculator","arguments":""}}]},"finish_reason":null}]}',
-        b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"expr\\""}}]},"finish_reason":null}]}',
-        b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": \\"2+2\\"}"}}]},"finish_reason":"tool_calls"}]}',
-        b'data: [DONE]',
-    ])
+    sse = b"\n".join(
+        [
+            b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"calculator","arguments":""}}]},"finish_reason":null}]}',
+            b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"expr\\""}}]},"finish_reason":null}]}',
+            b'data: {"id":"cc-y","object":"chat.completion.chunk","created":2000,"model":"gpt-4","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": \\"2+2\\"}"}}]},"finish_reason":"tool_calls"}]}',
+            b"data: [DONE]",
+        ]
+    )
 
     events = _parse_sse_events(sse)
     result = _reassemble_openai_sse(events)
@@ -988,21 +1062,20 @@ def test_sse_parsing_openai_tool_calls():
 
 def test_sse_parsing_openai_via_parse_sse_response():
     """_parse_sse_response dispatches to OpenAI reassembly for 'openai' format."""
-    sse = b"\n".join([
-        b'data: {"id":"cc-z","object":"chat.completion.chunk","created":3000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
-        b'data: {"id":"cc-z","object":"chat.completion.chunk","created":3000,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}}',
-        b'data: [DONE]',
-    ])
+    sse = b"\n".join(
+        [
+            b'data: {"id":"cc-z","object":"chat.completion.chunk","created":3000,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}',
+            b'data: {"id":"cc-z","object":"chat.completion.chunk","created":3000,"model":"gpt-4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1}}',
+            b"data: [DONE]",
+        ]
+    )
     result = _parse_sse_response(sse, "openai")
     assert result is not None
     assert result["choices"][0]["message"]["content"] == "Hi"
 
 
 def _responses_sse(*events: dict) -> bytes:
-    return b"".join(
-        b"data:" + json.dumps(event).encode() + b"\n\n"
-        for event in events
-    )
+    return b"".join(b"data:" + json.dumps(event).encode() + b"\n\n" for event in events)
 
 
 def test_openai_responses_final_event_cannot_erase_streamed_tool_call():
@@ -1080,13 +1153,15 @@ def test_openai_responses_rejects_final_tool_call_contradiction():
             "type": "response.completed",
             "response": {
                 "object": "response",
-                "output": [{
-                    "id": "fc_1",
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "calculator",
-                    "arguments": '{"expr":"2+2"}',
-                }],
+                "output": [
+                    {
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "calculator",
+                        "arguments": '{"expr":"2+2"}',
+                    }
+                ],
             },
         },
     )
@@ -1260,12 +1335,14 @@ def test_buffered_and_stream_audit_bodies_are_bounded():
 
 
 def test_decoded_response_headers_and_connection_nominated_headers_are_removed():
-    filtered = _filter_headers({
-        "Connection": "X-Internal, Keep-Alive",
-        "X-Internal": "must-not-cross",
-        "Keep-Alive": "timeout=5",
-        "Content-Type": "application/json",
-    })
+    filtered = _filter_headers(
+        {
+            "Connection": "X-Internal, Keep-Alive",
+            "X-Internal": "must-not-cross",
+            "Keep-Alive": "timeout=5",
+            "Content-Type": "application/json",
+        }
+    )
     assert "Connection" not in filtered
     assert "X-Internal" not in filtered
     assert "Keep-Alive" not in filtered
@@ -1378,10 +1455,7 @@ def test_proxy_rejects_duplicate_request_object_keys_before_forwarding():
             return "https", "api.openai.com", 443, "/v1/responses"
 
         def _read_body(self):
-            return (
-                b'{"model":"gpt-safe","model":"gpt-confused",'
-                b'"input":"hello"}'
-            )
+            return b'{"model":"gpt-safe","model":"gpt-confused","input":"hello"}'
 
         def _send_json_error(self, status, message, extra=None):
             self.error = (status, message, extra)
@@ -1561,13 +1635,20 @@ def test_request_and_response_events_are_written_together():
 
     run_id = uuid.uuid4().hex
     req_events, ctx = writer.build_request_events(
-        path="/v1/messages", method="POST",
-        req_headers={}, req_body=req_body, run_id=run_id,
+        path="/v1/messages",
+        method="POST",
+        req_headers={},
+        req_body=req_body,
+        run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/messages", req_body=req_body,
-        resp_status=200, resp_headers={}, resp_body=resp_body,
-        duration_ms=200, exchange_ctx=ctx,
+        path="/v1/messages",
+        req_body=req_body,
+        resp_status=200,
+        resp_headers={},
+        resp_body=resp_body,
+        duration_ms=200,
+        exchange_ctx=ctx,
     )
     writer.write(req_events + resp_events)
 
@@ -1626,26 +1707,36 @@ def test_undecodable_upstream_content_encoding_is_refused():
 def test_repeated_request_headers_are_combined():
     from panoptes.proxy import _merged_headers
 
-    merged = _merged_headers([
-        ("anthropic-beta", "beta-one"),
-        ("Anthropic-Beta", "beta-two"),
-        ("Cookie", "a=1"),
-        ("cookie", "b=2"),
-    ])
+    merged = _merged_headers(
+        [
+            ("anthropic-beta", "beta-one"),
+            ("Anthropic-Beta", "beta-two"),
+            ("Cookie", "a=1"),
+            ("cookie", "b=2"),
+        ]
+    )
     assert merged == {"anthropic-beta": "beta-one, beta-two", "Cookie": "a=1; b=2"}
 
 
 def test_usage_counts_cached_and_thinking_tokens():
     from panoptes.providers.gemini import GeminiProvider
 
-    usage = AnthropicProvider().extract_usage({"usage": {
-        "input_tokens": 3,
-        "cache_read_input_tokens": 90_000,
+    usage = AnthropicProvider().extract_usage(
+        {
+            "usage": {
+                "input_tokens": 3,
+                "cache_read_input_tokens": 90_000,
+                "cache_creation_input_tokens": 5_000,
+                "output_tokens": 7,
+            }
+        }
+    )
+    assert usage == {
+        "tokens_in": 95_003,
+        "tokens_out": 7,
+        "cached_input_tokens": 90_000,
         "cache_creation_input_tokens": 5_000,
-        "output_tokens": 7,
-    }})
-    assert usage == {"tokens_in": 95_003, "tokens_out": 7,
-                     "cached_input_tokens": 90_000, "cache_creation_input_tokens": 5_000}
+    }
 
     stream = (
         b'event: message_start\ndata: {"type":"message_start","message":{"id":"m",'
@@ -1658,39 +1749,80 @@ def test_usage_counts_cached_and_thinking_tokens():
     )
     message = _reassemble_anthropic_sse(_parse_sse_events(stream))
     assert AnthropicProvider().extract_usage(message) == {
-        "tokens_in": 23, "tokens_out": 9, "cached_input_tokens": 20,
+        "tokens_in": 23,
+        "tokens_out": 9,
+        "cached_input_tokens": 20,
     }
 
     gemini = GeminiProvider()
-    assert gemini.extract_usage({"usageMetadata": {
-        "promptTokenCount": 3, "candidatesTokenCount": 1, "thoughtsTokenCount": 500,
-    }}) == {"tokens_in": 3, "tokens_out": 501, "reasoning_tokens": 500}
-    assert gemini.extract_request_info(
-        {"contents": []},
-        path="/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
-    )["model"] == "gemini-2.5-pro"
+    assert gemini.extract_usage(
+        {
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 1,
+                "thoughtsTokenCount": 500,
+            }
+        }
+    ) == {"tokens_in": 3, "tokens_out": 501, "reasoning_tokens": 500}
+    assert (
+        gemini.extract_request_info(
+            {"contents": []},
+            path="/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+        )["model"]
+        == "gemini-2.5-pro"
+    )
 
 
 def test_optional_provider_usage_breakdowns_and_streaming():
-    from panoptes.providers.anthropic import AnthropicProvider, _reassemble_anthropic_sse
-    from panoptes.providers.openai import OpenAIProvider
-    from panoptes.providers.gemini import GeminiProvider
+    from panoptes.providers.anthropic import (
+        AnthropicProvider,
+        _reassemble_anthropic_sse,
+    )
     from panoptes.providers.base import _parse_sse_events
+    from panoptes.providers.gemini import GeminiProvider
+    from panoptes.providers.openai import OpenAIProvider
 
-    assert OpenAIProvider().extract_usage({"usage": {
-        "input_tokens": 10, "output_tokens": 8,
-        "input_tokens_details": {"cached_tokens": 4},
-        "output_tokens_details": {"reasoning_tokens": 5},
-    }}) == {"tokens_in": 10, "tokens_out": 8, "cached_input_tokens": 4, "reasoning_tokens": 5}
-    assert OpenAIProvider().extract_usage({"usage": {
-        "prompt_tokens": 10, "completion_tokens": 8,
-        "completion_tokens_details": {"reasoning_tokens": 0},
-    }})["reasoning_tokens"] == 0
-    assert "reasoning_tokens" not in GeminiProvider().extract_usage({"usageMetadata": {"thoughtsTokenCount": True}})
-    stream = (b'event: message_start\ndata: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
-              b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":6}}}\n\n'
-              b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
-    assert AnthropicProvider().extract_usage(_reassemble_anthropic_sse(_parse_sse_events(stream)))["reasoning_tokens"] == 6
+    assert OpenAIProvider().extract_usage(
+        {
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 8,
+                "input_tokens_details": {"cached_tokens": 4},
+                "output_tokens_details": {"reasoning_tokens": 5},
+            }
+        }
+    ) == {
+        "tokens_in": 10,
+        "tokens_out": 8,
+        "cached_input_tokens": 4,
+        "reasoning_tokens": 5,
+    }
+    assert (
+        OpenAIProvider().extract_usage(
+            {
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 8,
+                    "completion_tokens_details": {"reasoning_tokens": 0},
+                }
+            }
+        )["reasoning_tokens"]
+        == 0
+    )
+    assert "reasoning_tokens" not in GeminiProvider().extract_usage(
+        {"usageMetadata": {"thoughtsTokenCount": True}}
+    )
+    stream = (
+        b'event: message_start\ndata: {"type":"message_start","message":{"content":[],"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+        b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9,"output_tokens_details":{"thinking_tokens":6}}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    assert (
+        AnthropicProvider().extract_usage(
+            _reassemble_anthropic_sse(_parse_sse_events(stream))
+        )["reasoning_tokens"]
+        == 6
+    )
 
 
 def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
@@ -1698,8 +1830,10 @@ def test_thread_start_failure_rolls_back_resources_and_can_restart(monkeypatch):
 
     server = ProxyServer(port=0)
     with monkeypatch.context() as patch:
+
         def fail_start(thread):
             raise RuntimeError("thread launch failed")
+
         patch.setattr(threading.Thread, "start", fail_start)
         with pytest.raises(RuntimeError, match="thread launch failed"):
             server.start()

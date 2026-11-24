@@ -17,7 +17,7 @@ from .openai import OpenAIProvider
 # Ordered registry: first match wins.
 REGISTRY: list[Provider] = [
     AnthropicProvider(),
-    GeminiProvider(),   # before OpenAI — Gemini paths contain /v1beta/models/...
+    GeminiProvider(),  # before OpenAI — Gemini paths contain /v1beta/models/...
     OpenAIProvider(),
 ]
 

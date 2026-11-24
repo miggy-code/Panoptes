@@ -22,8 +22,10 @@ from panoptes.capture import HERMES_CAPABILITIES
 from panoptes.db import AuditDB
 from panoptes.schema import (
     redact_secrets,
-    utcnow_iso as _utcnow_iso,
     validate_identifier,
+)
+from panoptes.schema import (
+    utcnow_iso as _utcnow_iso,
 )
 
 DB_PATH = os.path.expanduser("~/.panoptes/audit.db")
@@ -107,8 +109,7 @@ class AuditPlugin:
             "turn": 0,
         }
         if (
-            requested_run_id is not None
-            and run_id != requested_run_id
+            requested_run_id is not None and run_id != requested_run_id
         ) or user_id != requested_user_id:
             log.warning("Replaced malformed Hermes lifecycle identity")
         return state
@@ -183,13 +184,8 @@ class AuditPlugin:
                     )
                 else:
                     state = self._new_session_state(context, session_id)
-                    if (
-                        raw_session_id is not None
-                        and session_id != raw_session_id
-                    ):
-                        log.warning(
-                            "Replaced malformed Hermes lifecycle session_id"
-                        )
+                    if raw_session_id is not None and session_id != raw_session_id:
+                        log.warning("Replaced malformed Hermes lifecycle session_id")
                     state = self._store_session_locked(state)
                 turn_number = state["turn"]
             run_id = state["run_id"]
@@ -273,9 +269,7 @@ class AuditPlugin:
                     "event_type": "agent_step",
                     "action": {
                         "tool_name": (
-                            valid_tool_names[0]
-                            if len(valid_tool_names) == 1
-                            else None
+                            valid_tool_names[0] if len(valid_tool_names) == 1 else None
                         ),
                         "tool_names": valid_tool_names,
                         "parameters": context.get("tool_input", {}) or {},
@@ -309,37 +303,39 @@ class AuditPlugin:
         def on_agent_end(context):
             state = self._resolve_session(context)
             try:
-                self._persist_lifecycle_event({
-                    "event_id": uuid.uuid4().hex,
-                    "timestamp": _utcnow_iso(),
-                    "agent": {
-                        "type": "hermes",
-                        "session_id": state["session_id"],
-                        "run_id": state["run_id"],
-                    },
-                    "event_type": "agent_end",
-                    "action": {
-                        "tool_name": None,
-                        "parameters": {},
-                        "target": None,
-                    },
-                    "outcome": {
-                        "status": context.get("outcome_status", "success"),
-                        "summary": _safe_text(context.get("response"), 200),
-                    },
-                    "context": {
-                        "turn_number": state.get("turn", 0),
-                        "total_turns": context.get("total_turns"),
-                        "capture": HERMES_CAPABILITIES.as_context(),
-                    },
-                    "cost": {
-                        "tokens_in": context.get("tokens_in", 0),
-                        "tokens_out": context.get("tokens_out", 0),
-                        "estimated_usd": context.get(
-                            "estimated_usd", context.get("total_cost")
-                        ),
-                    },
-                })
+                self._persist_lifecycle_event(
+                    {
+                        "event_id": uuid.uuid4().hex,
+                        "timestamp": _utcnow_iso(),
+                        "agent": {
+                            "type": "hermes",
+                            "session_id": state["session_id"],
+                            "run_id": state["run_id"],
+                        },
+                        "event_type": "agent_end",
+                        "action": {
+                            "tool_name": None,
+                            "parameters": {},
+                            "target": None,
+                        },
+                        "outcome": {
+                            "status": context.get("outcome_status", "success"),
+                            "summary": _safe_text(context.get("response"), 200),
+                        },
+                        "context": {
+                            "turn_number": state.get("turn", 0),
+                            "total_turns": context.get("total_turns"),
+                            "capture": HERMES_CAPABILITIES.as_context(),
+                        },
+                        "cost": {
+                            "tokens_in": context.get("tokens_in", 0),
+                            "tokens_out": context.get("tokens_out", 0),
+                            "estimated_usd": context.get(
+                                "estimated_usd", context.get("total_cost")
+                            ),
+                        },
+                    }
+                )
             finally:
                 with self._sessions_lock:
                     if self._sessions.get(state["session_id"]) is state:

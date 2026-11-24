@@ -10,13 +10,12 @@ from urllib.parse import urlparse
 from .base import (
     Provider,
     SSEParseError,
+    _optional_usage_counts,
     _parse_sse_events,
     _route_matches,
-    _usage_count,
-    _optional_usage_counts,
     _strict_json_loads,
+    _usage_count,
 )
-
 
 _ROUTES = (
     re.compile(r"/v1/chat/completions"),
@@ -25,36 +24,42 @@ _ROUTES = (
     re.compile(r"/v1/models(?:/[^/]+)?"),
 )
 
-_CLIENT_ACTION_OUTPUT_TYPES = frozenset({
-    "function_call",
-    "custom_tool_call",
-    "computer_call",
-    "local_shell_call",
-    "shell_call",
-    "apply_patch_call",
-})
-_SERVER_ACTION_OUTPUT_TYPES = frozenset({
-    "web_search_call",
-    "file_search_call",
-    "code_interpreter_call",
-    "image_generation_call",
-    "mcp_call",
-    "mcp_list_tools",
-    "mcp_approval_request",
-    "tool_search_call",
-})
-_ACTION_OUTPUT_TYPES = (
-    _CLIENT_ACTION_OUTPUT_TYPES | _SERVER_ACTION_OUTPUT_TYPES
+_CLIENT_ACTION_OUTPUT_TYPES = frozenset(
+    {
+        "function_call",
+        "custom_tool_call",
+        "computer_call",
+        "local_shell_call",
+        "shell_call",
+        "apply_patch_call",
+    }
 )
-_ACTION_RESULT_OUTPUT_TYPES = frozenset({
-    "shell_call_output",
-    "apply_patch_call_output",
-})
-_NON_ACTION_OUTPUT_TYPES = frozenset({
-    "message",
-    "reasoning",
-    "compaction",
-})
+_SERVER_ACTION_OUTPUT_TYPES = frozenset(
+    {
+        "web_search_call",
+        "file_search_call",
+        "code_interpreter_call",
+        "image_generation_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "tool_search_call",
+    }
+)
+_ACTION_OUTPUT_TYPES = _CLIENT_ACTION_OUTPUT_TYPES | _SERVER_ACTION_OUTPUT_TYPES
+_ACTION_RESULT_OUTPUT_TYPES = frozenset(
+    {
+        "shell_call_output",
+        "apply_patch_call_output",
+    }
+)
+_NON_ACTION_OUTPUT_TYPES = frozenset(
+    {
+        "message",
+        "reasoning",
+        "compaction",
+    }
+)
 
 
 def _decode_function_arguments(arguments: Any, *, source: str) -> dict:
@@ -156,9 +161,7 @@ def _extract_responses_action(item: dict, *, index: int) -> dict | None:
         # A new output-item type may be a new execution primitive. Treating it
         # as harmless would silently weaken enforcement until the adapter is
         # upgraded.
-        raise SSEParseError(
-            f"unsupported Responses output item type {item_type!r}"
-        )
+        raise SSEParseError(f"unsupported Responses output item type {item_type!r}")
 
     source = f"Responses {item_type} item {index}"
     if item_type in ("function_call", "custom_tool_call"):
@@ -172,9 +175,7 @@ def _extract_responses_action(item: dict, *, index: int) -> dict | None:
     if status is not None and not isinstance(status, str):
         raise SSEParseError(f"{source} status must be a string")
     execution_scope = (
-        "client"
-        if item_type in _CLIENT_ACTION_OUTPUT_TYPES
-        else "provider"
+        "client" if item_type in _CLIENT_ACTION_OUTPUT_TYPES else "provider"
     )
     if execution_scope == "client" or item_type == "mcp_approval_request":
         outcome_status = "pending"
@@ -200,11 +201,13 @@ def _extract_responses_action(item: dict, *, index: int) -> dict | None:
     # metadata is needed for non-function action types, where the proxy must
     # distinguish a client proposal from an already executed hosted tool.
     if item_type != "function_call":
-        action.update({
-            "execution_scope": execution_scope,
-            "provider_item_type": item_type,
-            "outcome_status": outcome_status,
-        })
+        action.update(
+            {
+                "execution_scope": execution_scope,
+                "provider_item_type": item_type,
+                "outcome_status": outcome_status,
+            }
+        )
     return action
 
 
@@ -276,8 +279,10 @@ class OpenAIProvider(Provider):
             )
         if "input" in body and "messages" not in body:
             value = body.get("input")
-            turns = value if isinstance(value, list) else (
-                [value] if value is not None else []
+            turns = (
+                value
+                if isinstance(value, list)
+                else ([value] if value is not None else [])
             )
             return body.get("instructions"), turns, names
         messages = body.get("messages")
@@ -285,7 +290,8 @@ class OpenAIProvider(Provider):
         turns = []
         for message in messages if isinstance(messages, list) else []:
             if isinstance(message, dict) and message.get("role") in (
-                "system", "developer",
+                "system",
+                "developer",
             ):
                 system.append(message.get("content"))
             else:
@@ -368,22 +374,25 @@ class OpenAIProvider(Provider):
                         paired_result = None
                     if action_type == "shell_call" and paired_result is not None:
                         result_status = paired_result["status"]
-                        action.update({
-                            "execution_scope": "provider",
-                            "outcome_status": (
-                                "error"
-                                if result_status in (
-                                    "failed",
-                                    "error",
-                                    "cancelled",
-                                )
-                                else "pending"
-                                if result_status in ("queued", "in_progress")
-                                else "success"
-                            ),
-                            "server_result": paired_result["result"],
-                            "server_result_type": paired_result["result_type"],
-                        })
+                        action.update(
+                            {
+                                "execution_scope": "provider",
+                                "outcome_status": (
+                                    "error"
+                                    if result_status
+                                    in (
+                                        "failed",
+                                        "error",
+                                        "cancelled",
+                                    )
+                                    else "pending"
+                                    if result_status in ("queued", "in_progress")
+                                    else "success"
+                                ),
+                                "server_result": paired_result["result"],
+                                "server_result_type": paired_result["result_type"],
+                            }
+                        )
                     events.append(action)
             if action_results:
                 raise SSEParseError(
@@ -421,11 +430,13 @@ class OpenAIProvider(Provider):
                     func.get("arguments", "{}"),
                     source=f"Chat Completions tool call {call_index}",
                 )
-                events.append({
-                    "tool_name": func.get("name", "unknown"),
-                    "parameters": params,
-                    "call_id": tc.get("id") or None,
-                })
+                events.append(
+                    {
+                        "tool_name": func.get("name", "unknown"),
+                        "parameters": params,
+                        "call_id": tc.get("id") or None,
+                    }
+                )
             legacy_call = message.get("function_call")
             if legacy_call is not None:
                 if tool_calls:
@@ -436,14 +447,16 @@ class OpenAIProvider(Provider):
                     raise SSEParseError(
                         "Chat Completions function_call must be an object"
                     )
-                events.append({
-                    "tool_name": legacy_call.get("name", "unknown"),
-                    "parameters": _decode_function_arguments(
-                        legacy_call.get("arguments", "{}"),
-                        source="Chat Completions legacy function call",
-                    ),
-                    "call_id": None,
-                })
+                events.append(
+                    {
+                        "tool_name": legacy_call.get("name", "unknown"),
+                        "parameters": _decode_function_arguments(
+                            legacy_call.get("arguments", "{}"),
+                            source="Chat Completions legacy function call",
+                        ),
+                        "call_id": None,
+                    }
+                )
         return events
 
     def extract_tool_results(self, req_body: dict) -> list[dict]:
@@ -477,25 +490,29 @@ class OpenAIProvider(Provider):
                 name = item.get("name")
                 if not isinstance(name, str) or not name:
                     name = result_types[item_type]
-                events.append({
-                    "tool_name": name,
-                    "result": item.get("output", ""),
-                    "call_id": call_id,
-                    "is_error": (
-                        status in ("failed", "error", "cancelled")
-                        or item.get("error") is not None
-                    ),
-                })
+                events.append(
+                    {
+                        "tool_name": name,
+                        "result": item.get("output", ""),
+                        "call_id": call_id,
+                        "is_error": (
+                            status in ("failed", "error", "cancelled")
+                            or item.get("error") is not None
+                        ),
+                    }
+                )
             if events:
                 return events
 
         for msg in req_body.get("messages", []):
             if isinstance(msg, dict) and msg.get("role") in ("tool", "function"):
-                events.append({
-                    "tool_name": msg.get("name", "unknown"),
-                    "result": msg.get("content", ""),
-                    "call_id": msg.get("tool_call_id") or None,
-                })
+                events.append(
+                    {
+                        "tool_name": msg.get("name", "unknown"),
+                        "result": msg.get("content", ""),
+                        "call_id": msg.get("tool_call_id") or None,
+                    }
+                )
         return events
 
     def extract_requested_tools(self, req_body: dict) -> dict[str, list[str]]:
@@ -532,16 +549,12 @@ class OpenAIProvider(Provider):
                 raise SSEParseError(f"OpenAI request tool {index} must be an object")
             tool_type = tool.get("type")
             if not isinstance(tool_type, str) or not tool_type:
-                raise SSEParseError(
-                    f"OpenAI request tool {index} is missing a type"
-                )
+                raise SSEParseError(f"OpenAI request tool {index} is missing a type")
             name = tool.get("name")
             if tool_type == "function" and isinstance(tool.get("function"), dict):
                 name = tool["function"].get("name", name)
             label = (
-                f"{tool_type}:{name}"
-                if isinstance(name, str) and name
-                else tool_type
+                f"{tool_type}:{name}" if isinstance(name, str) and name else tool_type
             )
             requested.append(label)
             if tool_type == "shell":
@@ -570,9 +583,7 @@ class OpenAIProvider(Provider):
                         targets.append(f"container_id:{container_id}")
                     network_policy = environment.get("network_policy")
                     if isinstance(network_policy, dict):
-                        allowed_domains = network_policy.get(
-                            "allowed_domains", []
-                        )
+                        allowed_domains = network_policy.get("allowed_domains", [])
                         if not isinstance(allowed_domains, list):
                             raise SSEParseError(
                                 "OpenAI shell allowed_domains must be a list"
@@ -607,14 +618,10 @@ class OpenAIProvider(Provider):
             raise SSEParseError("OpenAI request functions must be a list")
         for index, function in enumerate(legacy_functions):
             if not isinstance(function, dict):
-                raise SSEParseError(
-                    f"OpenAI legacy function {index} must be an object"
-                )
+                raise SSEParseError(f"OpenAI legacy function {index} must be an object")
             name = function.get("name")
             if not isinstance(name, str) or not name:
-                raise SSEParseError(
-                    f"OpenAI legacy function {index} is missing a name"
-                )
+                raise SSEParseError(f"OpenAI legacy function {index} is missing a name")
             label = f"function:{name}"
             requested.append(label)
             client_side.append(label)
@@ -632,16 +639,29 @@ class OpenAIProvider(Provider):
         if not isinstance(usage, dict):
             usage = {}
         responses = "input_tokens" in usage or "output_tokens" in usage
-        input_details = usage.get("input_tokens_details" if responses else "prompt_tokens_details")
-        output_details = usage.get("output_tokens_details" if responses else "completion_tokens_details")
+        input_details = usage.get(
+            "input_tokens_details" if responses else "prompt_tokens_details"
+        )
+        output_details = usage.get(
+            "output_tokens_details" if responses else "completion_tokens_details"
+        )
         return {
-            "tokens_in": _usage_count(usage, "input_tokens" if responses else "prompt_tokens"),
-            "tokens_out": _usage_count(usage, "output_tokens" if responses else "completion_tokens"),
-            **_optional_usage_counts(input_details, {
-                "cached_tokens": "cached_input_tokens",
-                "cache_write_tokens": "cache_creation_input_tokens",
-            }),
-            **_optional_usage_counts(output_details, {"reasoning_tokens": "reasoning_tokens"}),
+            "tokens_in": _usage_count(
+                usage, "input_tokens" if responses else "prompt_tokens"
+            ),
+            "tokens_out": _usage_count(
+                usage, "output_tokens" if responses else "completion_tokens"
+            ),
+            **_optional_usage_counts(
+                input_details,
+                {
+                    "cached_tokens": "cached_input_tokens",
+                    "cache_write_tokens": "cache_creation_input_tokens",
+                },
+            ),
+            **_optional_usage_counts(
+                output_details, {"reasoning_tokens": "reasoning_tokens"}
+            ),
         }
 
     def reassemble_sse(
@@ -654,8 +674,7 @@ class OpenAIProvider(Provider):
         if not events:
             raise SSEParseError("OpenAI SSE response contained no JSON data events")
         has_responses_shape = any(
-            str(event.get("type", "")).startswith("response.")
-            or "output" in event
+            str(event.get("type", "")).startswith("response.") or "output" in event
             for event in events
         )
         has_chat_shape = any("choices" in event for event in events)
@@ -771,11 +790,7 @@ def _merge_action_item(
         old = earlier.get(field)
         new = later.get(field)
         if old not in (None, "", [], {}) and new not in (None, "", [], {}):
-            equal = (
-                _arguments_equal(old, new)
-                if field == "arguments"
-                else old == new
-            )
+            equal = _arguments_equal(old, new) if field == "arguments" else old == new
             if not equal:
                 raise SSEParseError(
                     f"{source} contradicted {earlier_type} field {field!r}"
@@ -840,10 +855,7 @@ def _matching_final_action(
         if identity_matches:
             return identity_matches[0]
 
-    if (
-        index < len(final_output)
-        and final_output[index].get("type") == streamed_type
-    ):
+    if index < len(final_output) and final_output[index].get("type") == streamed_type:
         return index
     return None
 
@@ -864,11 +876,9 @@ def _reassemble_responses_sse(events: list[dict]) -> dict:
             partial = event.get("response")
             if not isinstance(partial, dict):
                 raise SSEParseError(f"{event_type} is missing a response object")
-            response.update({
-                key: value
-                for key, value in partial.items()
-                if key != "output"
-            })
+            response.update(
+                {key: value for key, value in partial.items() if key != "output"}
+            )
         elif event_type == "response.output_item.added":
             index = _output_index(event, len(streamed_output))
             item = event.get("item")
@@ -1029,9 +1039,10 @@ def _reassemble_responses_sse(events: list[dict]) -> dict:
             continue
         streamed_type = streamed.get("type")
         final_type = final_output[index].get("type")
-        if (
-            streamed_type not in (None, "")
-            and final_type not in (None, "", streamed_type)
+        if streamed_type not in (None, "") and final_type not in (
+            None,
+            "",
+            streamed_type,
         ):
             raise SSEParseError(
                 f"response.completed changed output type at index {index}"
@@ -1043,9 +1054,7 @@ def _reassemble_responses_sse(events: list[dict]) -> dict:
             continue
         match = _matching_final_action(streamed, index, final_output)
         if match is None:
-            completed_by_delta = (
-                index in arguments_done or index in custom_input_done
-            )
+            completed_by_delta = index in arguments_done or index in custom_input_done
             if index not in item_done and not completed_by_delta:
                 raise SSEParseError(
                     f"incomplete streamed action at output index {index}"
@@ -1108,14 +1117,10 @@ def _reassemble_openai_sse(chunks: list[dict]) -> dict:
             raise SSEParseError("Chat Completions stream choices must be a list")
         for choice in chunk_choices:
             if not isinstance(choice, dict):
-                raise SSEParseError(
-                    "Chat Completions stream choice must be an object"
-                )
+                raise SSEParseError("Chat Completions stream choice must be an object")
             idx = choice.get("index", 0)
             if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
-                raise SSEParseError(
-                    f"invalid Chat Completions choice index: {idx!r}"
-                )
+                raise SSEParseError(f"invalid Chat Completions choice index: {idx!r}")
             if idx not in choices:
                 choices[idx] = {
                     "index": idx,
@@ -1128,9 +1133,7 @@ def _reassemble_openai_sse(chunks: list[dict]) -> dict:
 
             delta = choice.get("delta", {})
             if not isinstance(delta, dict):
-                raise SSEParseError(
-                    "Chat Completions stream delta must be an object"
-                )
+                raise SSEParseError("Chat Completions stream delta must be an object")
             if delta.get("role"):
                 c["message"]["role"] = delta["role"]
             if delta.get("content"):
@@ -1138,13 +1141,13 @@ def _reassemble_openai_sse(chunks: list[dict]) -> dict:
                     raise SSEParseError(
                         "Chat Completions content delta must be a string"
                     )
-                c["message"]["content"] = (c["message"]["content"] or "") + delta["content"]
+                c["message"]["content"] = (c["message"]["content"] or "") + delta[
+                    "content"
+                ]
 
             tool_call_deltas = delta.get("tool_calls") or []
             if not isinstance(tool_call_deltas, list):
-                raise SSEParseError(
-                    "Chat Completions tool-call delta must be a list"
-                )
+                raise SSEParseError("Chat Completions tool-call delta must be a list")
             if tool_call_deltas and delta.get("function_call") is not None:
                 raise SSEParseError(
                     "Chat Completions delta contains both tool_calls and function_call"

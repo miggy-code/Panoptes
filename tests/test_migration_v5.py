@@ -36,7 +36,9 @@ def digest(path):
 def stored_versions(path):
     conn = sqlite3.connect(path)
     try:
-        return [r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1")]
+        return [
+            r[0] for r in conn.execute("SELECT version FROM schema_version ORDER BY 1")
+        ]
     finally:
         conn.close()
 
@@ -45,10 +47,14 @@ def stored_versions(path):
 def test_fixtures_really_are_schema_v4(name):
     conn = sqlite3.connect(f"{(FIXTURES / name).as_uri()}?mode=ro", uri=True)
     try:
-        assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 4
+        assert (
+            conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 4
+        )
         columns = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
         assert not columns & {"correlation_id", "parent_run_id", "attributes"}
-        count, chained = conn.execute("SELECT COUNT(*), COUNT(event_hash) FROM events").fetchone()
+        count, chained = conn.execute(
+            "SELECT COUNT(*), COUNT(event_hash) FROM events"
+        ).fetchone()
         assert count == chained == V4_FIXTURES[name]
     finally:
         conn.close()
@@ -85,7 +91,9 @@ def test_migrated_rows_are_unchanged_and_read_with_empty_v5_fields(tmp_path, nam
     try:
         events = db.query(limit=1000)
         assert len(events) == len(expected)
-        assert all(e["correlation_id"] is None and e["attributes"] == {} for e in events)
+        assert all(
+            e["correlation_id"] is None and e["attributes"] == {} for e in events
+        )
         assert all(e["agent"].get("parent_run_id") is None for e in events)
     finally:
         db.close()
@@ -104,24 +112,28 @@ def test_v5_events_append_to_a_migrated_v4_chain(tmp_path, name):
     db = AuditDB(str(path))
     try:
         before = db.get_chain_checkpoint()
-        db.insert_event({
-            "event_id": "after-migration",
-            "timestamp": "2026-11-02T12:00:00.000Z",
-            "event_type": "agentgate.allow",
-            "agent": {"type": "agentgate", "session_id": "s", "parent_run_id": "p"},
-            "correlation_id": "corr-new",
-            "attributes": {"reason": "ok"},
-            "action": {},
-            "outcome": {"status": "success"},
-            "context": {},
-        })
+        db.insert_event(
+            {
+                "event_id": "after-migration",
+                "timestamp": "2026-11-02T12:00:00.000Z",
+                "event_type": "agentgate.allow",
+                "agent": {"type": "agentgate", "session_id": "s", "parent_run_id": "p"},
+                "correlation_id": "corr-new",
+                "attributes": {"reason": "ok"},
+                "action": {},
+                "outcome": {"status": "success"},
+                "context": {},
+            }
+        )
         verification = db.verify_chain()
         assert verification["valid"], verification
         assert verification["event_count"] == before["event_count"] + 1
         # The checkpoint taken before the upgrade is still an exact prefix.
         prefix = db.verify_checkpoint(before)
         assert prefix["valid"] and prefix["appended_events"] == 1
-        assert [e["event_id"] for e in db.query(correlation_id="corr-new")] == ["after-migration"]
+        assert [e["event_id"] for e in db.query(correlation_id="corr-new")] == [
+            "after-migration"
+        ]
     finally:
         db.close()
 
@@ -160,12 +172,19 @@ def test_tampering_with_a_migrated_v4_row_is_still_detected(tmp_path, name):
 
 def test_stripping_a_v5_field_from_a_row_breaks_the_chain(tmp_path):
     db = AuditDB(str(tmp_path / "v5.db"))
-    db.insert_event({
-        "event_id": "e1", "timestamp": "2026-11-02T10:00:00.000Z",
-        "event_type": "agent_step", "agent": {"type": "t", "session_id": "s"},
-        "action": {"tool_names": []}, "outcome": {"status": "success"},
-        "context": {}, "correlation_id": "corr", "attributes": {"a": 1},
-    })
+    db.insert_event(
+        {
+            "event_id": "e1",
+            "timestamp": "2026-11-02T10:00:00.000Z",
+            "event_type": "agent_step",
+            "agent": {"type": "t", "session_id": "s"},
+            "action": {"tool_names": []},
+            "outcome": {"status": "success"},
+            "context": {},
+            "correlation_id": "corr",
+            "attributes": {"a": 1},
+        }
+    )
     assert db.verify_chain()["valid"]
     db.close()
     for statement in (

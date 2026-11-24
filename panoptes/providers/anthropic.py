@@ -9,11 +9,11 @@ from typing import Any
 from .base import (
     Provider,
     SSEParseError,
+    _optional_usage_counts,
     _parse_sse_events,
     _route_matches,
     _strict_json_loads,
     _usage_count,
-    _optional_usage_counts,
 )
 
 _ROUTES = (
@@ -29,23 +29,29 @@ _INPUT_USAGE_FIELDS = (
 # ``cache_creation`` splits cache_creation_input_tokens by TTL
 # (ephemeral_5m_input_tokens / ephemeral_1h_input_tokens), which bill differently.
 _USAGE_FIELDS = _INPUT_USAGE_FIELDS + (
-    "cache_creation", "output_tokens", "output_tokens_details",
+    "cache_creation",
+    "output_tokens",
+    "output_tokens_details",
 )
 
 
-_SERVER_RESULT_TYPES = frozenset({
-    "web_search_tool_result",
-    "web_fetch_tool_result",
-    "code_execution_tool_result",
-    "bash_code_execution_tool_result",
-    "text_editor_code_execution_tool_result",
-    "tool_search_tool_result",
-})
-_BENIGN_CONTENT_TYPES = frozenset({
-    "text",
-    "thinking",
-    "redacted_thinking",
-})
+_SERVER_RESULT_TYPES = frozenset(
+    {
+        "web_search_tool_result",
+        "web_fetch_tool_result",
+        "code_execution_tool_result",
+        "bash_code_execution_tool_result",
+        "text_editor_code_execution_tool_result",
+        "tool_search_tool_result",
+    }
+)
+_BENIGN_CONTENT_TYPES = frozenset(
+    {
+        "text",
+        "thinking",
+        "redacted_thinking",
+    }
+)
 
 
 def _anthropic_index(event: dict) -> int:
@@ -156,7 +162,10 @@ class AnthropicProvider(Provider):
 
         for index, block in enumerate(content):
             block_type = block["type"]
-            if block_type in _BENIGN_CONTENT_TYPES or block_type in _SERVER_RESULT_TYPES:
+            if (
+                block_type in _BENIGN_CONTENT_TYPES
+                or block_type in _SERVER_RESULT_TYPES
+            ):
                 continue
             if block_type not in ("tool_use", "server_tool_use"):
                 raise SSEParseError(
@@ -172,9 +181,7 @@ class AnthropicProvider(Provider):
             )
             parameters = block.get("input", {})
             if not isinstance(parameters, dict):
-                raise SSEParseError(
-                    f"Anthropic {block_type} input must be an object"
-                )
+                raise SSEParseError(f"Anthropic {block_type} input must be an object")
             event = {
                 "tool_name": name,
                 "parameters": parameters,
@@ -182,19 +189,23 @@ class AnthropicProvider(Provider):
             }
             if block_type == "server_tool_use":
                 result = results.get(call_id)
-                event.update({
-                    "execution_scope": "provider",
-                    "provider_item_type": block_type,
-                    "outcome_status": (
-                        "error"
-                        if result and result["is_error"]
-                        else "success" if result else "pending"
-                    ),
-                    "server_result": result["result"] if result else None,
-                    "server_result_type": (
-                        result["result_type"] if result else None
-                    ),
-                })
+                event.update(
+                    {
+                        "execution_scope": "provider",
+                        "provider_item_type": block_type,
+                        "outcome_status": (
+                            "error"
+                            if result and result["is_error"]
+                            else "success"
+                            if result
+                            else "pending"
+                        ),
+                        "server_result": result["result"] if result else None,
+                        "server_result_type": (
+                            result["result_type"] if result else None
+                        ),
+                    }
+                )
             events.append(event)
         return events
 
@@ -217,14 +228,16 @@ class AnthropicProvider(Provider):
                             raise SSEParseError(
                                 "Anthropic tool_result is_error must be a boolean"
                             )
-                        events.append({
-                            # The wire block correlates by ID but does not
-                            # repeat the original tool name.
-                            "tool_name": "unknown",
-                            "result": block.get("content", ""),
-                            "call_id": block.get("tool_use_id") or None,
-                            "is_error": is_error,
-                        })
+                        events.append(
+                            {
+                                # The wire block correlates by ID but does not
+                                # repeat the original tool name.
+                                "tool_name": "unknown",
+                                "result": block.get("content", ""),
+                                "call_id": block.get("tool_use_id") or None,
+                                "is_error": is_error,
+                            }
+                        )
         return events
 
     def extract_requested_tools(self, req_body: dict) -> dict[str, list[str]]:
@@ -249,9 +262,7 @@ class AnthropicProvider(Provider):
             raise SSEParseError("Anthropic request tools must be a list")
         for index, tool in enumerate(tools):
             if not isinstance(tool, dict):
-                raise SSEParseError(
-                    f"Anthropic request tool {index} must be an object"
-                )
+                raise SSEParseError(f"Anthropic request tool {index} must be an object")
             raw_type = tool.get("type")
             name = tool.get("name")
             if raw_type is None:
@@ -267,9 +278,7 @@ class AnthropicProvider(Provider):
             else:
                 tool_type = raw_type
             label = (
-                f"{tool_type}:{name}"
-                if isinstance(name, str) and name
-                else tool_type
+                f"{tool_type}:{name}" if isinstance(name, str) and name else tool_type
             )
             requested.append(label)
             if tool_type == "function" or tool_type.startswith(client_prefixes):
@@ -299,19 +308,32 @@ class AnthropicProvider(Provider):
                 _usage_count(usage, field) for field in _INPUT_USAGE_FIELDS
             ),
             "tokens_out": _usage_count(usage, "output_tokens"),
-            **_optional_usage_counts(usage, {
-                "cache_read_input_tokens": "cached_input_tokens",
-                "cache_creation_input_tokens": "cache_creation_input_tokens",
-            }),
-            **_optional_usage_counts(usage.get("cache_creation") if isinstance(usage, dict) else None, {
-                # Both halves of the TTL split are kept so pricing can check they sum to the total.
-                "ephemeral_5m_input_tokens": "cache_creation_5m_input_tokens",
-                "ephemeral_1h_input_tokens": "cache_creation_1h_input_tokens",
-            }),
-            **_optional_usage_counts(usage.get("output_tokens_details") if isinstance(usage, dict) else None, {
-                "thinking_tokens": "reasoning_tokens",
-            }),
-            **({"cache_creation_split_invalid": True} if _split_is_malformed(usage) else {}),
+            **_optional_usage_counts(
+                usage,
+                {
+                    "cache_read_input_tokens": "cached_input_tokens",
+                    "cache_creation_input_tokens": "cache_creation_input_tokens",
+                },
+            ),
+            **_optional_usage_counts(
+                usage.get("cache_creation") if isinstance(usage, dict) else None,
+                {
+                    # Both halves of the TTL split are kept so pricing can check they sum to the total.
+                    "ephemeral_5m_input_tokens": "cache_creation_5m_input_tokens",
+                    "ephemeral_1h_input_tokens": "cache_creation_1h_input_tokens",
+                },
+            ),
+            **_optional_usage_counts(
+                usage.get("output_tokens_details") if isinstance(usage, dict) else None,
+                {
+                    "thinking_tokens": "reasoning_tokens",
+                },
+            ),
+            **(
+                {"cache_creation_split_invalid": True}
+                if _split_is_malformed(usage)
+                else {}
+            ),
         }
 
     def reassemble_sse(
@@ -338,7 +360,8 @@ def _split_is_malformed(usage: Any) -> bool:
         return True
     return any(
         isinstance(value := split.get(key), bool)
-        or not isinstance(value, int) or value < 0
+        or not isinstance(value, int)
+        or value < 0
         for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
     )
 
@@ -378,9 +401,7 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
         elif ev_type == "content_block_start":
             index = _anthropic_index(ev)
             if index in content_blocks:
-                raise SSEParseError(
-                    f"duplicate content_block_start for index {index}"
-                )
+                raise SSEParseError(f"duplicate content_block_start for index {index}")
             block = ev.get("content_block", {})
             if not isinstance(block, dict):
                 raise SSEParseError("content_block_start is missing a content block")
@@ -397,9 +418,7 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
                 thinking = block.get("thinking", "")
                 signature = block.get("signature", "")
                 if not isinstance(thinking, str) or not isinstance(signature, str):
-                    raise SSEParseError(
-                        "Anthropic thinking fields must be strings"
-                    )
+                    raise SSEParseError("Anthropic thinking fields must be strings")
                 cb["thinking"] = thinking
                 cb["signature"] = signature
             elif block_type == "redacted_thinking":
@@ -486,9 +505,7 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
                     f"content_block_stop references unknown index {index}"
                 )
             if index in stopped_blocks:
-                raise SSEParseError(
-                    f"duplicate content_block_stop for index {index}"
-                )
+                raise SSEParseError(f"duplicate content_block_stop for index {index}")
             cb = content_blocks[index]
             if "_fragments" in cb:
                 full_json = "".join(cb["_fragments"])
@@ -532,9 +549,7 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
         elif ev_type == "error":
             raise SSEParseError("Anthropic stream reported an error event")
         else:
-            raise SSEParseError(
-                f"unsupported Anthropic stream event type: {ev_type!r}"
-            )
+            raise SSEParseError(f"unsupported Anthropic stream event type: {ev_type!r}")
 
     incomplete = sorted(set(content_blocks) - stopped_blocks)
     if incomplete:
@@ -550,23 +565,29 @@ def _reassemble_anthropic_sse(events: list[dict]) -> dict:
         if cb.get("type") == "text":
             assembled.append({"type": "text", "text": cb.get("text", "")})
         elif cb.get("type") == "thinking":
-            assembled.append({
-                "type": "thinking",
-                "thinking": cb.get("thinking", ""),
-                "signature": cb.get("signature", ""),
-            })
+            assembled.append(
+                {
+                    "type": "thinking",
+                    "thinking": cb.get("thinking", ""),
+                    "signature": cb.get("signature", ""),
+                }
+            )
         elif cb.get("type") == "redacted_thinking":
-            assembled.append({
-                "type": "redacted_thinking",
-                "data": cb.get("data", ""),
-            })
+            assembled.append(
+                {
+                    "type": "redacted_thinking",
+                    "data": cb.get("data", ""),
+                }
+            )
         elif cb.get("type") in ("tool_use", "server_tool_use"):
-            assembled.append({
-                "type": cb["type"],
-                "id": cb.get("id", ""),
-                "name": cb.get("name", ""),
-                "input": cb.get("input", {}),
-            })
+            assembled.append(
+                {
+                    "type": cb["type"],
+                    "id": cb.get("id", ""),
+                    "name": cb.get("name", ""),
+                    "input": cb.get("input", {}),
+                }
+            )
         elif cb.get("type") in _SERVER_RESULT_TYPES:
             assembled.append(dict(cb))
     message["content"] = assembled

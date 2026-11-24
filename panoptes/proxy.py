@@ -46,15 +46,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised in a subproce
         name="httpx",
     ) from exc
 
-from panoptes._hooked import (
-    HookedExchangeMixin,
-    _answer_if_client_present,
-    _ExchangeRun,
-    _may_have_reached_upstream,
-    _report_of,
-    _start_drain_timer,
-    _upstream_url,
-)
+import panoptes.providers as _providers
 from panoptes._events import (  # noqa: F401 — re-exported for callers
     DEFAULT_MAX_TOOL_EVENTS_PER_EXCHANGE,
     AmbiguousResponseError,
@@ -66,6 +58,15 @@ from panoptes._events import (  # noqa: F401 — re-exported for callers
     _parse_sse_response,
     detect_agent_type,
 )
+from panoptes._hooked import (
+    HookedExchangeMixin,
+    _answer_if_client_present,
+    _ExchangeRun,
+    _may_have_reached_upstream,
+    _report_of,
+    _start_drain_timer,
+    _upstream_url,
+)
 from panoptes._server import BoundedThreadingHTTPServer
 from panoptes.db import AuditDB
 from panoptes.hooks import (
@@ -73,15 +74,13 @@ from panoptes.hooks import (
     ProxyHooks,
     Upstream,
 )
-from panoptes.schema import (
-    ValidationError,
-)
-
-import panoptes.providers as _providers
 from panoptes.providers.base import (
     SSEParseError,
     _parse_sse_events,  # noqa: F401 — re-exported for callers
     _strict_json_loads,
+)
+from panoptes.schema import (
+    ValidationError,
 )
 
 # ---------------------------------------------------------------------------
@@ -103,6 +102,7 @@ DEFAULT_DISCONNECT_DRAIN_SECONDS = 30.0
 DEFAULT_HOOK_SLOW_SECONDS = 5.0
 # stop() waits this long for in-flight exchanges (the upstream read timeout).
 _STOP_GRACE_SECONDS = 120.0
+
 
 def _is_loopback_bind_host(host: str) -> bool:
     """Return whether ``host`` is an explicit loopback bind target."""
@@ -172,7 +172,9 @@ class UpstreamBodyTooLarge(RuntimeError):
         self.upstream_headers = upstream_headers or {}
 
 
-def _parse_upstream_url(url: str, default_scheme: str = "https") -> tuple[str, str, int]:
+def _parse_upstream_url(
+    url: str, default_scheme: str = "https"
+) -> tuple[str, str, int]:
     """Parse and validate a configured upstream URL.
 
     Only HTTP(S) upstreams without embedded credentials, query strings, or
@@ -184,7 +186,9 @@ def _parse_upstream_url(url: str, default_scheme: str = "https") -> tuple[str, s
     p = urlparse(candidate)
     scheme = p.scheme.lower()
     if scheme not in ("http", "https"):
-        raise NoUpstreamError(f"Unsupported upstream URL scheme: {scheme or '<missing>'}")
+        raise NoUpstreamError(
+            f"Unsupported upstream URL scheme: {scheme or '<missing>'}"
+        )
     if p.username is not None or p.password is not None:
         raise NoUpstreamError("Upstream URLs must not contain credentials")
     if p.query or p.fragment:
@@ -205,16 +209,28 @@ def _parse_upstream_url(url: str, default_scheme: str = "https") -> tuple[str, s
 # HTTP proxy handler
 # ---------------------------------------------------------------------------
 
-HOP_BY_HOP = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "proxy-connection", "te", "trailer", "trailers", "transfer-encoding",
-    "upgrade",
-})
-PANOPTES_INTERNAL_HEADERS = frozenset({
-    "x-panoptes-agent",
-    "x-panoptes-session",
-    "x-panoptes-correlation-id",
-})
+HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+PANOPTES_INTERNAL_HEADERS = frozenset(
+    {
+        "x-panoptes-agent",
+        "x-panoptes-session",
+        "x-panoptes-correlation-id",
+    }
+)
+
 
 def _strip_query_credentials(
     path: str,
@@ -291,9 +307,7 @@ def _filter_headers(headers: dict[str, str]) -> dict[str, str]:
         if key.lower() != "connection":
             continue
         connection_nominated.update(
-            token.strip().lower()
-            for token in str(value).split(",")
-            if token.strip()
+            token.strip().lower() for token in str(value).split(",") if token.strip()
         )
     blocked = HOP_BY_HOP | connection_nominated
     return {k: v for k, v in headers.items() if k.lower() not in blocked}
@@ -405,9 +419,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         safe_path = urlparse(raw_path).path or "/"
         if raw_path and raw_path != safe_path:
             safe_args = [
-                value.replace(raw_path, safe_path)
-                if isinstance(value, str)
-                else value
+                value.replace(raw_path, safe_path) if isinstance(value, str) else value
                 for value in safe_args
             ]
         log.info(fmt % tuple(safe_args))
@@ -452,9 +464,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 return s, h, p, path
 
         safe_path = urlparse(path).path or "/"
-        raise NoUpstreamError(
-            f"No supported provider route for path '{safe_path}'"
-        )
+        raise NoUpstreamError(f"No supported provider route for path '{safe_path}'")
 
     # ------------------------------------------------------------------
     # Request body
@@ -490,20 +500,18 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         if content_length < 0:
             raise RequestFramingError("Content-Length must not be negative")
 
-        limit = getattr(
-            self, "max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES
-        )
+        limit = getattr(self, "max_request_body_bytes", DEFAULT_MAX_REQUEST_BODY_BYTES)
         if content_length > limit:
-            raise RequestBodyTooLarge(
-                f"Request body exceeds the {limit}-byte limit"
-            )
+            raise RequestBodyTooLarge(f"Request body exceeds the {limit}-byte limit")
         if content_length == 0:
             return b""
 
         try:
             body = self.rfile.read(content_length)
         except OSError as exc:
-            raise RequestFramingError("Failed to read the complete request body") from exc
+            raise RequestFramingError(
+                "Failed to read the complete request body"
+            ) from exc
         if len(body) != content_length:
             raise RequestFramingError(
                 "Request body ended before the declared Content-Length"
@@ -563,13 +571,9 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 response_headers = dict(resp.headers)
                 _check_content_encoding(resp.headers)
                 content_lengths = _header_values(resp.headers, "Content-Length")
-                transfer_encodings = _header_values(
-                    resp.headers, "Transfer-Encoding"
-                )
+                transfer_encodings = _header_values(resp.headers, "Transfer-Encoding")
                 if content_lengths and transfer_encodings:
-                    raise ResponseInspectionError(
-                        "Ambiguous upstream response framing"
-                    )
+                    raise ResponseInspectionError("Ambiguous upstream response framing")
                 if len(content_lengths) > 1:
                     raise ResponseInspectionError(
                         "Multiple upstream Content-Length headers"
@@ -630,16 +634,28 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             log.error("Upstream timeout: %s %s", method, safe_label)
             report.upstream_error = True
             report.request_sent |= _may_have_reached_upstream(exc)
-            return 504, {"content-type": "application/json"}, json.dumps({"error": "Gateway Timeout"}).encode()
+            return (
+                504,
+                {"content-type": "application/json"},
+                json.dumps({"error": "Gateway Timeout"}).encode(),
+            )
         except httpx.ConnectError:
             log.error("Upstream connect error: %s %s", method, safe_label)
             report.upstream_error = True
-            return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
+            return (
+                502,
+                {"content-type": "application/json"},
+                json.dumps({"error": "Bad Gateway"}).encode(),
+            )
         except Exception as exc:
             log.exception("Upstream error: %s %s", method, safe_label)
             report.upstream_error = True
             report.request_sent |= _may_have_reached_upstream(exc)
-            return 502, {"content-type": "application/json"}, json.dumps({"error": "Bad Gateway"}).encode()
+            return (
+                502,
+                {"content-type": "application/json"},
+                json.dumps({"error": "Bad Gateway"}).encode(),
+            )
         finally:
             if owned:
                 client.close()
@@ -680,14 +696,14 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         response_started = False
 
         try:
-            with client.stream(method, upstream_url, headers=fwd_headers, content=body) as resp:
+            with client.stream(
+                method, upstream_url, headers=fwd_headers, content=body
+            ) as resp:
                 report.request_sent = report.answered = True
                 report.upstream_status = resp.status_code
                 _check_content_encoding(resp.headers)
                 # Send status and headers to client (strip Content-Length — unknown)
-                resp_headers = _decoded_body_headers(
-                    dict(resp.headers), streaming=True
-                )
+                resp_headers = _decoded_body_headers(dict(resp.headers), streaming=True)
                 self.send_response(resp.status_code)
                 for k, v in resp_headers.items():
                     self.send_header(k, v)
@@ -785,7 +801,9 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
     # Response helpers
     # ------------------------------------------------------------------
 
-    def _send_json_error(self, status: int, message: str, extra: dict | None = None) -> None:
+    def _send_json_error(
+        self, status: int, message: str, extra: dict | None = None
+    ) -> None:
         body: dict[str, Any] = {"error": message}
         if extra:
             body.update(extra)
@@ -862,7 +880,9 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         if writer:
             try:
                 req_events, exchange_ctx = writer.build_request_events(
-                    path=path, method=method, req_headers=req_headers,
+                    path=path,
+                    method=method,
+                    req_headers=req_headers,
                     req_body=req_body,
                     hook_mode=hooks is not None,
                 )
@@ -877,10 +897,16 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 log.exception("Request event construction failed — continuing")
             if hooks is not None:
                 run = self._enter_exchange(
-                    method=method, path=path, raw_path=raw_path,
-                    target=(scheme, host, port), req_headers=req_headers,
-                    body=body, req_body=req_body, req_events=req_events,
-                    exchange_ctx=exchange_ctx, query_credentials=query_credentials,
+                    method=method,
+                    path=path,
+                    raw_path=raw_path,
+                    target=(scheme, host, port),
+                    req_headers=req_headers,
+                    body=body,
+                    req_body=req_body,
+                    req_events=req_events,
+                    exchange_ctx=exchange_ctx,
+                    query_credentials=query_credentials,
                     t0=t0,
                 )
                 if not self._run_before_forward(run):
@@ -904,9 +930,17 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             else self._handle_buffered
         )
         handler(
-            method=method, scheme=scheme, host=host, port=port, path=path,
-            req_headers=req_headers, body=body, req_body=req_body,
-            req_events=req_events, exchange_ctx=exchange_ctx, t0=t0,
+            method=method,
+            scheme=scheme,
+            host=host,
+            port=port,
+            path=path,
+            req_headers=req_headers,
+            body=body,
+            req_body=req_body,
+            req_events=req_events,
+            exchange_ctx=exchange_ctx,
+            t0=t0,
         )
 
     def _handle_streaming(
@@ -928,7 +962,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         writer = self.writer
         resp_status, resp_headers_raw, accumulated, audit_truncated = (
             self._forward_streaming(
-                method, scheme, host, port, path, req_headers, body,
+                method,
+                scheme,
+                host,
+                port,
+                path,
+                req_headers,
+                body,
             )
         )
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -959,9 +999,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
 
         try:
             resp_events = writer.build_response_events(
-                path=path, req_body=req_body, resp_status=resp_status,
-                resp_headers=resp_headers_raw, resp_body=resp_body,
-                duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+                path=path,
+                req_body=req_body,
+                resp_status=resp_status,
+                resp_headers=resp_headers_raw,
+                resp_body=resp_body,
+                duration_ms=duration_ms,
+                exchange_ctx=exchange_ctx,
             )
             if inspection_error:
                 _mark_inspection_failure(
@@ -972,14 +1016,14 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 )
             if run is not None:
                 self._note_response(
-                    resp_events, exchange_ctx, resp_body,
+                    resp_events,
+                    exchange_ctx,
+                    resp_body,
                     read_in_full=not audit_truncated,
                     inspection_error=inspection_error,
                 )
             writer.write(
-                _unpersisted_exchange_events(
-                    req_events, resp_events, exchange_ctx
-                )
+                _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
             )
         except ValidationError as exc:
             message = (
@@ -1007,9 +1051,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             except Exception:
                 log.exception("Failed to persist streaming audit fallback")
         except AuditWriteError:
-            log.exception(
-                "Pass-through response audit was not durable after delivery"
-            )
+            log.exception("Pass-through response audit was not durable after delivery")
         except Exception:
             log.exception("Failed to process streaming audit events — continuing")
 
@@ -1040,9 +1082,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             truncated: bool = False,
         ) -> list[dict]:
             events = writer.build_response_events(
-                path=path, req_body=req_body, resp_status=status,
-                resp_headers=headers, resp_body=None,
-                duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+                path=path,
+                req_body=req_body,
+                resp_status=status,
+                resp_headers=headers,
+                resp_body=None,
+                duration_ms=duration_ms,
+                exchange_ctx=exchange_ctx,
             )
             _mark_inspection_failure(
                 events, message, blocked=blocked, truncated=truncated
@@ -1051,7 +1097,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
 
         try:
             resp_status, resp_headers_raw, resp_body_bytes = self._forward_request(
-                method, scheme, host, port, path, req_headers, body,
+                method,
+                scheme,
+                host,
+                port,
+                path,
+                req_headers,
+                body,
             )
         except UpstreamBodyTooLarge as exc:
             duration_ms = int((time.monotonic() - t0) * 1000)
@@ -1064,7 +1116,9 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 resp_events = build_inspection_failure(
                     message,
                     status=exc.upstream_status or 502,
-                    headers=exc.upstream_headers, blocked=True, truncated=True,
+                    headers=exc.upstream_headers,
+                    blocked=True,
+                    truncated=True,
                 )
                 try:
                     writer.write(
@@ -1073,9 +1127,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                         )
                     )
                 except AuditWriteError:
-                    log.exception(
-                        "Oversized-response denial audit was not durable"
-                    )
+                    log.exception("Oversized-response denial audit was not durable")
             self._send_json_error(
                 502,
                 message,
@@ -1109,27 +1161,27 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             )
             resp_events = build_inspection_failure(
                 f"{message}: {inspection_error}",
-                status=resp_status, headers=resp_headers_raw, blocked=True,
+                status=resp_status,
+                headers=resp_headers_raw,
+                blocked=True,
             )
             resp_status = 502
-            resp_body_bytes = json.dumps({
-                "error": message,
-                "inspection_error": True,
-            }).encode()
+            resp_body_bytes = json.dumps(
+                {
+                    "error": message,
+                    "inspection_error": True,
+                }
+            ).encode()
             resp_headers_raw = {
                 "content-type": "application/json",
                 "x-panoptes-inspection-blocked": "true",
             }
             try:
                 writer.write(  # type: ignore[union-attr]
-                    _unpersisted_exchange_events(
-                        req_events, resp_events, exchange_ctx
-                    )
+                    _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
                 )
             except AuditWriteError:
-                log.exception(
-                    "Uninspectable-response denial audit was not durable"
-                )
+                log.exception("Uninspectable-response denial audit was not durable")
             inspection_error = None  # denial has already been persisted
             writer = None  # nothing further to record for an opaque body
 
@@ -1137,9 +1189,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             resp_events: list[dict] = []
             try:
                 resp_events = writer.build_response_events(
-                    path=path, req_body=req_body, resp_status=resp_status,
-                    resp_headers=resp_headers_raw, resp_body=resp_body_parsed,
-                    duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+                    path=path,
+                    req_body=req_body,
+                    resp_status=resp_status,
+                    resp_headers=resp_headers_raw,
+                    resp_body=resp_body_parsed,
+                    duration_ms=duration_ms,
+                    exchange_ctx=exchange_ctx,
                 )
                 if inspection_error:
                     _mark_inspection_failure(
@@ -1148,14 +1204,14 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 run = getattr(self, "_run", None)
                 if run is not None:
                     self._note_response(
-                        resp_events, exchange_ctx, resp_body_parsed,
+                        resp_events,
+                        exchange_ctx,
+                        resp_body_parsed,
                         read_in_full=True,
                         inspection_error="unparsed" if parse_failed else None,
                     )
                 writer.write(
-                    _unpersisted_exchange_events(
-                        req_events, resp_events, exchange_ctx
-                    )
+                    _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
                 )
             except AuditWriteError:
                 log.exception("Response audit could not be persisted")
@@ -1167,7 +1223,9 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 try:
                     fallback_events = build_inspection_failure(
                         f"{message}: {exc}",
-                        status=resp_status, headers=resp_headers_raw, blocked=True,
+                        status=resp_status,
+                        headers=resp_headers_raw,
+                        blocked=True,
                     )
                     writer.write(
                         _unpersisted_exchange_events(
@@ -1175,14 +1233,14 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                         )
                     )
                 except Exception:
-                    log.exception(
-                        "Failed to persist invalid response audit fallback"
-                    )
+                    log.exception("Failed to persist invalid response audit fallback")
                 resp_status = 502
-                resp_body_bytes = json.dumps({
-                    "error": message,
-                    "inspection_error": True,
-                }).encode()
+                resp_body_bytes = json.dumps(
+                    {
+                        "error": message,
+                        "inspection_error": True,
+                    }
+                ).encode()
                 resp_headers_raw = {
                     "content-type": "application/json",
                     "x-panoptes-inspection-blocked": "true",
@@ -1195,7 +1253,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 try:
                     fallback_events = build_inspection_failure(
                         f"Response event construction failed: {exc}",
-                        status=resp_status, headers=resp_headers_raw,
+                        status=resp_status,
+                        headers=resp_headers_raw,
                         blocked=False,
                     )
                     writer.write(
@@ -1204,9 +1263,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                         )
                     )
                 except Exception:
-                    log.exception(
-                        "Failed to build the incomplete response fallback"
-                    )
+                    log.exception("Failed to build the incomplete response fallback")
 
         # Send response to client
         run = getattr(self, "_run", None)
@@ -1244,6 +1301,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._serve_request("POST")
 
+
 # Kept for callers that imported the private name.
 _BoundedThreadingHTTPServer = BoundedThreadingHTTPServer
 
@@ -1277,9 +1335,7 @@ class ProxyServer:
         hook_slow_seconds: float = DEFAULT_HOOK_SLOW_SECONDS,
     ) -> None:
         if not _is_loopback_bind_host(host):
-            raise ValueError(
-                f"Refusing non-loopback proxy bind host {host!r}"
-            )
+            raise ValueError(f"Refusing non-loopback proxy bind host {host!r}")
         if db is not None and db_path is not None:
             raise ValueError("db and db_path are mutually exclusive")
         if hooks is not None and not isinstance(hooks, ProxyHooks):
@@ -1338,9 +1394,7 @@ class ProxyServer:
                     f"{sorted(known)}"
                 )
             if not isinstance(upstream, Upstream):
-                raise TypeError(
-                    f"upstreams[{protocol!r}] must be an Upstream"
-                )
+                raise TypeError(f"upstreams[{protocol!r}] must be an Upstream")
             resolved[protocol] = (upstream.name or protocol, upstream)
         return resolved
 
@@ -1415,8 +1469,12 @@ class ProxyServer:
             raise
 
         log.info("Panoptes proxy listening on %s:%d", self.host, self.port)
-        log.info("Reverse-proxy mode: ANTHROPIC_BASE_URL=http://%s:%d", self.host, self.port)
-        log.info("Reverse-proxy mode: OPENAI_BASE_URL=http://%s:%d/v1", self.host, self.port)
+        log.info(
+            "Reverse-proxy mode: ANTHROPIC_BASE_URL=http://%s:%d", self.host, self.port
+        )
+        log.info(
+            "Reverse-proxy mode: OPENAI_BASE_URL=http://%s:%d/v1", self.host, self.port
+        )
         return self.port
 
     def stop(self) -> None:
@@ -1435,9 +1493,7 @@ class ProxyServer:
             ):
                 self._server.shutdown()
             self._server.server_close()
-            if not start_failed and not self._server.wait_idle(
-                _STOP_GRACE_SECONDS
-            ):
+            if not start_failed and not self._server.wait_idle(_STOP_GRACE_SECONDS):
                 log.warning(
                     "Stopping with exchanges still in flight after %ss",
                     _STOP_GRACE_SECONDS,
@@ -1499,7 +1555,9 @@ def start_proxy(
     port = port or 0
 
     server = ProxyServer(
-        host=host, port=port, db_path=db_path_expanded,
+        host=host,
+        port=port,
+        db_path=db_path_expanded,
         max_request_body_bytes=max_request_body_bytes,
         max_buffered_response_bytes=max_buffered_response_bytes,
         max_audit_stream_bytes=max_audit_stream_bytes,

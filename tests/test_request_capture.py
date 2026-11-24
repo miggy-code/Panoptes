@@ -13,7 +13,9 @@ TURN_TEXT = "an earlier user turn about project orchid"
 
 
 def sha(value):
-    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    canonical = json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
@@ -22,15 +24,18 @@ def fingerprint(path, body):
 
 
 ANTHROPIC = {
-    "model": "claude-test", "system": SECRET_TEXT,
+    "model": "claude-test",
+    "system": SECRET_TEXT,
     "messages": [
         {"role": "user", "content": TURN_TEXT},
         {"role": "assistant", "content": "ok"},
         {"role": "user", "content": "latest"},
     ],
-    "tools": [{"name": "read_file", "input_schema": {}},
-              {"name": "write_file", "input_schema": {}},
-              {"type": "web_search_20250305", "name": "web_search"}],
+    "tools": [
+        {"name": "read_file", "input_schema": {}},
+        {"name": "write_file", "input_schema": {}},
+        {"type": "web_search_20250305", "name": "web_search"},
+    ],
 }
 OPENAI_CHAT = {
     "model": "gpt-test",
@@ -43,18 +48,25 @@ OPENAI_CHAT = {
     "tools": [{"type": "function", "function": {"name": "read_file"}}],
 }
 OPENAI_RESPONSES = {
-    "model": "gpt-test", "instructions": SECRET_TEXT,
-    "input": [{"role": "user", "content": TURN_TEXT},
-              {"role": "user", "content": "latest"}],
+    "model": "gpt-test",
+    "instructions": SECRET_TEXT,
+    "input": [
+        {"role": "user", "content": TURN_TEXT},
+        {"role": "user", "content": "latest"},
+    ],
     "tools": [{"type": "function", "name": "read_file"}, {"type": "web_search"}],
 }
 GEMINI = {
     "system_instruction": {"parts": [{"text": SECRET_TEXT}]},
-    "contents": [{"role": "user", "parts": [{"text": TURN_TEXT}]},
-                 {"role": "model", "parts": [{"text": "ok"}]},
-                 {"role": "user", "parts": [{"text": "latest"}]}],
-    "tools": [{"function_declarations": [{"name": "read_file"}, {"name": "write_file"}]},
-              {"google_search": {}}],
+    "contents": [
+        {"role": "user", "parts": [{"text": TURN_TEXT}]},
+        {"role": "model", "parts": [{"text": "ok"}]},
+        {"role": "user", "parts": [{"text": "latest"}]},
+    ],
+    "tools": [
+        {"function_declarations": [{"name": "read_file"}, {"name": "write_file"}]},
+        {"google_search": {}},
+    ],
 }
 
 
@@ -97,15 +109,23 @@ def test_the_history_hash_ignores_the_newest_turn_only():
 
 
 def test_nothing_is_reported_when_there_is_nothing_to_hash():
-    assert fingerprint("/v1/messages", {"model": "m", "messages": [
-        {"role": "user", "content": "hi"}]}) == {}
+    assert (
+        fingerprint(
+            "/v1/messages",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        == {}
+    )
     assert fingerprint("/v1/messages", None) == {}
 
 
-@pytest.mark.parametrize("body", [
-    {"messages": "not a list", "tools": "nope", "system": 5},
-    {"messages": [1, None], "tools": [1, "x", None]},
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"messages": "not a list", "tools": "nope", "system": 5},
+        {"messages": [1, None], "tools": [1, "x", None]},
+    ],
+)
 def test_malformed_bodies_never_raise(body):
     fingerprint("/v1/messages", body)
     fingerprint("/v1/chat/completions", body)
@@ -115,31 +135,46 @@ def test_malformed_bodies_never_raise(body):
 def test_the_event_carries_the_fields_and_no_text_in_them():
     writer = AuditEventWriter(db=None)
     events, _ = writer.build_request_events(
-        path="/v1/messages", method="POST", req_headers={}, req_body=ANTHROPIC)
+        path="/v1/messages", method="POST", req_headers={}, req_body=ANTHROPIC
+    )
     action = next(e for e in events if e["event_type"] == "model_request")["action"]
-    assert action["messages_count"] == 4          # 3 messages + the system prompt
+    assert action["messages_count"] == 4  # 3 messages + the system prompt
     assert len(action["system_prompt_sha256"]) == 64
     assert action["declared_tools"] == ["read_file", "write_file", "web_search"]
-    derived = json.dumps({k: action[k] for k in (
-        "system_prompt_sha256", "history_sha256", "declared_tools")})
+    derived = json.dumps(
+        {
+            k: action[k]
+            for k in ("system_prompt_sha256", "history_sha256", "declared_tools")
+        }
+    )
     assert SECRET_TEXT not in derived and TURN_TEXT not in derived
 
 
 def test_chat_message_hashes_survive_raw_request_truncation():
     messages = [{"role": "user", "content": "hello world " * 6000}]
     events, _ = AuditEventWriter(db=None).build_request_events(
-        path="/v1/chat/completions", method="POST", req_headers={},
-        req_body={"model": "m", "messages": messages})
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body={"model": "m", "messages": messages},
+    )
     request = next(e for e in events if e["event_type"] == "model_request")
     assert request["raw_request"].endswith("...[truncated]")
     assert request["action"]["message_hashes"] == ["b886fe52ddceb949"]
     from panoptes.schema import normalize_event
-    assert normalize_event(request)["action"]["message_hashes"] == request["action"]["message_hashes"]
+
+    assert (
+        normalize_event(request)["action"]["message_hashes"]
+        == request["action"]["message_hashes"]
+    )
 
 
 def test_chat_message_hashes_are_bounded():
     messages = [{"role": "user", "content": "hello"}] * 1025
     events, _ = AuditEventWriter(db=None).build_request_events(
-        path="/v1/chat/completions", method="POST", req_headers={},
-        req_body={"model": "m", "messages": messages})
+        path="/v1/chat/completions",
+        method="POST",
+        req_headers={},
+        req_body={"model": "m", "messages": messages},
+    )
     assert "message_hashes" not in events[0]["action"]

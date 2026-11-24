@@ -36,6 +36,7 @@ def test_current_schema_version_is_five():
 
 # ── agent.type is an open validated identifier ───────────────────────────────
 
+
 @pytest.mark.parametrize("agent_type", ["my_agent", "acme.review-bot", "x" * 256])
 def test_agent_type_is_open(db, agent_type):
     event = make_event()
@@ -72,6 +73,7 @@ def test_declared_v4_events_keep_the_closed_agent_list():
 
 
 # ── run_id optional, parent_run_id ───────────────────────────────────────────
+
 
 def test_run_id_is_optional_and_never_invented(db):
     db.insert_event(make_event())
@@ -124,6 +126,7 @@ def test_declared_v4_events_reject_parent_run_id():
 
 # ── correlation_id is first-class ────────────────────────────────────────────
 
+
 def test_correlation_id_is_a_top_level_indexed_field(db):
     db.insert_event(make_event(event_id="a", correlation_id="corr-1"))
     db.insert_event(make_event(event_id="b", correlation_id="corr-2"))
@@ -132,7 +135,9 @@ def test_correlation_id_is_a_top_level_indexed_field(db):
     assert [e["event_id"] for e in found] == ["a"]
     assert found[0]["correlation_id"] == "corr-1"
     assert {e["event_id"]: e["correlation_id"] for e in db.query()} == {
-        "a": "corr-1", "b": "corr-2", "c": None,
+        "a": "corr-1",
+        "b": "corr-2",
+        "c": None,
     }
 
 
@@ -152,6 +157,7 @@ def test_declared_v4_events_reject_correlation_id():
 
 
 # ── user is optional; no default identity ────────────────────────────────────
+
 
 def test_missing_user_stays_missing(db):
     db.insert_event(make_event())
@@ -183,6 +189,7 @@ def test_declared_v4_events_keep_legacy_user_defaults():
 
 # ── attributes ───────────────────────────────────────────────────────────────
 
+
 def test_attributes_round_trip(db):
     attributes = {"rule_ids": ["r1"], "nested": {"n": 1}, "ok": True}
     db.insert_event(make_event(attributes=attributes))
@@ -190,11 +197,15 @@ def test_attributes_round_trip(db):
 
 
 def test_attributes_are_redacted_like_context():
-    event = normalize_event(make_event(attributes={
-        "api_key": "whatever",
-        "note": "uses sk-proj-fakefakefakefake0123456789 in text",
-        "fine": "value",
-    }))
+    event = normalize_event(
+        make_event(
+            attributes={
+                "api_key": "whatever",
+                "note": "uses sk-proj-fakefakefakefake0123456789 in text",
+                "fine": "value",
+            }
+        )
+    )
     assert event["attributes"]["api_key"] == "[REDACTED]"
     assert "sk-proj" not in event["attributes"]["note"]
     assert event["attributes"]["fine"] == "value"
@@ -235,6 +246,7 @@ def test_declared_v4_events_reject_attributes():
 
 # ── namespaced event types ───────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize(
     "event_type",
     ["agentgate.allow", "acme.review.finished", "a1.b_2"],
@@ -247,9 +259,19 @@ def test_namespaced_event_types_are_accepted(db, event_type):
 @pytest.mark.parametrize(
     "event_type",
     [
-        "custom", "unknown", "Agentgate.allow", ".allow", "agentgate.",
-        "agentgate..allow", "agentgate.Allow", "1agentgate.allow",
-        "agentgate.allow now", "a." + "b" * 130, "", None, 7,
+        "custom",
+        "unknown",
+        "Agentgate.allow",
+        ".allow",
+        "agentgate.",
+        "agentgate..allow",
+        "agentgate.Allow",
+        "1agentgate.allow",
+        "agentgate.allow now",
+        "a." + "b" * 130,
+        "",
+        None,
+        7,
     ],
 )
 def test_other_event_types_stay_rejected(event_type):
@@ -268,9 +290,12 @@ def test_namespaced_types_need_v5():
 
 
 def test_custom_events_do_not_get_data_access_tags():
-    event = normalize_event(make_event(
-        event_type="acme.thing", action={"target": "prod kubectl"},
-    ))
+    event = normalize_event(
+        make_event(
+            event_type="acme.thing",
+            action={"target": "prod kubectl"},
+        )
+    )
     assert event["action"]["derived_data_accessed"] == []
 
 
@@ -287,6 +312,7 @@ def test_capture_observed_events_accept_namespaced_types():
 
 
 # ── replay ───────────────────────────────────────────────────────────────────
+
 
 def test_v5_event_round_trips_idempotently(db):
     event = make_event(
@@ -305,6 +331,7 @@ def test_v5_event_round_trips_idempotently(db):
 
 # ── review fixes: aliases and anchoring ──────────────────────────────────────
 
+
 def test_the_v4_alias_names_are_gone():
     from panoptes import schema
 
@@ -316,9 +343,14 @@ def test_the_v4_alias_names_are_gone():
 @pytest.mark.parametrize(
     "event_type",
     [
-        "agentgate.allow\n", "agentgate.allow\r\n", "agentgate.allow\n\n",
-        "\nagentgate.allow", "agentgate.allow ", "agentgate.allow\x00",
-        "agentgate.allow ", "agentgate\n.allow",
+        "agentgate.allow\n",
+        "agentgate.allow\r\n",
+        "agentgate.allow\n\n",
+        "\nagentgate.allow",
+        "agentgate.allow ",
+        "agentgate.allow\x00",
+        "agentgate.allow ",
+        "agentgate\n.allow",
     ],
 )
 def test_a_trailing_newline_does_not_pass_the_event_type_check(event_type):
@@ -343,8 +375,10 @@ def test_no_schema_regex_accepts_a_value_with_a_trailing_newline():
     from panoptes import schema
 
     patterns = [
-        value for value in vars(schema).values()
-        if isinstance(value, re.Pattern) and value.pattern.startswith(("^", "["))
+        value
+        for value in vars(schema).values()
+        if isinstance(value, re.Pattern)
+        and value.pattern.startswith(("^", "["))
         and value.pattern.endswith("$")
     ]
     assert patterns == []

@@ -55,6 +55,7 @@ def read_only_verify(path):
 
 # ── the stripped-and-restarted chain ─────────────────────────────────────────
 
+
 def test_a_stripped_chain_reopened_with_chain_true_is_not_valid(tmp_path):
     path = chained_db(tmp_path / "audit.db", 5)
     edit(path, *STRIP, FORGE_MARKER)
@@ -92,12 +93,12 @@ def test_a_chain_that_covers_events_alongside_legacy_ones_stays_intact(tmp_path)
     plain.insert_events([event(0), event(1)])
     plain.close()
     db = AuditDB(str(path), chain=True)
-    assert db.verify_chain()["chain"] == "partial"          # nothing covered yet
+    assert db.verify_chain()["chain"] == "partial"  # nothing covered yet
     db.insert_event(event(2))
     result = db.verify_chain()
     db.close()
     assert result["valid"] is True and result["chain"] == "intact"
-    assert result["coverage"] == "partial"                   # still disclosed
+    assert result["coverage"] == "partial"  # still disclosed
 
 
 def test_an_empty_chained_database_is_still_intact(tmp_path):
@@ -117,7 +118,9 @@ TAMPERED = {
 
 
 @pytest.mark.parametrize("name", TAMPERED)
-def test_a_chain_stripped_from_a_schema_4_plus_database_is_broken_everywhere(tmp_path, name):
+def test_a_chain_stripped_from_a_schema_4_plus_database_is_broken_everywhere(
+    tmp_path, name
+):
     path = chained_db(tmp_path / "audit.db", 4)
     edit(path, *TAMPERED[name])
 
@@ -126,7 +129,7 @@ def test_a_chain_stripped_from_a_schema_4_plus_database_is_broken_everywhere(tmp
     assert result["chain"] == "broken", result
 
     with pytest.raises(ChainIntegrityError):
-        AuditDB(str(path))                      # the writer refuses it too
+        AuditDB(str(path))  # the writer refuses it too
     reader = AuditDB.open_readonly(str(path))
     try:
         with pytest.raises(ChainIntegrityError):
@@ -148,13 +151,14 @@ def test_a_pre_chain_schema_without_metadata_is_absent_not_broken(tmp_path):
     shutil.copy(FIXTURES / "panoptes_v4.db", path)
     edit(path, "DELETE FROM chain_meta", "UPDATE schema_version SET version = 3")
     result = read_only_verify(path)
-    assert result["chain"] == "broken"          # hashed events without metadata
+    assert result["chain"] == "broken"  # hashed events without metadata
     edit(path, "UPDATE events SET prev_hash = NULL, event_hash = NULL")
     result = read_only_verify(path)
     assert result["chain"] == "absent" and result["valid"] is False
 
 
 # ── a forged marker ──────────────────────────────────────────────────────────
+
 
 def test_a_disabled_marker_beside_a_live_chain_is_broken_everywhere(tmp_path):
     path = chained_db(tmp_path / "audit.db", 3)
@@ -169,15 +173,25 @@ def test_a_disabled_marker_beside_a_live_chain_is_broken_everywhere(tmp_path):
     try:
         with pytest.raises(ChainIntegrityError, match="both"):
             reader.get_chain_checkpoint()
-        assert reader.verify_checkpoint({
-            "format_version": "1", "algorithm": "sha256", "anchor": "a",
-            "head": "a", "event_count": 0, "legacy_event_count": 0,
-        })["valid"] is False
+        assert (
+            reader.verify_checkpoint(
+                {
+                    "format_version": "1",
+                    "algorithm": "sha256",
+                    "anchor": "a",
+                    "head": "a",
+                    "event_count": 0,
+                    "legacy_event_count": 0,
+                }
+            )["valid"]
+            is False
+        )
     finally:
         reader.close()
 
 
 # ── checkpoints carry a consistent chain key ─────────────────────────────────
+
 
 def test_checkpoints_always_say_whether_a_chain_is_present(tmp_path):
     chained = AuditDB(str(tmp_path / "a.db"))

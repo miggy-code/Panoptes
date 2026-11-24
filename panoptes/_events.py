@@ -13,8 +13,8 @@ from typing import Any
 
 import panoptes.providers as _providers
 from panoptes.capture import PROXY_CAPABILITIES
-from panoptes.hooks import Identity
 from panoptes.hermes_hooks import request_fingerprint as hermes_request_fingerprint
+from panoptes.hooks import Identity
 from panoptes.providers.base import (
     SSEParseError,
     _parse_sse_events,
@@ -59,8 +59,6 @@ class AmbiguousResponseError(ResponseInspectionError):
     """Raised when response JSON has parser-differential ambiguity."""
 
 
-
-
 def _cap_raw(body: dict | None) -> str | None:
     """Serialize body to JSON, redact secrets, cap at 64 KB."""
     if body is None:
@@ -87,6 +85,7 @@ _AGENT_UA_PATTERNS: list[tuple[str, str]] = [
     ("antigravity", "antigravity"),
     ("google-code-assist", "antigravity"),
 ]
+
 
 def _lower_keys(headers: dict[str, str]) -> dict[str, str]:
     """Lowercase header names so lookups are case-insensitive."""
@@ -157,9 +156,8 @@ def _parse_provider_response(
     streaming = bool(exchange_ctx.get("req_info", {}).get("stream"))
     content_type = _lower_keys(resp_headers).get("content-type", "").lower()
     stripped = raw.lstrip()
-    looks_like_sse = (
-        "text/event-stream" in content_type
-        or stripped.startswith((b"data:", b"event:", b":"))
+    looks_like_sse = "text/event-stream" in content_type or stripped.startswith(
+        (b"data:", b"event:", b":")
     )
 
     try:
@@ -188,7 +186,9 @@ def _parse_provider_response(
         raise ResponseInspectionError(f"JSON parse failed: {exc}") from exc
 
     if not isinstance(parsed, dict) or not parsed:
-        raise ResponseInspectionError("provider response produced no inspectable object")
+        raise ResponseInspectionError(
+            "provider response produced no inspectable object"
+        )
     return parsed
 
 
@@ -345,11 +345,13 @@ class AuditEventWriter:
             **self._base_kwargs(exchange_ctx),
         )
         event["outcome"] = {"status": "error", "summary": "after_exchange raised"}
-        event["attributes"].update({
-            "hook": "after_exchange",
-            "error_type": type(exc).__name__,
-            "error": str(redact_secrets(str(exc)))[:500],
-        })
+        event["attributes"].update(
+            {
+                "hook": "after_exchange",
+                "error_type": type(exc).__name__,
+                "error": str(redact_secrets(str(exc)))[:500],
+            }
+        )
         event = normalize_event(event)
         validate_event(event)
         return event
@@ -472,7 +474,8 @@ class AuditEventWriter:
 
         def _base(event_type: str) -> dict:
             return self._make_base_event(
-                event_type, streaming=req_info["stream"],
+                event_type,
+                streaming=req_info["stream"],
                 **self._base_kwargs(exchange_ctx),
             )
 
@@ -491,16 +494,19 @@ class AuditEventWriter:
             **provider.request_fingerprint(req_body),
         }
         messages = req_body.get("messages") if isinstance(req_body, dict) else None
-        if path == "/v1/chat/completions" and isinstance(messages, list) and len(messages) <= 1024:
+        if (
+            path == "/v1/chat/completions"
+            and isinstance(messages, list)
+            and len(messages) <= 1024
+        ):
             req_event["action"]["message_hashes"] = hermes_request_fingerprint(
                 {"request_messages": messages}
             )["messages"]
         req_event["outcome"] = {"status": "success"}
         req_event["raw_request"] = _cap_raw(req_body)
-        if (
-            isinstance(req_event["raw_request"], str)
-            and req_event["raw_request"].endswith("...[truncated]")
-        ):
+        if isinstance(req_event["raw_request"], str) and req_event[
+            "raw_request"
+        ].endswith("...[truncated]"):
             req_event["context"]["capture"]["raw_request_truncated"] = True
         events.append(req_event)
 
@@ -529,9 +535,7 @@ class AuditEventWriter:
                     result_str = json.dumps(
                         redacted_result, ensure_ascii=False, default=str
                     )
-                result_status = (
-                    "error" if tr.get("is_error") is True else "success"
-                )
+                result_status = "error" if tr.get("is_error") is True else "success"
                 tr_event["outcome"] = {
                     "status": result_status,
                     "summary": result_str[:500],
@@ -594,11 +598,20 @@ class AuditEventWriter:
             "duration_ms": duration_ms,
         }
         if resp_status < 400:
-            resp_event["outcome"] = {"status": "success", "summary": f"HTTP {resp_status}"}
+            resp_event["outcome"] = {
+                "status": "success",
+                "summary": f"HTTP {resp_status}",
+            }
         elif resp_status < 500:
-            resp_event["outcome"] = {"status": "error", "summary": f"Client error HTTP {resp_status}"}
+            resp_event["outcome"] = {
+                "status": "error",
+                "summary": f"Client error HTTP {resp_status}",
+            }
         else:
-            resp_event["outcome"] = {"status": "error", "summary": f"Server error HTTP {resp_status}"}
+            resp_event["outcome"] = {
+                "status": "error",
+                "summary": f"Server error HTTP {resp_status}",
+            }
 
         if isinstance(resp_body, dict):
             resp_event["cost"] = provider.extract_usage(resp_body)
@@ -614,10 +627,9 @@ class AuditEventWriter:
                 exchange_ctx["cost_micros"] = micros
 
         resp_event["raw_response"] = _cap_raw(resp_body)
-        if (
-            isinstance(resp_event["raw_response"], str)
-            and resp_event["raw_response"].endswith("...[truncated]")
-        ):
+        if isinstance(resp_event["raw_response"], str) and resp_event[
+            "raw_response"
+        ].endswith("...[truncated]"):
             resp_event["context"]["capture"]["raw_response_truncated"] = True
         events.append(resp_event)
 
@@ -659,9 +671,9 @@ class AuditEventWriter:
                             ensure_ascii=False,
                             default=str,
                         )
-                    tc_event["action"]["server_result_summary"] = (
-                        server_result_text[:500]
-                    )
+                    tc_event["action"]["server_result_summary"] = server_result_text[
+                        :500
+                    ]
                     tc_event["action"]["server_result_complete"] = (
                         len(server_result_text) <= 500
                     )
@@ -683,13 +695,9 @@ class AuditEventWriter:
                         "cancelled",
                     }:
                         outcome_status = "error"
-                    elif (
-                        execution_scope in {"provider", "server"}
-                        and (
-                            "result" in tc
-                            or provider_status
-                            in {"completed", "success", "succeeded"}
-                        )
+                    elif execution_scope in {"provider", "server"} and (
+                        "result" in tc
+                        or provider_status in {"completed", "success", "succeeded"}
                     ):
                         outcome_status = "success"
                     else:
@@ -711,9 +719,7 @@ class AuditEventWriter:
                             "Provider-hosted action is pending or deferred upstream"
                         )
                 else:
-                    summary = (
-                        "Model proposed this tool call; local execution was not observed"
-                    )
+                    summary = "Model proposed this tool call; local execution was not observed"
                 tc_event["outcome"] = {
                     "status": outcome_status,
                     "summary": summary,
@@ -774,15 +780,21 @@ class AuditEventWriter:
         """
         run_id = uuid.uuid4().hex
         req_events, exchange_ctx = self.build_request_events(
-            path=path, method=method, req_headers=req_headers,
-            req_body=req_body, run_id=run_id,
+            path=path,
+            method=method,
+            req_headers=req_headers,
+            req_body=req_body,
+            run_id=run_id,
         )
         resp_events = self.build_response_events(
-            path=path, req_body=req_body, resp_status=resp_status,
-            resp_headers=resp_headers, resp_body=resp_body,
-            duration_ms=duration_ms, exchange_ctx=exchange_ctx,
+            path=path,
+            req_body=req_body,
+            resp_status=resp_status,
+            resp_headers=resp_headers,
+            resp_body=resp_body,
+            duration_ms=duration_ms,
+            exchange_ctx=exchange_ctx,
         )
         all_events = req_events + resp_events
         self.write(all_events)
         return all_events
-

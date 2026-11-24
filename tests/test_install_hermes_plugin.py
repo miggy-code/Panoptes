@@ -86,7 +86,9 @@ def test_installer_writes_current_hermes_plugin_files(tmp_path, monkeypatch):
     assert installer.get_plugin_dir() == plugin_dir
     assert installer.install()
     assert "on_session_start" in (plugin_dir / "plugin.yaml").read_text()
-    assert "from .hermes_hooks import register" in (plugin_dir / "__init__.py").read_text()
+    assert (
+        "from .hermes_hooks import register" in (plugin_dir / "__init__.py").read_text()
+    )
     for name in ("plugin.yaml", "__init__.py", "hermes_hooks.py"):
         assert stat.S_IMODE((plugin_dir / name).stat().st_mode) == 0o600
 

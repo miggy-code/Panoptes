@@ -30,31 +30,44 @@ __all__ = [
 
 # Headers a client may present a provider credential in. A hook that injects its
 # own key removes these from ``outbound_headers`` first.
-CLIENT_CREDENTIAL_HEADERS = frozenset({
-    "authorization",
-    "x-api-key",
-    "x-goog-api-key",
-})
+CLIENT_CREDENTIAL_HEADERS = frozenset(
+    {
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+    }
+)
 
 # Query parameters treated as credentials, matched case-insensitively after
 # percent-decoding. Gemini sends its key this way.
 QUERY_CREDENTIAL_PARAMS = frozenset({"key", "api_key", "apikey", "access_token"})
 
-OUTCOMES = frozenset({
-    "forwarded",
-    "upstream_error",
-    "rejected",
-    "hook_error",
-    "not_forwarded",
-    "aborted",
-})
+OUTCOMES = frozenset(
+    {
+        "forwarded",
+        "upstream_error",
+        "rejected",
+        "hook_error",
+        "not_forwarded",
+        "aborted",
+    }
+)
 
 # Names the proxy owns and re-applies after the hook returns.
-STATIC_HOP_BY_HOP = frozenset({
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "proxy-connection", "te", "trailer", "trailers", "transfer-encoding",
-    "upgrade",
-})
+STATIC_HOP_BY_HOP = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
 
 _HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _FORBIDDEN_HEADER_VALUE_CHARS = ("\r", "\n", "\x00")
@@ -144,7 +157,12 @@ class Upstream:
             raise ValueError("Upstream url must include a host")
         if parsed.username is not None or parsed.password is not None:
             raise ValueError("Upstream url must not contain credentials")
-        if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        if (
+            parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
             raise ValueError(
                 "Upstream url must be an origin (scheme://host[:port]); "
                 "path prefixes are not supported"
@@ -227,9 +245,7 @@ class OutboundHeaders(MutableMapping):
         if not isinstance(value, str) or any(
             char in value for char in _FORBIDDEN_HEADER_VALUE_CHARS
         ):
-            raise ValueError(
-                f"Header {name!r} must be a string without CR, LF or NUL"
-            )
+            raise ValueError(f"Header {name!r} must be a string without CR, LF or NUL")
         return name, value
 
     def __setitem__(self, name: str, value: str) -> None:
@@ -424,7 +440,11 @@ def reject_response(reject: Reject) -> tuple[int, bytes, str]:
     if not isinstance(reject, Reject):
         raise ValueError("before_forward must return None or a Reject")
     status = reject.status
-    if isinstance(status, bool) or not isinstance(status, int) or not 400 <= status <= 599:
+    if (
+        isinstance(status, bool)
+        or not isinstance(status, int)
+        or not 400 <= status <= 599
+    ):
         raise ValueError("Reject.status must be an integer from 400 to 599")
     try:
         validate_identifier(reject.reason, "Reject.reason")

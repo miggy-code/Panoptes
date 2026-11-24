@@ -14,14 +14,11 @@ from pathlib import Path
 
 from panoptes import __version__
 
-
 MANIFEST_JSON = json.dumps(
     {
         "name": "panoptes",
         "version": __version__,
-        "description": (
-            "Panoptes Hermes lifecycle observation"
-        ),
+        "description": ("Panoptes Hermes lifecycle observation"),
         "hooks": ["agent:start", "agent:step", "agent:end"],
         "entrypoint": "plugin.py",
     },
@@ -29,7 +26,13 @@ MANIFEST_JSON = json.dumps(
 )
 
 # Only the files install() writes; uninstall() never removes anything else.
-_PLUGIN_FILES = ("manifest.json", "plugin.py", "plugin.yaml", "__init__.py", "hermes_hooks.py")
+_PLUGIN_FILES = (
+    "manifest.json",
+    "plugin.py",
+    "plugin.yaml",
+    "__init__.py",
+    "hermes_hooks.py",
+)
 
 # The generated plugin.py is a thin entrypoint shim: the implementation lives
 # in panoptes.hermes_plugin (the panoptes package must be importable in the
@@ -61,7 +64,11 @@ PLUGIN_INIT = "from .hermes_hooks import register\n"
 
 def get_plugin_dir() -> Path:
     """Return the target plugin directory."""
-    return Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser() / "plugins" / "panoptes"
+    return (
+        Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+        / "plugins"
+        / "panoptes"
+    )
 
 
 def _atomic_private_write(path: Path, contents: str) -> None:
@@ -123,9 +130,7 @@ def install(dry_run: bool = False) -> bool:
     plugin_path = plugin_dir / "plugin.py"
     for candidate in (plugin_dir / name for name in _PLUGIN_FILES):
         if candidate.is_symlink():
-            raise RuntimeError(
-                f"Refusing to replace symlink plugin file: {candidate}"
-            )
+            raise RuntimeError(f"Refusing to replace symlink plugin file: {candidate}")
 
     # Write manifest.json
     _atomic_private_write(manifest_path, MANIFEST_JSON)
@@ -135,8 +140,14 @@ def install(dry_run: bool = False) -> bool:
     _atomic_private_write(plugin_path, PLUGIN_PY)
     print(f"Wrote: {plugin_path}")
 
-    for name, content in (("plugin.yaml", PLUGIN_YAML), ("__init__.py", PLUGIN_INIT),
-                          ("hermes_hooks.py", Path(__file__).with_name("hermes_hooks.py").read_text(encoding="utf-8"))):
+    for name, content in (
+        ("plugin.yaml", PLUGIN_YAML),
+        ("__init__.py", PLUGIN_INIT),
+        (
+            "hermes_hooks.py",
+            Path(__file__).with_name("hermes_hooks.py").read_text(encoding="utf-8"),
+        ),
+    ):
         _atomic_private_write(plugin_dir / name, content)
         print(f"Wrote: {plugin_dir / name}")
 

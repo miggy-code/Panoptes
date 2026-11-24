@@ -8,9 +8,9 @@ import tempfile
 import uuid
 
 from panoptes.capture import (
-    CaptureCapabilities,
     HERMES_CAPABILITIES,
     PROXY_CAPABILITIES,
+    CaptureCapabilities,
 )
 from panoptes.hermes_plugin import AuditPlugin
 from panoptes.proxy import AuditEventWriter
@@ -36,6 +36,7 @@ class _HermesContext:
         def register(fn):
             self.handlers[name] = fn
             return fn
+
         return register
 
 
@@ -122,6 +123,7 @@ def test_hermes_concurrent_steps_get_distinct_turn_numbers() -> None:
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     barrier = threading.Barrier(2)
@@ -144,10 +146,14 @@ def test_hermes_concurrent_steps_get_distinct_turn_numbers() -> None:
 
         def run(tool_name):
             try:
-                ctx.handlers["agent:step"](_Step({
-                    "session_id": "s1",
-                    "tool_names": [tool_name],
-                }))
+                ctx.handlers["agent:step"](
+                    _Step(
+                        {
+                            "session_id": "s1",
+                            "tool_names": [tool_name],
+                        }
+                    )
+                )
             except Exception as exc:
                 errors.append(exc)
 
@@ -176,6 +182,7 @@ def test_hermes_single_tool_name_string_is_not_split_into_characters() -> None:
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     with tempfile.TemporaryDirectory() as directory:
@@ -185,11 +192,13 @@ def test_hermes_single_tool_name_string_is_not_split_into_characters() -> None:
         ctx = _Context()
         plugin.register(ctx)
         ctx.handlers["agent:start"]({"session_id": "s1", "run_id": "r1"})
-        ctx.handlers["agent:step"]({
-            "session_id": "s1",
-            "tool_names": "read_file",
-            "tool_input": {"path": "/prod/config"},
-        })
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s1",
+                "tool_names": "read_file",
+                "tool_input": {"path": "/prod/config"},
+            }
+        )
 
         steps = plugin.db.query(event_type="agent_step", limit=10)
         assert len(steps) == 1
@@ -207,6 +216,7 @@ def test_hermes_emits_exactly_one_event_for_each_lifecycle_step() -> None:
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     with tempfile.TemporaryDirectory() as directory:
@@ -216,15 +226,19 @@ def test_hermes_emits_exactly_one_event_for_each_lifecycle_step() -> None:
         ctx = _Context()
         plugin.register(ctx)
         ctx.handlers["agent:start"]({"session_id": "s1", "run_id": "r1"})
-        ctx.handlers["agent:step"]({
-            "session_id": "s1",
-            "tool_names": [],
-            "outcome_summary": None,
-        })
-        ctx.handlers["agent:step"]({
-            "session_id": "s1",
-            "tool_names": ["read_file", "write_file"],
-        })
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s1",
+                "tool_names": [],
+                "outcome_summary": None,
+            }
+        )
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s1",
+                "tool_names": ["read_file", "write_file"],
+            }
+        )
 
         steps = plugin.db.query(event_type="agent_step", limit=10)
         assert len(steps) == 2
@@ -246,12 +260,11 @@ def test_hermes_redacts_lifecycle_text_before_adapter_truncation() -> None:
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     private_key = (
-        "-----BEGIN PRIVATE KEY-----"
-        + ("A" * 800)
-        + "-----END PRIVATE KEY-----"
+        "-----BEGIN PRIVATE KEY-----" + ("A" * 800) + "-----END PRIVATE KEY-----"
     )
     with tempfile.TemporaryDirectory() as directory:
         plugin = AuditPlugin(
@@ -259,15 +272,19 @@ def test_hermes_redacts_lifecycle_text_before_adapter_truncation() -> None:
         )
         ctx = _Context()
         plugin.register(ctx)
-        ctx.handlers["agent:start"]({
-            "session_id": "s1",
-            "run_id": "r1",
-            "message": private_key,
-        })
-        ctx.handlers["agent:end"]({
-            "session_id": "s1",
-            "response": private_key,
-        })
+        ctx.handlers["agent:start"](
+            {
+                "session_id": "s1",
+                "run_id": "r1",
+                "message": private_key,
+            }
+        )
+        ctx.handlers["agent:end"](
+            {
+                "session_id": "s1",
+                "response": private_key,
+            }
+        )
 
         events = plugin.db.query(limit=10)
         serialized = str(events)
@@ -286,6 +303,7 @@ def test_hermes_concurrent_sessions_do_not_cross_attribute() -> None:
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     with tempfile.TemporaryDirectory() as directory:
@@ -296,16 +314,20 @@ def test_hermes_concurrent_sessions_do_not_cross_attribute() -> None:
         plugin.register(ctx)
         ctx.handlers["agent:start"]({"session_id": "s1", "run_id": "r1"})
         ctx.handlers["agent:start"]({"session_id": "s2", "run_id": "r2"})
-        ctx.handlers["agent:step"]({
-            "session_id": "s1",
-            "tool_names": ["read_file"],
-            "tool_input": {"path": "one"},
-        })
-        ctx.handlers["agent:step"]({
-            "session_id": "s2",
-            "tool_names": ["write_file"],
-            "tool_input": {"path": "two"},
-        })
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s1",
+                "tool_names": ["read_file"],
+                "tool_input": {"path": "one"},
+            }
+        )
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s2",
+                "tool_names": ["write_file"],
+                "tool_input": {"path": "two"},
+            }
+        )
 
         calls = plugin.db.query(event_type="agent_step", limit=10)
         by_tool = {event["action"]["tool_name"]: event["agent"] for event in calls}
@@ -326,50 +348,52 @@ def test_hermes_duplicate_start_retains_active_session_attribution(
         ctx = _HermesContext()
         plugin.register(ctx)
 
-        ctx.handlers["agent:start"]({
-            "session_id": "session-1",
-            "run_id": "original-run",
-            "user_id": "original-user",
-        })
-        ctx.handlers["agent:step"]({
-            "session_id": "session-1",
-            "tool_names": ["read_file"],
-        })
+        ctx.handlers["agent:start"](
+            {
+                "session_id": "session-1",
+                "run_id": "original-run",
+                "user_id": "original-user",
+            }
+        )
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "session-1",
+                "tool_names": ["read_file"],
+            }
+        )
 
         with caplog.at_level(logging.WARNING, logger="panoptes.hermes"):
-            ctx.handlers["agent:start"]({
-                "session_id": "session-1",
-                "run_id": "replacement-run",
-                "user_id": "replacement-user",
-            })
+            ctx.handlers["agent:start"](
+                {
+                    "session_id": "session-1",
+                    "run_id": "replacement-run",
+                    "user_id": "replacement-user",
+                }
+            )
 
         state = plugin._sessions["session-1"]
         assert state["run_id"] == "original-run"
         assert state["user_id"] == "original-user"
         assert state["turn"] == 1
 
-        ctx.handlers["agent:step"]({
-            "session_id": "session-1",
-            "run_id": "replacement-run",
-            "tool_names": ["write_file"],
-        })
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "session-1",
+                "run_id": "replacement-run",
+                "tool_names": ["write_file"],
+            }
+        )
 
         starts = plugin.db.query(event_type="agent_start", limit=10)
         duplicate = next(
-            event
-            for event in starts
-            if event["outcome"]["status"] == "warned"
+            event for event in starts if event["outcome"]["status"] == "warned"
         )
         assert duplicate["agent"]["run_id"] == "original-run"
         assert duplicate["user"]["id"] == "original-user"
         assert duplicate["context"]["turn_number"] == 1
         steps = plugin.db.query(event_type="agent_step", limit=10)
-        assert {event["agent"]["run_id"] for event in steps} == {
-            "original-run"
-        }
-        assert sorted(
-            event["context"]["turn_number"] for event in steps
-        ) == [1, 2]
+        assert {event["agent"]["run_id"] for event in steps} == {"original-run"}
+        assert sorted(event["context"]["turn_number"] for event in steps) == [1, 2]
         assert "retained its established run and user attribution" in caplog.text
         plugin.db.close()
 
@@ -387,28 +411,30 @@ def test_hermes_active_session_tracking_is_hard_capped_and_auditable(
 
         with caplog.at_level(logging.WARNING, logger="panoptes.hermes"):
             for index in range(3):
-                ctx.handlers["agent:start"]({
-                    "session_id": f"session-{index}",
-                    "run_id": f"run-{index}",
-                })
+                ctx.handlers["agent:start"](
+                    {
+                        "session_id": f"session-{index}",
+                        "run_id": f"run-{index}",
+                    }
+                )
 
             assert len(plugin._sessions) == 2
             assert "session-0" not in plugin._sessions
 
             # A late callback remains isolated and bounded rather than being
             # attributed to another active session.
-            ctx.handlers["agent:step"]({
-                "session_id": "session-0",
-                "run_id": "run-0",
-                "tool_names": ["read_file"],
-            })
+            ctx.handlers["agent:step"](
+                {
+                    "session_id": "session-0",
+                    "run_id": "run-0",
+                    "tool_names": ["read_file"],
+                }
+            )
 
         assert len(plugin._sessions) == 2
         starts = plugin.db.query(event_type="agent_start", limit=10)
         capped_start = next(
-            event
-            for event in starts
-            if event["agent"]["session_id"] == "session-2"
+            event for event in starts if event["agent"]["session_id"] == "session-2"
         )
         assert "session_tracking" not in capped_start["context"]["capture"]
         steps = plugin.db.query(event_type="agent_step", limit=10)
@@ -428,6 +454,7 @@ def test_hermes_lifecycle_write_failures_are_observational_and_cleanup_state() -
             def register(fn):
                 self.handlers[name] = fn
                 return fn
+
             return register
 
     class _FailingDB:
@@ -446,10 +473,12 @@ def test_hermes_lifecycle_write_failures_are_observational_and_cleanup_state() -
         ctx.handlers["agent:start"]({"session_id": "s1", "run_id": "r1"})
         assert plugin._sessions["s1"]["turn"] == 0
 
-        ctx.handlers["agent:step"]({
-            "session_id": "s1",
-            "tool_names": ["read_file"],
-        })
+        ctx.handlers["agent:step"](
+            {
+                "session_id": "s1",
+                "tool_names": ["read_file"],
+            }
+        )
         assert plugin._sessions["s1"]["turn"] == 1
 
         ctx.handlers["agent:end"]({"session_id": "s1"})
@@ -475,5 +504,3 @@ def _deep(levels: int) -> dict:
     for _ in range(levels):
         value = {"a": value}
     return value
-
-

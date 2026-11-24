@@ -42,6 +42,7 @@ def sha(path):
 
 # ── unchained databases ──────────────────────────────────────────────────────
 
+
 def test_unchained_database_stores_events_without_hashes(tmp_path):
     path = tmp_path / "plain.db"
     db = AuditDB(str(path), chain=False)
@@ -64,10 +65,16 @@ def test_unchained_database_never_verifies_as_valid(tmp_path, populated):
     assert "unchained" in result["error"]
     checkpoint = db.get_chain_checkpoint()
     assert checkpoint["chain"] == "absent" and checkpoint["initialized"] is False
-    proof = db.verify_checkpoint({
-        "format_version": "1", "algorithm": "sha256", "anchor": "a", "head": "a",
-        "event_count": 0, "legacy_event_count": 0,
-    })
+    proof = db.verify_checkpoint(
+        {
+            "format_version": "1",
+            "algorithm": "sha256",
+            "anchor": "a",
+            "head": "a",
+            "event_count": 0,
+            "legacy_event_count": 0,
+        }
+    )
     assert proof["valid"] is False
     db.close()
 
@@ -109,6 +116,7 @@ def test_unchained_database_opens_read_only_and_reports_absent(tmp_path):
 
 # ── a chain is never silently dropped ────────────────────────────────────────
 
+
 def test_chain_false_is_refused_on_a_chained_database(tmp_path):
     path = tmp_path / "chained.db"
     db = AuditDB(str(path))
@@ -129,7 +137,9 @@ def test_a_chained_database_stays_chained(tmp_path, chain):
     db = AuditDB(str(path), chain=chain)
     db.insert_event(event(2))
     result = db.verify_chain()
-    assert result["valid"] and result["chain"] == "intact" and result["event_count"] == 2
+    assert (
+        result["valid"] and result["chain"] == "intact" and result["event_count"] == 2
+    )
     db.close()
     assert hash_columns(path) == (2, 2, 2)
 
@@ -187,6 +197,7 @@ def test_a_marker_next_to_a_live_chain_is_refused(tmp_path):
 
 # ── enabling a chain on an unchained database ────────────────────────────────
 
+
 def test_chain_true_starts_a_chain_after_the_existing_rows(tmp_path):
     path = tmp_path / "plain.db"
     plain = AuditDB(str(path), chain=False)
@@ -206,11 +217,14 @@ def test_chain_true_starts_a_chain_after_the_existing_rows(tmp_path):
 
 # ── databases that predate the chain ─────────────────────────────────────────
 
+
 def test_a_pre_chain_file_reads_and_reports_absent(tmp_path):
     path = tmp_path / "v2.db"
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, "
-                 "applied_at TEXT NOT NULL DEFAULT (datetime('now')))")
+    conn.execute(
+        "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, "
+        "applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
     conn.execute("INSERT INTO schema_version (version) VALUES (2)")
     conn.execute("""
         CREATE TABLE events (
@@ -226,7 +240,7 @@ def test_a_pre_chain_file_reads_and_reports_absent(tmp_path):
         "INSERT INTO events (event_id, timestamp, agent_type, session_id, run_id, "
         "event_type, agent, user_info, action, outcome, context, cost) VALUES "
         "('old', '2026-01-01T00:00:00.000Z', 'hermes', 's', 'r', 'agent_start', "
-        "'{\"type\":\"hermes\",\"session_id\":\"s\",\"run_id\":\"r\"}', '{}', '{}', "
+        '\'{"type":"hermes","session_id":"s","run_id":"r"}\', \'{}\', \'{}\', '
         "'{\"status\":\"success\"}', '{}', '{}')"
     )
     conn.commit()
@@ -255,6 +269,7 @@ def test_a_pre_chain_file_reads_and_reports_absent(tmp_path):
 
 
 # ── arguments ────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.parametrize("bad", ["yes", 1, 0])
 def test_chain_must_be_a_bool_or_none(tmp_path, bad):

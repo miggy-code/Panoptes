@@ -90,8 +90,9 @@ def test_a_writer_cleans_up_after_a_reader_and_the_chain_still_verifies(tmp_path
     reader.close()
 
     again = AuditDB(str(path))
-    again.insert_event({**EVENT, "event_id": "later",
-                        "timestamp": "2026-11-02T11:00:00.000Z"})
+    again.insert_event(
+        {**EVENT, "event_id": "later", "timestamp": "2026-11-02T11:00:00.000Z"}
+    )
     assert again.verify_chain()["valid"]
     again.close()
     assert sorted(os.listdir(tmp_path)) == ["audit.db"]
@@ -125,8 +126,9 @@ def test_only_wal_sidecars_may_appear_while_a_reader_is_open(tmp_path):
     path = tmp_path / "audit.db"
     writer = AuditDB(str(path))
     for n in range(3):
-        writer.insert_event({**EVENT, "event_id": f"e{n}",
-                             "timestamp": f"2026-11-02T10:00:0{n}.000Z"})
+        writer.insert_event(
+            {**EVENT, "event_id": f"e{n}", "timestamp": f"2026-11-02T10:00:0{n}.000Z"}
+        )
     writer.close()
 
     reader = AuditDB.open_readonly(str(path))
@@ -140,7 +142,9 @@ def test_only_wal_sidecars_may_appear_while_a_reader_is_open(tmp_path):
 
 
 @needs_non_root
-def test_a_wal_database_cannot_be_read_from_a_read_only_directory_without_sidecars(tmp_path):
+def test_a_wal_database_cannot_be_read_from_a_read_only_directory_without_sidecars(
+    tmp_path,
+):
     path = tmp_path / "audit.db"
     writer = AuditDB(str(path))
     writer.insert_event(EVENT)

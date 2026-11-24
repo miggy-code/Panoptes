@@ -57,7 +57,9 @@ def test_v5_fields_read_as_empty_on_a_v4_log(v4_path):
     db = AuditDB.open_readonly(str(v4_path))
     try:
         events = db.query(limit=1000)
-        assert all(e["correlation_id"] is None and e["attributes"] == {} for e in events)
+        assert all(
+            e["correlation_id"] is None and e["attributes"] == {} for e in events
+        )
         assert db.query(correlation_id="anything") == []
         assert db.query(parent_run_id="anything") == []
         grouped = db.aggregate(["correlation_id"], ["count"])
@@ -103,13 +105,15 @@ def test_writes_are_refused(v4_path):
     db = AuditDB.open_readonly(str(v4_path))
     try:
         with pytest.raises(sqlite3.OperationalError):
-            db.insert_event({
-                "agent": {"type": "t", "session_id": "s"},
-                "event_type": "agent_step",
-                "action": {"tool_names": []},
-                "outcome": {"status": "success"},
-                "context": {},
-            })
+            db.insert_event(
+                {
+                    "agent": {"type": "t", "session_id": "s"},
+                    "event_type": "agent_step",
+                    "action": {"tool_names": []},
+                    "outcome": {"status": "success"},
+                    "context": {},
+                }
+            )
     finally:
         db.close()
 
@@ -161,23 +165,27 @@ def test_a_newer_log_is_refused(v4_path):
 def test_a_log_a_writer_has_open_can_be_read(tmp_path):
     path = tmp_path / "live.db"
     writer = AuditDB(str(path))
-    writer.insert_event({
-        "agent": {"type": "t", "session_id": "s"},
-        "event_type": "agent_step",
-        "action": {"tool_names": []},
-        "outcome": {"status": "success"},
-        "context": {},
-    })
-    reader = AuditDB.open_readonly(str(path))
-    try:
-        assert reader.get_stats()["total_events"] == 1
-        writer.insert_event({
+    writer.insert_event(
+        {
             "agent": {"type": "t", "session_id": "s"},
             "event_type": "agent_step",
             "action": {"tool_names": []},
             "outcome": {"status": "success"},
             "context": {},
-        })
+        }
+    )
+    reader = AuditDB.open_readonly(str(path))
+    try:
+        assert reader.get_stats()["total_events"] == 1
+        writer.insert_event(
+            {
+                "agent": {"type": "t", "session_id": "s"},
+                "event_type": "agent_step",
+                "action": {"tool_names": []},
+                "outcome": {"status": "success"},
+                "context": {},
+            }
+        )
         assert reader.get_stats()["total_events"] == 2
         assert reader.verify_chain()["valid"]
     finally:

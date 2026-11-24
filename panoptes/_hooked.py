@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from enum import Enum, auto
 import logging
 import socket
 import threading
 import time
+from enum import Enum, auto
 from typing import Any
 
 import httpx
@@ -67,7 +67,9 @@ def _may_have_reached_upstream(exc: BaseException) -> bool:
     )
 
 
-def _start_drain_timer(resp: Any, seconds: float) -> tuple[threading.Timer, threading.Event]:
+def _start_drain_timer(
+    resp: Any, seconds: float
+) -> tuple[threading.Timer, threading.Event]:
     """Cut the upstream read after *seconds*, however silent the upstream is.
 
     A deadline checked only when a chunk arrives is no bound at all: a stalled
@@ -102,7 +104,7 @@ def _answer_if_client_present(handler: Any, status: int, message: str) -> None:
         log.warning("Client disconnected before the %s reply was written", status)
 
 
-def _report_of(handler: Any) -> "_ForwardReport":
+def _report_of(handler: Any) -> _ForwardReport:
     run = getattr(handler, "_run", None)
     return run.report if run is not None else _ForwardReport()
 
@@ -347,7 +349,9 @@ class HookedExchangeMixin:
             log.warning(
                 "%s took %.1fs (hook_slow_seconds=%s); a slow hook holds a "
                 "request slot",
-                hook, elapsed, self.hook_slow_seconds,
+                hook,
+                elapsed,
+                self.hook_slow_seconds,
             )
 
     def _set_outcome(self, outcome: str, status: int | None) -> None:
@@ -406,7 +410,9 @@ class HookedExchangeMixin:
         outcome = run.outcome or "aborted"
         usage = run.usage
         sent = report.request_sent and outcome not in (
-            "rejected", "hook_error", "not_forwarded"
+            "rejected",
+            "hook_error",
+            "not_forwarded",
         )
         status = run.status
         # What the provider did, not what the client was told: Panoptes may

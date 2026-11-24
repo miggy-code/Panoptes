@@ -4,9 +4,9 @@ This module requires the ``otel`` extra. It is never loaded by capture/storage.
 Each record is a zero-duration root observation: correlation is not parentage.
 """
 
-from datetime import datetime, timezone
 import hashlib
-from typing import Iterable
+from collections.abc import Iterable
+from datetime import datetime, timezone
 
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan
@@ -17,10 +17,19 @@ from panoptes.schema import redact_secrets
 
 MAPPING_VERSION = "1"
 _CAPTURE_FIELDS = (
-    "adapter", "fidelity", "observation_boundary", "identity_assurance",
-    "execution_observed", "provenance", "authenticated", "streaming",
-    "audit_body_truncated", "inspection_status", "delivery_status",
-    "upstream_forwarded", "response_delivered",
+    "adapter",
+    "fidelity",
+    "observation_boundary",
+    "identity_assurance",
+    "execution_observed",
+    "provenance",
+    "authenticated",
+    "streaming",
+    "audit_body_truncated",
+    "inspection_status",
+    "delivery_status",
+    "upstream_forwarded",
+    "response_delivered",
 )
 
 
@@ -32,7 +41,8 @@ def observation_span(event: dict) -> ReadableSpan:
     """Map one stored record without inventing execution, duration or parentage."""
     attrs = {"panoptes.mapping_version": MAPPING_VERSION}
     fields = {
-        "event_id": event["event_id"], "event_type": event["event_type"],
+        "event_id": event["event_id"],
+        "event_type": event["event_type"],
         "agent.type": (event.get("agent") or {}).get("type"),
         "agent.session_id": (event.get("agent") or {}).get("session_id"),
         "agent.run_id": (event.get("agent") or {}).get("run_id"),
@@ -57,31 +67,46 @@ def observation_span(event: dict) -> ReadableSpan:
     timestamp = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00"))
     if timestamp.tzinfo is None:
         raise ValueError("Export requires a timezone-aware audit timestamp")
-    delta = timestamp.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = timestamp.astimezone(timezone.utc) - datetime(
+        1970, 1, 1, tzinfo=timezone.utc
+    )
     nanos = ((delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds) * 1000
-    digest = hashlib.sha256(("panoptes.observation.v1:" + event["event_id"]).encode()).digest()
+    digest = hashlib.sha256(
+        ("panoptes.observation.v1:" + event["event_id"]).encode()
+    ).digest()
     span_context = SpanContext(
         trace_id=int.from_bytes(digest[:16], "big") or 1,
         span_id=int.from_bytes(digest[16:24], "big") or 1,
-        is_remote=False, trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        is_remote=False,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
     )
     failed = fields["outcome.status"] in ("error", "timeout")
     return ReadableSpan(
         name=f"panoptes.observation.{event['event_type']}",
-        context=span_context, parent=None, kind=SpanKind.INTERNAL,
+        context=span_context,
+        parent=None,
+        kind=SpanKind.INTERNAL,
         resource=Resource({"service.name": "panoptes"}),
-        attributes=attrs, start_time=nanos, end_time=nanos,
+        attributes=attrs,
+        start_time=nanos,
+        end_time=nanos,
         status=Status(StatusCode.ERROR if failed else StatusCode.UNSET),
     )
 
 
-def export_events(events: Iterable[dict], exporter: SpanExporter, *, batch_size: int = 128) -> int:
+def export_events(
+    events: Iterable[dict], exporter: SpanExporter, *, batch_size: int = 128
+) -> int:
     """Export sequential bounded batches; caller owns exporter shutdown.
 
     No queue, delivery cursor or automatic application retry. Stable IDs permit
     receiver-side deduplication but do not guarantee it. Failures may be partial.
     """
-    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 10000:
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or not 1 <= batch_size <= 10000
+    ):
         raise ValueError("batch_size must be between 1 and 10000")
     accepted = 0
     batch = []
@@ -91,9 +116,13 @@ def export_events(events: Iterable[dict], exporter: SpanExporter, *, batch_size:
         try:
             result = exporter.export(tuple(batch))
         except Exception:
-            raise ExportError(f"Export failed after {accepted} acknowledged observations") from None
+            raise ExportError(
+                f"Export failed after {accepted} acknowledged observations"
+            ) from None
         if result is not SpanExportResult.SUCCESS:
-            raise ExportError(f"Export failed after {accepted} acknowledged observations")
+            raise ExportError(
+                f"Export failed after {accepted} acknowledged observations"
+            )
         accepted += len(batch)
         batch.clear()
 
