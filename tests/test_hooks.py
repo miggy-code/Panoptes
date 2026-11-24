@@ -22,6 +22,7 @@ from panoptes.hooks import (
     User,
 )
 from panoptes.proxy import ProxyServer
+from panoptes.schema import ValidationError
 
 BODY = {
     "model": "claude-test",
@@ -509,11 +510,11 @@ def test_a_hook_identity_without_a_run_id_gets_none_invented(make_proxy):
 
 
 def test_identity_is_validated_on_assignment():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Identity(agent_type="a" * 300, session_id="s")
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Identity(agent_type="ok", session_id="line\nbreak")
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         User(id="sk-ant-" + "a" * 40)
 
 

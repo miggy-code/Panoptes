@@ -139,7 +139,6 @@ def test_query_filters():
         db = AuditDB(db_path)
 
         sid = uuid.uuid4().hex
-        base_ts = "2026-07-05T10:00:00.000Z"
 
         # Insert events with known timestamps
         for i in range(5):
@@ -901,7 +900,7 @@ def test_validation_error_on_insert():
         db = AuditDB(db_path)
 
         # Missing agent
-        try:
+        with pytest.raises(ValidationError):
             db.insert_event(
                 {
                     "event_type": "tool_call",
@@ -910,9 +909,6 @@ def test_validation_error_on_insert():
                     "context": {},
                 }
             )
-            assert False, "Should have raised ValidationError"
-        except ValidationError:
-            pass
 
         db.close()
 
@@ -1096,14 +1092,12 @@ def test_future_schema_version_is_rejected():
         conn.commit()
         conn.close()
 
-        try:
+        with pytest.raises(UnsupportedSchemaVersionError) as excinfo:
             AuditDB(db_path)
-            assert False, "A future schema version must be rejected"
-        except UnsupportedSchemaVersionError as exc:
-            message = str(exc)
-            assert str(SCHEMA_VERSION + 1) in message
-            assert str(SCHEMA_VERSION) in message
-            assert "refusing to open" in message
+        message = str(excinfo.value)
+        assert str(SCHEMA_VERSION + 1) in message
+        assert str(SCHEMA_VERSION) in message
+        assert "refusing to open" in message
 
         check = sqlite3.connect(db_path)
         columns = [row[1] for row in check.execute("PRAGMA table_info(events)")]
@@ -1184,11 +1178,8 @@ def test_event_id_conflicts_and_invalid_events_are_never_silent():
             **event,
             "outcome": {"status": "error", "summary": "rewritten"},
         }
-        try:
+        with pytest.raises(EventConflictError, match="different canonical payload"):
             db.insert_event(conflicting)
-            assert False, "A conflicting event_id must not be silently ignored"
-        except EventConflictError as exc:
-            assert "different canonical payload" in str(exc)
 
         invalid = {
             "event_id": "invalid-null-session",
@@ -1198,11 +1189,8 @@ def test_event_id_conflicts_and_invalid_events_are_never_silent():
             "outcome": {"status": "success"},
             "context": {},
         }
-        try:
+        with pytest.raises((ValidationError, sqlite3.IntegrityError)):
             db.insert_event(invalid)
-            assert False, "An invalid NOT NULL field must fail visibly"
-        except (ValidationError, sqlite3.IntegrityError):
-            pass
 
         rows = db.query(limit=20)
         assert len(rows) == 1
@@ -1246,11 +1234,8 @@ def test_redaction_cannot_collapse_distinct_secret_bearing_event_replays():
                 },
             },
         ):
-            try:
+            with pytest.raises(EventConflictError, match="cannot be proven identical"):
                 db.insert_event(retry)
-                assert False, "A raw secret-bearing duplicate ID must conflict"
-            except EventConflictError as exc:
-                assert "cannot be proven identical" in str(exc)
 
         # A canonical read-back contains only the placeholder and is safe to
         # replay idempotently for transport recovery.
@@ -1277,11 +1262,10 @@ def test_explicit_event_id_requires_stable_timestamp():
             "context": {},
         }
         for _ in range(2):
-            try:
+            with pytest.raises(
+                ValidationError, match="timestamp is required when event_id is provided"
+            ):
                 db.insert_event(event)
-                assert False, "A stable event_id needs a stable timestamp"
-            except ValidationError as exc:
-                assert "timestamp is required when event_id is provided" in str(exc)
 
         assert db.get_stats()["total_events"] == 0
         assert db.get_chain_checkpoint()["event_count"] == 0
@@ -1603,11 +1587,8 @@ def test_batch_conflict_rolls_back_events_and_chain_head():
             **original,
             "outcome": {"status": "error"},
         }
-        try:
+        with pytest.raises(EventConflictError):
             db.insert_events([new_event, conflicting])
-            assert False, "The conflicting tail event must abort the batch"
-        except EventConflictError:
-            pass
 
         assert [event["event_id"] for event in db.query(limit=20)] == ["existing"]
         assert db.get_chain_checkpoint() == before
@@ -1646,11 +1627,8 @@ def test_database_permissions_and_symlink_rejection():
             pass
         link = os.path.join(tmpdir, "linked.db")
         os.symlink(target, link)
-        try:
+        with pytest.raises(ValueError, match="(?i)symlink"):
             AuditDB(link)
-            assert False, "A symlink database path must be rejected"
-        except ValueError as exc:
-            assert "symlink" in str(exc).lower()
 
 
 def test_insert_events_preserves_replays_within_batch():
@@ -1768,11 +1746,8 @@ def test_insert_events_rollback_on_bad_event():
         }
 
         # Batch with the invalid event — should raise and leave DB empty
-        try:
+        with pytest.raises(ValidationError):
             db.insert_events([valid_event, invalid_event])
-            assert False, "Should have raised ValidationError"
-        except ValidationError:
-            pass
 
         # DB must be completely unchanged (the valid_event was NOT inserted)
         stats = db.get_stats()
@@ -2180,11 +2155,8 @@ def test_aggregate_validation():
             lambda: db.query(offset=-1),
             lambda: db.list_sessions(limit=0),
         ):
-            try:
+            with pytest.raises(ValueError):
                 bad_call()
-                assert False, "Expected ValueError"
-            except ValueError:
-                pass
 
         db.close()
 
