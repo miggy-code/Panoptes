@@ -1,15 +1,13 @@
 # Proxy hooks
 
-> **Status: implemented**, in `panoptes/hooks.py` and `ProxyServer`. The
-> contract below was approved before the code was written; changing it is a
-> breaking change to every embedder. Decided: `after_exchange` is owed for every
-> entered exchange; every exchange has a `correlation_id`; one hooks object per
-> proxy.
+> **Status: implemented** in `panoptes/hooks.py` and `ProxyServer`. A change
+> to this contract is a breaking change for every embedder.
 
-The Panoptes reverse proxy observes model-API traffic: it forwards each request,
-parses it and the response, prices the usage and records events. It never
-decides anything and never blocks. Anything that decides plugs in through two
-hooks, one before the request leaves and one after the exchange ends.
+The Panoptes reverse proxy observes model API traffic. It forwards each
+request, parses the request and the response, prices the usage, and records
+events. It makes no policy decisions. Code that makes decisions plugs in
+through two hooks: one runs before the request leaves, and one runs after the
+exchange ends.
 
 ```python
 from panoptes.db import AuditDB
@@ -34,25 +32,27 @@ server.stop()                # stops accepting, finishes in-flight exchanges
 
 ## Entry point
 
-`ProxyServer(...)` is the embeddable entry point and its own handle:
-`start()` returns without blocking and returns the bound port, `.port` holds it,
-and `.stop()` shuts the proxy down. It takes `hooks=`, `db=`, `upstreams=` and
-`pricing=` in addition to the arguments it takes today. `start_proxy(...)` is the
-command-line entry point; it **blocks** until interrupted, takes `db_path` only,
-and gains no hook support.
+`ProxyServer(...)` is the entry point for embedding. It is also the handle:
+
+- `start()` returns at once with the bound port. `.port` also holds the port.
+- `stop()` shuts the proxy down.
+- The hook-related arguments are `hooks`, `db`, `chain`, `upstreams`,
+  `pricing`, `disconnect_drain_seconds`, and `hook_slow_seconds`.
+
+`start_proxy(...)` is the command-line entry point. It **blocks** until it is
+interrupted. It takes `db_path` only and has no hook support.
 
 `panoptes.hooks` imports no HTTP client, so it loads without the `[proxy]`
-extra. With `hooks=None` (the default) the proxy is pure observe and
-pass-through: no hook code runs, nothing new is buffered, and behaviour is
-unchanged.
+extra. With `hooks=None` (the default), no hook code runs and nothing extra is
+buffered.
 
-`stop()` waits for in-flight exchanges, so every entered exchange still gets
-its `after_exchange` on an orderly shutdown (bounded by the upstream timeout,
-120 seconds; it logs a warning if exchanges are still running after that).
+`stop()` waits for open exchanges, so each entered exchange still gets its
+`after_exchange` call on an orderly shutdown. The wait is limited by the
+upstream timeout (120 seconds). After that, `stop()` logs a warning if
+exchanges are still running.
 
-Panoptes has no credential injection, budgets or policy engine of its own: a hook
-is how a consumer adds them. The constructor arguments are `hooks`, `db`, `chain`,
-`upstreams`, `pricing`, `disconnect_drain_seconds` and `hook_slow_seconds`.
+Panoptes has no credential injection, budgets, or policy engine. A consumer
+adds them with a hook.
 
 ## What a hook may and may not do
 
@@ -171,8 +171,7 @@ exchange.identity = Identity(agent_type="claude_code", session_id=run, run_id=ru
 ```
 
 `Identity` is a frozen value and assignment replaces it as a whole, so a hook
-never leaves a half-updated identity. Panoptes seeds `exchange.identity` as it
-does today: from the client's `X-Panoptes-Agent` and `X-Panoptes-Session`
+never leaves a half-updated identity. Panoptes seeds `exchange.identity` from the client's `X-Panoptes-Agent` and `X-Panoptes-Session`
 headers, the User-Agent, and a generated `run_id`. Those are **client
 assertions**, nothing more. A hook that authenticates the caller replaces it
 wholesale, and the exchange is joined to that run, not to whatever the client
@@ -358,18 +357,18 @@ but keeps **draining the upstream** and capturing it, up to
 provider's final usage. If the stream ends inside the bound, the usage is parsed
 normally and `complete` is `True`: `complete` describes what Panoptes read, not
 what the client received. If the bound is hit first, Panoptes closes the upstream
-connection, `complete` is `False` and `usage` is `{}`. `request_sent` is `True`
-either way. Draining holds the request slot, so the bound is the cost cap. The time bound is
-a wall-clock deadline: when it passes Panoptes cuts the upstream read even if the
-provider has gone silent, and `complete` is `False`. (A disconnect is noticed
-when Panoptes next writes to the client; until then the relay behaves as it
-always has, bounded by the upstream read timeout.)
+connection, `complete` is `False`, and `usage` is `{}`. `request_sent` is
+`True` either way. Draining holds the request slot, so the bound is the cost
+limit. The time bound is a wall-clock deadline. When it passes, Panoptes stops
+the upstream read even if the provider sends nothing more, and `complete` is
+`False`. Panoptes notices a disconnect the next time it writes to the client.
+Until then, the upstream read timeout limits the relay.
 
 A buffered (non-streamed) response is read in full before it is written, so a
 client that disconnects before the write has no effect on `complete`.
 
-Draining is part of hook support: a proxy with no hooks ends the relay when the
-client leaves, as it always has.
+Draining is part of hook support. A proxy with no hooks ends the relay when
+the client leaves.
 
 ## Upstreams
 

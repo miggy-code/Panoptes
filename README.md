@@ -2,104 +2,130 @@
 
 <p align="center">
   <strong>Agent observability and local audit trails.</strong><br>
-  A local-first record of OpenAI-, Anthropic-, Gemini-, and Hermes-based workflows.
+  A local record of OpenAI-, Anthropic-, Gemini-, and Hermes-based agent workflows.
 </p>
 
 <p align="center">
   <a href="https://github.com/miggy-code/Panoptes/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/miggy-code/Panoptes/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://pypi.org/project/panoptes-observe/"><img alt="PyPI" src="https://img.shields.io/pypi/v/panoptes-observe.svg"></a>
   <a href="LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-blue.svg"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg">
 </p>
 
-Panoptes records what agents and models did and lets you read it back. Point a
-supported model client at the local reverse proxy and Panoptes turns requests,
-responses, tool instructions, and cost data into a queryable SQLite audit trail.
-Hermes integrations can also report lifecycle events.
+Panoptes records what your agents and models do. Point a model client at the
+local reverse proxy. Panoptes then writes each request, response, tool call,
+and token count to a SQLite audit trail that you can query.
 
-Panoptes observes. It never decides and never blocks: nothing in it allows,
-denies, rewrites, or rate-limits a request. Anything that decides plugs in
-through the [hook seam](docs/hooks.md) from another package.
+```text
+$ panoptes session demo-session        # output shortened
+Session: demo-session (7 of 7 events)
+2026-11-23T20:07:34.246Z  model_request  claude-example  SUCCESS
+2026-11-23T20:07:34.252Z  model_response  claude-example  SUCCESS (6 ms)
+2026-11-23T20:07:34.252Z  tool_call  terminal  PENDING
+  command=kubectl get pods -n prod | Model proposed this tool call; local execution was not observed
+2026-11-23T20:07:34.266Z  tool_result  unknown  SUCCESS
+  api-7d9f 1/1 Running | execution=client-reported
+...
+```
 
-It runs locally with no external service. It records model API traffic and
-host-reported lifecycle events; tool calls emitted by a model remain requests
-unless the host reports an execution outcome.
+Panoptes runs on your machine. It needs no external service, and its core has
+no runtime dependencies.
 
 ## Why
 
-Agent logs tend to be provider-specific, short-lived, and hard to compare.
-Panoptes is built to answer a smaller set of operational questions well:
+Agent logs are usually specific to one provider, short-lived, and hard to
+compare. Panoptes answers a small set of questions well:
 
-- Which model requests and tool instructions crossed the observed API path?
-- What did each exchange cost, and how many tokens did it use?
-- Which events belong to the same run, and which run spawned which?
-- Has the locally stored event history changed since a checkpoint?
+- Which model requests and tool calls went through the proxy?
+- How many tokens did each exchange use, and what did it cost?
+- Which events belong to the same run, and which run started which?
+- Did the stored history change after a checkpoint?
 
-Every supported adapter writes the same event shape. Every event carries
-capture metadata describing where it came from and how strong that observation
-is. That gives you one dependable record for tracing agent behavior,
-investigating incidents, and testing ideas, without the operational weight of a
-distributed observability stack.
+All adapters write the same event shape. Each event also records how it was
+captured, so you can tell a model's *proposal* from an action the host
+*reported*.
 
-## Quick Start
+## Quick start
 
-Install Panoptes as an isolated command-line application. The proxy needs the
-`proxy` extra; the store and the CLI's query commands do not:
+Install the command-line tool. The proxy needs the `proxy` extra:
 
 ```bash
 pipx install 'panoptes-observe[proxy]'
-```
-
-Or use `uv`:
-
-```bash
+# or
 uv tool install 'panoptes-observe[proxy]'
 ```
 
-The distribution is named `panoptes-observe`; the installed command remains
-`panoptes`. To work on the source instead:
+The package name is `panoptes-observe`. The command is `panoptes`.
 
-```bash
-git clone https://github.com/miggy-code/Panoptes.git
-cd Panoptes
-python -m pip install -e ".[dev]"   # includes the proxy extra's httpx
-```
-
-### Capture model API traffic
-
-Start Panoptes in one terminal:
+Start the proxy in one terminal:
 
 ```bash
 panoptes proxy --port 8081
 ```
 
-Then point a supported client at it from another terminal:
+Point a client at it from a second terminal:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8081 claude
 ```
 
-After the run, inspect what Panoptes recorded:
+Read what Panoptes recorded:
 
 ```bash
 panoptes status
 panoptes query --event-type tool_call --limit 10
 ```
 
-The proxy forwards every request and relays every stream as it arrives. Add
-`--pricing rates.json` (a versioned JSON rate table) and responses carry an
-estimated cost; a response that cannot be priced is recorded as unpriced.
+To see the full flow without a real provider, follow
+[Investigating a session](docs/investigating-a-session.md). It runs the proxy
+against a local fake upstream.
 
-The proxy only binds to loopback. Client sockets have a 30-second I/O timeout
-and the server accepts at most 64 concurrent requests by default; tune these
-with `--client-timeout` and `--max-concurrent-requests`.
+## What Panoptes does and does not do
 
-### Embed the proxy and decide with hooks
+Panoptes records. It does not make policy decisions: it does not allow, deny,
+rewrite, or rate-limit requests. A separate package can add those decisions
+through the [hook interface](docs/hooks.md).
 
-The proxy can run inside another process, with a hook that is called before a
-request is forwarded and after the exchange ends. A hook can reject a request,
-set the identity it is recorded under, set the outbound headers (that is how a
-gateway injects a provider key) and settle the cost afterwards. The proxy itself
-never decides anything.
+Panoptes *fails closed* on traffic that it cannot record correctly:
+
+- It refuses provider endpoints that are not on its allowlist, such as batch
+  and file uploads.
+- It refuses requests that are malformed, too large, or have duplicate JSON
+  keys.
+- It replaces a buffered reply with HTTP 502 when the reply has a duplicate
+  JSON key. The client and the audit trail could read different values.
+- It replaces a buffered reply with HTTP 502 when the reply is larger than the
+  inspection limit.
+
+Panoptes does not prove that a tool ran. A `tool_call` event is a model's
+proposal. It stays `pending` until a host reports an outcome. Panoptes is not
+a security boundary. For the full trust model, read [SECURITY.md](SECURITY.md).
+
+## Usage
+
+### Run the proxy
+
+```bash
+panoptes proxy --port 8081 --pricing rates.json
+```
+
+- The proxy forwards each request and relays each stream as it arrives.
+- `--pricing` loads a versioned JSON rate table. Responses then carry an
+  estimated cost. A response that Panoptes cannot price is marked unpriced.
+- The proxy binds only to loopback addresses.
+- `--client-timeout` sets the client socket timeout (default 30 seconds).
+- `--max-concurrent-requests` sets the request limit (default 64).
+
+Send `X-Panoptes-Session: <id>` to group exchanges into one session. Without
+it, each exchange is its own session. The `X-Panoptes-*` headers are client
+claims, not authenticated identities. Panoptes removes them before it forwards
+the request.
+
+### Embed the proxy and add hooks
+
+You can run the proxy inside another process. A hook runs before Panoptes
+forwards a request and after the exchange ends. A hook can reject a request,
+set the recorded identity, change outbound headers, and settle the cost.
 
 ```python
 from panoptes.hooks import ProxyHooks, Reject
@@ -111,28 +137,26 @@ class Gate(ProxyHooks):
             return Reject(403, reason="openai_not_allowed")
 
 server = ProxyServer(port=0, db_path="~/.panoptes/audit.db", hooks=Gate())
-port = server.start()        # non-blocking; server.stop() when done
+port = server.start()        # Returns at once. Call server.stop() when done.
 ```
 
-The full contract is in [docs/hooks.md](docs/hooks.md).
-Lifecycle and capture guarantees are summarized in
+The full contract is in [docs/hooks.md](docs/hooks.md). Lifecycle rules are in
 [docs/lifecycle-invariants.md](docs/lifecycle-invariants.md).
 
-### Install Hermes lifecycle hooks
+### Record Hermes lifecycle events
 
 ```bash
 python -m panoptes.install_hermes_plugin
 ```
 
-The installer supplies the current Hermes `plugin.yaml` and `register(ctx)`
-interface, plus legacy entrypoints. Add `panoptes` to Hermes `plugins.enabled`;
-the Panoptes package must be importable in the Hermes environment for local
-capture. Current Hermes `on_session_start`, `post_tool_call`, and `on_session_end`
-observations become Panoptes lifecycle events; `on_session_finalize` ends a
-session. Those hooks observe; they do not block. For isolated agents,
-`PANOPTES_HERMES_SINK` can direct observations to a separately protected
-Panoptes listener; this does not authenticate the host or prove tool execution.
-For example, start a sink on a protected local network with:
+Then add `panoptes` to `plugins.enabled` in Hermes. The Panoptes package must
+be importable in the Hermes environment.
+
+The plugin records `on_session_start`, `post_tool_call`, and `on_session_end`
+as lifecycle events. `on_session_finalize` ends a session. The hooks record
+only. They never block Hermes.
+
+To send events from an isolated agent to a separate listener, start a sink:
 
 ```python
 from panoptes.hermes_ingest import make_server
@@ -141,43 +165,28 @@ make_server(("127.0.0.1", 8083), "/private/audit.sqlite",
             "/private/hermes-events.jsonl").serve_forever()
 ```
 
-Set `PANOPTES_HERMES_SINK=http://127.0.0.1:8083/lifecycle` in Hermes. In a
-container, bind the listener only to the isolated network. Lifecycle events
-are written to the Panoptes audit database; the optional JSONL journal holds
-host-reported child links and request fingerprints for reconciliation.
+Then set `PANOPTES_HERMES_SINK=http://127.0.0.1:8083/lifecycle` in Hermes. In
+a container, bind the listener only to the isolated network. The listener does
+not authenticate the host.
 
 ### Query and verify
 
 ```bash
 panoptes query --agent hermes --event-type agent_step --limit 50
-panoptes session <session-id>
-panoptes session <session-id> --limit 50
-panoptes session <session-id> --json
+panoptes session <session-id> [--limit N] [--json]
 panoptes evidence <event-id>
 
-# Verify local hash links and export a checkpoint for separate storage
-panoptes verify
-panoptes checkpoint > checkpoint.json
-
-# Later, prove that separately stored checkpoint is a prefix of current history
-panoptes verify --checkpoint checkpoint.json
+panoptes verify                              # check the local hash chain
+panoptes checkpoint > checkpoint.json        # store this file somewhere else
+panoptes verify --checkpoint checkpoint.json # later: prove history only grew
 ```
 
-Read-only database commands require an existing initialized audit database. A
-missing, mistyped, or empty `--db-path` exits with status 2 instead of creating
-a new database.
-
-`session` shows a chronological timeline with event status, tool or model,
-available duration, and event/run/exchange/correlation/call IDs. `evidence` uses
-the same timeline format for related records. Model proposals remain distinct from
-reported execution outcomes. By default `session` selects up to 10,000 newest events;
-`--limit` selects fewer. Partial timelines state the selected and matching
-counts. `--json` returns full stored events with those counts and a `partial`
-flag. Events written by an earlier version or by another producer may carry
-decision records; the timeline shows them as recorded.
-
-See [reviewing a retained evaluation-lab trial](docs/incident-review.md) for a
-read-only investigation using existing capture, execution, and recovery evidence.
+- `session` shows a timeline with status, tool or model, duration, and IDs.
+- `evidence` shows the events related to one event, in the same format.
+- `session` selects up to 10,000 of the newest events. When it shows only
+  part of a session, it prints the selected and matching counts.
+- Read-only commands need an existing audit database. A missing or empty
+  `--db-path` exits with status 2. Panoptes does not create a new database.
 
 ### Check your setup
 
@@ -185,13 +194,58 @@ read-only investigation using existing capture, execution, and recovery evidence
 panoptes doctor
 ```
 
-Doctor checks an existing database and schema, reports the latest audit
-timestamp, and warns when history is empty or older than 24 hours. It opens the
-database read-only, does not repair files or attempt audit writes, and makes no
-provider requests. Exit status is 0 when checks pass (warnings may remain), or 2
-when a check fails. It does not discover a running proxy's settings, prove
-client routing, or verify the hash chain; use `panoptes verify` for the chain
-check.
+`doctor` opens the database read-only. It checks the schema and the newest
+event time. It warns when the history is empty or older than 24 hours. It
+exits with 0 when checks pass and 2 when a check fails. It does not verify the
+hash chain. Use `panoptes verify` for that.
+
+### Export to OpenTelemetry
+
+```bash
+pip install 'panoptes-observe[otel]'
+panoptes export-otel --endpoint http://127.0.0.1:4318/v1/traces --limit 1000
+```
+
+The export reads committed events and sends metadata only. It never sends
+prompts, tool arguments, or results. For the mapping and delivery limits, read
+[docs/otel-export.md](docs/otel-export.md).
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `panoptes proxy` | Start the loopback-only model API reverse proxy |
+| `panoptes status` | Show event counts |
+| `panoptes doctor` | Check the audit database (read-only) |
+| `panoptes query` | Find events by agent, type, tool, or time |
+| `panoptes session <id>` | Show a session timeline |
+| `panoptes evidence <id>` | Show the events related to one event |
+| `panoptes verify` | Verify the local chain or a stored checkpoint |
+| `panoptes checkpoint` | Print the current chain checkpoint |
+| `panoptes export-otel` | Export event metadata over OTLP/HTTP |
+| `panoptes --version` | Show the installed version |
+
+## Supported protocols
+
+| Protocol | Capture method |
+|---|---|
+| Anthropic Messages API | Reverse proxy |
+| OpenAI Chat Completions and Responses APIs | Reverse proxy |
+| Gemini `generateContent` and `streamGenerateContent` | Reverse proxy |
+| Hermes Agent | Plugin (host-reported lifecycle) |
+
+An agent works with the proxy if you can change its model API base URL and it
+uses a supported protocol.
+
+The parsers recognize these tool types:
+
+- **OpenAI:** function, custom, computer, shell, apply-patch, and hosted tools.
+- **Anthropic:** client and server tool blocks.
+- **Gemini:** function, built-in tool, and code-execution parts.
+
+Panoptes records an unrecognized tool type under `action.unknown_tool_types`.
+It never treats an unknown type as safe. New provider features need a parser
+update and test fixtures before Panoptes supports them.
 
 ## Architecture
 
@@ -199,51 +253,25 @@ check.
 adapter → normalize → SQLite → read API / CLI
 ```
 
-Each adapter normalizes what it observes into the schema below, and the store
-commits it with an optional local hash chain. `capture.py` describes each
-adapter's fidelity so consumers can distinguish a model instruction from a
-host-reported action.
+Each adapter converts what it observes into one event schema. Before Panoptes
+stores an event, it does these steps:
 
-### Capture adapters
+1. It validates identifiers, timestamps, outcomes, and costs.
+2. It redacts common secret formats.
+3. It adds heuristic data-access tags, such as `prod` or `infra`.
 
-| Adapter | Observes |
-|---------|----------|
-| Reverse proxy | Supported model requests, responses, tool instructions, and client-reported tool results |
-| Hermes plugin | Host-reported `agent_start`, `agent_step`, and `agent_end` events |
+Then the store commits the event, with an optional local hash chain.
 
-The reverse proxy sees only traffic that crosses it. It cannot see an arbitrary
-local file read after the agent receives a response, and an agent that still
-holds provider credentials can bypass it. At the boundary itself, Panoptes
-withholds a buffered reply whose JSON repeats an object key, because the client
-and the audit trail could otherwise read different values, and it refuses a
-buffered reply larger than its limit.
+Redaction and tags are best-effort. Redaction can miss a secret format, and a
+tag can be wrong.
 
-For reliable cross-request timelines, adapters should send
-`X-Panoptes-Session: <stable-session-id>`. Without it, each exchange is
-isolated. `X-Panoptes-Agent` and session headers are client assertions, not
-authenticated workload identities, and are removed before upstream forwarding.
-An embedding hook can set the identity itself; the event then records that a hook
-asserted it.
-
-Every proxied exchange gets a `run_id` and a `correlation_id`. The correlation
-id is the client's `X-Panoptes-Correlation-Id` when it sends a valid one (a
-client assertion, not proof of anything) and otherwise the exchange's own id;
-`attributes.correlation_source` says which. Events also carry
-`attributes.exchange_id`, which is unique per request even when a client reuses
-its correlation id.
-
-### Audit schema
+### Event schema
 
 ```json
 {
   "event_id": "uuid",
   "timestamp": "2026-07-17T14:30:00.000Z",
-  "agent": {
-    "type": "claude_code",
-    "session_id": "abc123",
-    "run_id": "run456",
-    "parent_run_id": null
-  },
+  "agent": {"type": "claude_code", "session_id": "abc123", "run_id": "run456"},
   "event_type": "tool_call",
   "correlation_id": "c0ffee",
   "attributes": {"exchange_id": "…", "correlation_source": "proxy"},
@@ -268,162 +296,80 @@ its correlation id.
 }
 ```
 
-**Schema v5** (this release) opens the vocabulary and removes invented
-defaults:
+The current schema is version 5:
 
-- `agent.type` and `user.auth_method` are any validated identifier. The adapters
-  Panoptes ships (`claude_code`, `codex`, `hermes`, …) are a list of known
-  names, not an enforced set.
-- `run_id` is optional and never invented by the store, and `agent.parent_run_id`
-  links a child agent to its parent. `session_id` is still required.
-- `user` is optional. There is **no default user**: an event without one stores
-  an empty `user`, where earlier versions filled in `local_user` and `cli`.
-- `correlation_id` is a first-class, indexed field, and `attributes` is an open,
-  size-bounded JSON object redacted like `context`.
-- Another producer names its events `<namespace>.<name>` (for example
-  `acme.allow`); the built-in event types stay a closed set.
-- An event that declares `context.schema_version` 1 to 4 keeps the rules of that
-  version, and v1–v4 databases migrate in place with their hash chains still
-  verifying.
+- `agent.type` accepts any valid identifier. The built-in adapter names are a
+  list, not an enforced set.
+- `run_id` is optional. The store never makes one up. `agent.parent_run_id`
+  links a child agent to its parent. `session_id` is required.
+- `user` is optional. There is no default user.
+- `correlation_id` is an indexed field. `attributes` is an open JSON object
+  with a size limit.
+- Other producers name their event types `<namespace>.<name>`, for example
+  `acme.allow`.
+- Version 1 to 4 databases migrate in place. Their hash chains still verify.
 
-The Python API for writing, strict ingest, read-only reading, `iter_events` and
-the optional hash chain is in [docs/api.md](docs/api.md). By default a new
-database is hash-chained and an existing one keeps its mode; `AuditDB(path,
-chain=False)` creates one without a chain, which then verifies as `absent`,
-never as valid.
+Request events also store a system prompt hash, a history hash, and the
+declared tool names. They store no prompt text in those fields.
 
-Before an event reaches disk, Panoptes validates its identifiers, timestamps,
-outcomes, and costs; redacts common secret forms; and derives heuristic
-data-access tags from the action. Those tags are useful for investigation, but
-they can be wrong. Treat both redaction and classification as defense in depth,
-not as complete data-loss prevention.
+For the Python API and the hash-chain modes, read [docs/api.md](docs/api.md).
 
-Request events include complete bounded summaries of requested client-side,
-provider-hosted, and unknown tool capabilities, plus a system-prompt hash, a
-history hash and the declared tool names (no text is stored). Client-executed
-model tool proposals remain `pending`; recognized provider-hosted actions record
-whether they completed, failed, or remain pending upstream. Hosted result
-excerpts are redacted and bounded. A tool type Panoptes does not recognize is
-recorded under `action.unknown_tool_types`, never treated as known-safe.
+### Token and cost fields
 
-## Supported Protocols and Adapters
+Response events store `cost.tokens_in` and `cost.tokens_out` as totals. When
+the provider reports them, Panoptes also stores these breakdowns:
 
-| Protocol / adapter | Capture method |
-|--------------------|----------------|
-| Anthropic Messages API | Reverse proxy |
-| OpenAI Chat Completions and Responses APIs | Reverse proxy |
-| Gemini `generateContent` and `streamGenerateContent` | Reverse proxy |
-| Hermes Agent | Native plugin (host-reported lifecycle) |
+| Field | Meaning |
+|---|---|
+| `cost.reasoning_tokens` | Reasoning or thinking tokens. Part of `tokens_out`. |
+| `cost.cached_input_tokens` | Cache reads. Part of `tokens_in`. |
+| `cost.cache_creation_input_tokens` | Cache writes. Part of `tokens_in`. |
+| `cost.cache_creation_5m_input_tokens` | Anthropic 5-minute cache writes. |
+| `cost.cache_creation_1h_input_tokens` | Anthropic 1-hour cache writes. |
+| `cost.tool_prompt_tokens` | Gemini tool prompt tokens. Separate from its prompt count. |
 
-An agent is proxy-compatible only if it lets you replace its model API base URL
-and emits a supported protocol. That is not equivalent to a tested native
-integration.
+A missing field means the provider did not report it. It does not mean zero.
+Anthropic thinking tokens are an estimate. Token counts from different
+providers are not always comparable.
 
-Current action parsing covers OpenAI function/custom/computer/shell/apply-patch
-and hosted-tool output items, Anthropic client and server tool blocks, and
-Gemini function, built-in tool, and code-execution parts. A tool declaration or
-response item type that Panoptes does not recognize is recorded as unknown and
-never becomes an implicit safe result. Provider features introduced after this
-release, including OpenAI programmatic tool-calling output, require an adapter
-update and adversarial fixtures before they are supported.
-
-## Commands
-
-```text
-panoptes proxy          Start the loopback-only model-API reverse proxy
-panoptes --version      Show the installed Panoptes version
-panoptes status         Show event statistics
-panoptes doctor         Check the audit database (read-only)
-panoptes query          Query events by agent, type, tool, or time
-panoptes session <id>   Show a chronological timeline (--limit N, --json)
-panoptes evidence <id>  Reconstruct a related event path
-panoptes verify         Verify the local chain or a separately stored checkpoint
-panoptes checkpoint     Print the current chain checkpoint
-```
-
-## Project Status
+## Project status
 
 | Component | Status |
-|-----------|--------|
-| Model-API reverse proxy and hook seam | Alpha |
+|---|---|
+| Model API reverse proxy and hooks | Alpha |
 | Hermes lifecycle plugin | Alpha |
-| SQLite storage and local hash chain | Available; external checkpoints remain operator-managed |
+| SQLite storage and local hash chain | Available |
 | Query and integrity CLI | Available |
+| OpenTelemetry export | Alpha |
 
-The project targets Python 3.10 through 3.13 and runs its tests, distribution
-validation, and wheel smoke test in GitHub Actions. Passing tests do not expand
-the adapter guarantees described in [SECURITY.md](SECURITY.md).
-
-The core has no runtime dependencies. The proxy needs `httpx`
-(`pip install 'panoptes-observe[proxy]'`).
+CI runs the tests on Python 3.10 to 3.13. It also builds the package and runs
+a smoke test on the installed wheel.
 
 ## Development
 
-Create an environment, install the development extra, and run the suite:
-
 ```bash
+git clone https://github.com/miggy-code/Panoptes.git
+cd Panoptes
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev,release]"
 python -m pytest -q
-python -m build
-python -m twine check --strict dist/*
 ```
 
-The tests are local and network-independent. A change is ready to review when
-the full suite passes and `git diff --check` is clean. Release ownership and
-the tagged publishing flow are documented in [RELEASING.md](RELEASING.md).
+The tests run locally and need no network. A change is ready for review when
+the full suite passes and `git diff --check` is clean. The release process is
+in [RELEASING.md](RELEASING.md).
 
-Focus tests on observable behavior: capture, the hook contract, audit storage
-and integrity, and CLI flows. Use shared setup and parameterized cases for
-repeated inputs. Test helpers through those behaviors unless a separate test
-protects a distinct data-loss boundary.
+Write tests for observable behavior: capture, the hook contract, storage and
+integrity, and CLI flows.
 
 ## Contributing
 
 Bug reports, protocol fixtures, and focused adapters are welcome. The most
-useful contributions strengthen an existing boundary: external append-only audit
-sinks and adversarial provider fixtures. For security issues, please use the
-private reporting path in [SECURITY.md](SECURITY.md).
+useful work makes an existing boundary stronger, for example external
+append-only audit sinks or adversarial provider fixtures. Report security
+issues through the private process in [SECURITY.md](SECURITY.md).
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
-
-### Provider usage breakdowns
-
-Model response events retain `cost.tokens_in` and `cost.tokens_out` as totals.
-When reported by the provider, `cost.reasoning_tokens` records Gemini thought
-tokens, OpenAI reasoning tokens, or Anthropic thinking tokens; these are
-subsets of output tokens. `cost.cached_input_tokens` records cache reads, and
-Anthropic and OpenAI may also report cache writes as `cost.cache_creation_input_tokens`;
-Anthropic's 1-hour TTL share of those writes is `cost.cache_creation_1h_input_tokens`.
-Both reads and writes are parts of `cost.tokens_in`. Gemini may
-also report `cost.tool_prompt_tokens`, separate from its prompt token count.
-A missing breakdown means unavailable, not zero. Anthropic's thinking count
-is an estimate from re-tokenization, and providers' token counts and caching
-semantics are not necessarily directly comparable.
-
-`AuditDB.aggregate` supports these breakdown names and their corresponding
-`_reported` counts. Sums are null when no events reported the metric; use the
-counts to assess coverage before comparing runs. Existing events are unchanged.
-
-### Optional OpenTelemetry output
-
-Export committed audit observations separately from capture:
-
-```bash
-pip install 'panoptes-observe[otel]'
-panoptes export-otel --db-path ~/.panoptes/audit.db \
-  --endpoint http://127.0.0.1:4318/v1/traces --limit 1000
-# Optional selection: --session-id SESSION --since ISO8601 --until ISO8601
-```
-
-This reads the newest selected events without modifying the database. It sends
-metadata only, including identifiers and capture fidelity; prompts, tool arguments,
-results and raw bodies are excluded. Each record is a zero-duration observation,
-not proof of tool execution. Export failures exit nonzero; earlier batches may
-have succeeded. Repeating export can produce duplicates at the receiver. Capture
-has no OTel dependency unless this extra is installed and the command is invoked.
-See the [architecture review and mapping](docs/architecture-review.md) for lifecycle
-changes, delivery limits and the exact privacy boundary.
+Apache 2.0. See [LICENSE](LICENSE).

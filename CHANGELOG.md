@@ -5,6 +5,18 @@ All notable changes to Panoptes are recorded here. Releases follow
 
 ## [Unreleased]
 
+### Documentation
+
+- Rewrite the README, SECURITY, RELEASING, AGENTS, and lifecycle docs in
+  simplified technical English. The README now lists every case where the proxy
+  fails closed, and includes `export-otel` in the command table.
+- Add `docs/investigating-a-session.md`, a walkthrough that runs on a local fake
+  upstream. It replaces the walkthrough that depended on external lab data.
+- Replace the architecture review with `docs/otel-export.md`, which documents
+  the export mapping and delivery limits. Move the lifecycle limits into
+  `docs/lifecycle-invariants.md`.
+- Remove the internal implementation record.
+
 ## [0.3.0] - 2026-11-06
 
 ### Breaking
