@@ -51,9 +51,12 @@ voice, one idea per sentence.
 ```bash
 uv sync
 uv run pytest -q
+uv run ruff check
+uv run ruff format --check
+uv run mypy
 ```
 
-A change is mergeable only when the full suite passes.
+A change is mergeable only when all five pass. CI runs the same commands.
 
 ## Conventions
 

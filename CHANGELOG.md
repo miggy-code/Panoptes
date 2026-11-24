@@ -23,6 +23,7 @@ All notable changes to Panoptes are recorded here. Releases follow
   dependency groups pinned in `uv.lock`, and CI installs with
   `uv sync --locked`. The `dev` and `release` extras are removed; users install
   the package as before.
+- Add ruff (lint and format) and mypy checks. CI runs both on every push.
 
 ## [0.3.0] - 2026-11-06
 

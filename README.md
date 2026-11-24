@@ -342,8 +342,8 @@ providers are not always comparable.
 | Query and integrity CLI | Available |
 | OpenTelemetry export | Alpha |
 
-CI runs the tests on Python 3.10 to 3.13. It also builds the package and runs
-a smoke test on the installed wheel.
+CI runs ruff and mypy, runs the tests on Python 3.10 to 3.13, builds the
+package, and runs a smoke test on the installed wheel.
 
 ## Development
 
@@ -352,6 +352,7 @@ git clone https://github.com/miggy-code/Panoptes.git
 cd Panoptes
 uv sync
 uv run pytest -q
+uv run ruff check && uv run ruff format --check && uv run mypy
 ```
 
 `uv sync` creates `.venv` and installs the locked dev tools from `uv.lock`.
@@ -359,7 +360,7 @@ Without uv, run `pip install -e ".[proxy,otel]" --group dev` (pip 25.1 or
 newer).
 
 The tests run locally and need no network. A change is ready for review when
-the full suite passes and `git diff --check` is clean. The release process is
+the tests, lint, format and type checks pass, and `git diff --check` is clean. The release process is
 in [RELEASING.md](RELEASING.md).
 
 Write tests for observable behavior: capture, the hook contract, storage and
