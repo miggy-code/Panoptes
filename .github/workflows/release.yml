@@ -17,10 +17,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # No dependency cache here: a release builds from a clean slate.
+      # No dependency cache: a release builds from a clean slate.
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.13"
+          enable-cache: false
 
       - name: Verify release tag matches package version
         env:
