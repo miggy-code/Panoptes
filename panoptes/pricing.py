@@ -7,13 +7,14 @@ needs. Everything else is reported as unpriced.
 
 from __future__ import annotations
 
+import enum
 import json
 import math
 import os
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from fractions import Fraction
-from typing import Any
+from typing import Any, Literal
 
 MICROS_PER_USD = 1_000_000
 RATE_FIELDS = ("input_per_million", "cached_input_per_million", "output_per_million")
@@ -38,9 +39,16 @@ def usd_to_micros(value: Any) -> int:
 
 
 def _count(cost: dict, field: str) -> int | None:
+    """An optional token count: 0 when absent, None when malformed."""
     value = cost.get(field)
     if value is None:
         return 0
+    return _required_count(cost, field)
+
+
+def _required_count(cost: dict, field: str) -> int | None:
+    """A required token count, or None when it is absent or malformed."""
+    value = cost.get(field)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
@@ -114,18 +122,21 @@ class PricingTable:
         rounded up to a whole micro-dollar once, at the end.
         """
         rate = self.models.get(model or "")
-        tokens_in, tokens_out = cost.get("tokens_in"), cost.get("tokens_out")
-        if rate is None or any(
-            isinstance(v, bool) or not isinstance(v, int) or v < 0
-            for v in (tokens_in, tokens_out)
-        ):
+        if rate is None:
             return None
-        cached, tool_prompt = (
-            _count(cost, "cached_input_tokens"),
-            _count(cost, "tool_prompt_tokens"),
-        )
+        tokens_in = _required_count(cost, "tokens_in")
+        tokens_out = _required_count(cost, "tokens_out")
+        cached = _count(cost, "cached_input_tokens")
+        tool_prompt = _count(cost, "tool_prompt_tokens")
         writes = _count(cost, "cache_creation_input_tokens")
-        if None in (cached, tool_prompt, writes) or cached + writes > tokens_in:
+        if (
+            tokens_in is None
+            or tokens_out is None
+            or cached is None
+            or tool_prompt is None
+            or writes is None
+            or cached + writes > tokens_in
+        ):
             return None
         split = _write_split(cost, writes)
         if split is _INVALID or cost.get("cache_creation_split_invalid") is True:
@@ -145,10 +156,16 @@ class PricingTable:
         return math.ceil(micros)
 
 
-_INVALID = object()
+class _Split(enum.Enum):
+    INVALID = enum.auto()
 
 
-def _write_split(cost: dict, writes: int) -> tuple[int, int] | None | object:
+_INVALID = _Split.INVALID
+
+
+def _write_split(
+    cost: dict, writes: int
+) -> tuple[int, int] | None | Literal[_Split.INVALID]:
     """The (5-minute, 1-hour) split of cache writes; None when no split is reported; _INVALID when
     the split is partial, malformed, or does not sum to the total (including a nonzero split with no
     writes)."""

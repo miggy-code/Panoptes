@@ -182,7 +182,7 @@ class AnthropicProvider(Provider):
             parameters = block.get("input", {})
             if not isinstance(parameters, dict):
                 raise SSEParseError(f"Anthropic {block_type} input must be an object")
-            event = {
+            event: dict[str, Any] = {
                 "tool_name": name,
                 "parameters": parameters,
                 "call_id": call_id,

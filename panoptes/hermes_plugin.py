@@ -55,7 +55,7 @@ class AuditPlugin:
 
     def __init__(
         self,
-        db_path: str = None,
+        db_path: str | None = None,
         max_active_sessions: int = DEFAULT_MAX_ACTIVE_SESSIONS,
     ):
         if (

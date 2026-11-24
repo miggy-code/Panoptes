@@ -10,6 +10,7 @@ import math
 import re
 import unicodedata
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -166,7 +167,9 @@ _SENSITIVE_KEYS: frozenset = frozenset(
 )
 
 # Patterns for detecting secrets inside string values
-_CONTENT_PATTERNS: list[tuple[re.Pattern, str]] = [
+_CONTENT_PATTERNS: list[
+    tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]
+] = [
     # Bearer tokens in Authorization header values
     (re.compile(r"^Bearer\s+(\S{16,})$", re.IGNORECASE), "Bearer [REDACTED]"),
     (

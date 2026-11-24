@@ -109,7 +109,7 @@ def export_events(
     ):
         raise ValueError("batch_size must be between 1 and 10000")
     accepted = 0
-    batch = []
+    batch: list[ReadableSpan] = []
 
     def send() -> None:
         nonlocal accepted

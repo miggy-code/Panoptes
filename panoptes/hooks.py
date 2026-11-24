@@ -319,6 +319,10 @@ class Exchange:
     estimated_usd_micros: int | None
     provider_error: bool
     duration_ms: int | None
+    # Proxy-owned flags; hooks never set these directly.
+    _identity_frozen: bool
+    _identity_assigned: bool
+    _drop_query_credentials: bool
 
     def __init__(
         self,

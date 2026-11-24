@@ -908,6 +908,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     exchange_ctx=exchange_ctx,
                     query_credentials=query_credentials,
                     t0=t0,
+                    hooks=hooks,
+                    writer=writer,
                 )
                 if not self._run_before_forward(run):
                     return
@@ -1074,6 +1076,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         writer = self.writer
 
         def build_inspection_failure(
+            writer: AuditEventWriter,
             message: str,
             *,
             status: int,
@@ -1114,6 +1117,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             )
             if writer:
                 resp_events = build_inspection_failure(
+                    writer,
                     message,
                     status=exc.upstream_status or 502,
                     headers=exc.upstream_headers,
@@ -1152,6 +1156,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 inspection_error = str(exc)
 
         parse_failed = inspection_error is not None
+        record_response = writer is not None
 
         if ambiguous_response:
             # Two readings of one object: the client could act on a different
@@ -1159,11 +1164,16 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             message = (
                 "Upstream response denied because it could not be safely inspected"
             )
-            resp_events = build_inspection_failure(
-                f"{message}: {inspection_error}",
-                status=resp_status,
-                headers=resp_headers_raw,
-                blocked=True,
+            denial_events = (
+                build_inspection_failure(
+                    writer,
+                    f"{message}: {inspection_error}",
+                    status=resp_status,
+                    headers=resp_headers_raw,
+                    blocked=True,
+                )
+                if writer is not None
+                else []
             )
             resp_status = 502
             resp_body_bytes = json.dumps(
@@ -1176,17 +1186,20 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 "content-type": "application/json",
                 "x-panoptes-inspection-blocked": "true",
             }
-            try:
-                writer.write(  # type: ignore[union-attr]
-                    _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
-                )
-            except AuditWriteError:
-                log.exception("Uninspectable-response denial audit was not durable")
+            if writer is not None:
+                try:
+                    writer.write(
+                        _unpersisted_exchange_events(
+                            req_events, denial_events, exchange_ctx
+                        )
+                    )
+                except AuditWriteError:
+                    log.exception("Uninspectable-response denial audit was not durable")
             inspection_error = None  # denial has already been persisted
-            writer = None  # nothing further to record for an opaque body
+            record_response = False  # nothing further to record for an opaque body
 
-        if writer:
-            resp_events: list[dict] = []
+        if writer is not None and record_response:
+            resp_events = []
             try:
                 resp_events = writer.build_response_events(
                     path=path,
@@ -1222,6 +1235,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 log.warning("%s: %s", message, exc)
                 try:
                     fallback_events = build_inspection_failure(
+                        writer,
                         f"{message}: {exc}",
                         status=resp_status,
                         headers=resp_headers_raw,
@@ -1252,6 +1266,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 )
                 try:
                     fallback_events = build_inspection_failure(
+                        writer,
                         f"Response event construction failed: {exc}",
                         status=resp_status,
                         headers=resp_headers_raw,
@@ -1372,7 +1387,7 @@ class ProxyServer:
         self.client_socket_timeout_seconds = client_socket_timeout_seconds
         self.max_concurrent_requests = max_concurrent_requests
         self.pricing = pricing
-        self._server: http.server.HTTPServer | None = None
+        self._server: BoundedThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._db: AuditDB | None = None
         self._http_client: httpx.Client | None = None

@@ -997,10 +997,13 @@ class AuditDB:
                 if self._is_memory
                 else self._db_path
             )
+        # Connections are scoped to one database operation. ThreadingHTTPServer
+        # creates short-lived request threads, so retaining a thread-local
+        # connection would leak one connection per completed request.
+        self._all_conns: set[sqlite3.Connection] = set()
+        self._conns_lock = threading.Lock()
+        self._keeper_conn: sqlite3.Connection | None = None
         if read_only:
-            self._all_conns: set = set()
-            self._conns_lock = threading.Lock()
-            self._keeper_conn: sqlite3.Connection | None = None
             try:
                 _check_read_only_schema(self)
                 self._refresh_columns()
@@ -1009,13 +1012,6 @@ class AuditDB:
                 raise
             return
         _prepare_database_path(self._db_path)
-
-        # Connections are scoped to one database operation. ThreadingHTTPServer
-        # creates short-lived request threads, so retaining a thread-local
-        # connection would leak one connection per completed request.
-        self._all_conns: set = set()
-        self._conns_lock = threading.Lock()
-        self._keeper_conn: sqlite3.Connection | None = None
 
         try:
             # A named shared-memory database exists only while at least one

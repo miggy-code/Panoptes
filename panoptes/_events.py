@@ -286,7 +286,7 @@ class AuditEventWriter:
             # A client assertion for joining this exchange to an external journal;
             # it never changes agent type, session, or identity assurance.
             capture["client_correlation_id"] = correlation_id
-        event = {
+        event: dict[str, Any] = {
             "event_id": uuid.uuid4().hex,
             "timestamp": utcnow_iso(),
             "agent": {"type": agent_type, "session_id": session_id},
