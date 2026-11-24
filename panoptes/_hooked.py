@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from panoptes._events import AuditEventWriter, AuditWriteError, provider_reported_usage
+from panoptes._events import (
+    AuditEventWriter,
+    AuditWriteError,
+    ExchangeContext,
+    provider_reported_usage,
+)
 from panoptes.hooks import (
     STATIC_HOP_BY_HOP,
     Exchange,
@@ -149,7 +154,7 @@ class _ExchangeRun:
     seeded_events: list
     seeded_identity: Identity
     events: list
-    ctx: dict
+    ctx: ExchangeContext
     report: _ForwardReport = dataclasses.field(default_factory=_ForwardReport)
     fwd_headers: dict | None = None
     forward_path: str | None = None
@@ -207,22 +212,22 @@ class HookedExchangeMixin(_HandlerBase):
         body: bytes,
         req_body: dict | None,
         req_events: list[dict],
-        exchange_ctx: dict,
+        exchange_ctx: ExchangeContext,
         query_credentials: list[str],
         t0: float,
         hooks: ProxyHooks,
         writer: AuditEventWriter,
     ) -> _ExchangeRun:
         seeded = Identity(
-            agent_type=exchange_ctx["agent_type"],
-            session_id=exchange_ctx["session_id"],
-            run_id=exchange_ctx["run_id"],
+            agent_type=exchange_ctx.agent_type,
+            session_id=exchange_ctx.session_id,
+            run_id=exchange_ctx.run_id,
         )
         exchange = Exchange(
-            exchange_id=exchange_ctx["exchange_id"],
-            correlation_id=exchange_ctx["correlation_id"],
-            correlation_source=exchange_ctx["correlation_source"],
-            provider=exchange_ctx["req_format"],
+            exchange_id=exchange_ctx.exchange_id,
+            correlation_id=exchange_ctx.correlation_id,
+            correlation_source=exchange_ctx.correlation_source,
+            provider=exchange_ctx.provider,
             upstream_name=self._upstream_name,
             upstream_url=_upstream_url(*target, ""),
             method=method,
@@ -276,7 +281,7 @@ class HookedExchangeMixin(_HandlerBase):
             try:
                 if exchange._identity_assigned:
                     events, ctx = writer.build_request_events(
-                        path=run.ctx["path"],
+                        path=run.ctx.path,
                         method=exchange.method,
                         req_headers=run.client_headers,
                         req_body=run.req_body,
@@ -309,7 +314,6 @@ class HookedExchangeMixin(_HandlerBase):
         # The request intent is durable before it leaves the process.
         try:
             writer.write(events)
-            ctx["_request_events_persisted"] = True
         except AuditWriteError:
             log.exception("Request-intent audit could not be persisted")
             run.outcome, run.status = "not_forwarded", 503
@@ -390,7 +394,7 @@ class HookedExchangeMixin(_HandlerBase):
     def _note_response(
         self,
         resp_events: list[dict],
-        exchange_ctx: dict,
+        resp_status: int,
         resp_body: dict | None,
         *,
         read_in_full: bool,
@@ -426,7 +430,9 @@ class HookedExchangeMixin(_HandlerBase):
                     }
                     break
         if report.upstream_status is not None:
-            run.cost_micros = exchange_ctx.get("cost_micros")
+            run.cost_micros = run.writer.estimate_cost_micros(
+                run.ctx, resp_status, resp_body
+            )
 
     def _finish_run(self) -> None:
         """Settle the exchange and call ``after_exchange`` exactly once."""

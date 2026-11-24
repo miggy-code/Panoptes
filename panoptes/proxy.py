@@ -52,6 +52,7 @@ from panoptes._events import (  # noqa: F401 — re-exported for callers
     AmbiguousResponseError,
     AuditEventWriter,
     AuditWriteError,
+    ExchangeContext,
     ResponseInspectionError,
     _mark_inspection_failure,
     _parse_provider_response,
@@ -369,10 +370,10 @@ def _safe_upstream_label(scheme: str, host: str, port: int, path: str) -> str:
 def _unpersisted_exchange_events(
     req_events: list[dict],
     resp_events: list[dict],
-    exchange_ctx: dict,
+    request_recorded: bool,
 ) -> list[dict]:
     """Avoid duplicating request events already made durable pre-forward."""
-    if exchange_ctx.get("_request_events_persisted"):
+    if request_recorded:
         return resp_events
     return req_events + resp_events
 
@@ -820,7 +821,6 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
 
     def _serve_request(self, method: str) -> None:
         """Run one proxied request and settle its hooks however it ends."""
-        self._exchange_ctx: dict = {}
         self._run = None
         try:
             self._handle_request(method)
@@ -874,59 +874,54 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
 
         # 3. Build request events
         writer = self.writer
-        req_events: list[dict] = []
-        exchange_ctx: dict = {}
-
-        if writer:
+        assert writer is not None, "ProxyServer configures a writer"
+        request_recorded = False
+        try:
+            req_events, exchange_ctx = writer.build_request_events(
+                path=path,
+                method=method,
+                req_headers=req_headers,
+                req_body=req_body,
+                hook_mode=hooks is not None,
+            )
+        except (ValidationError, SSEParseError, ValueError) as exc:
+            log.warning("Rejected invalid proxy audit context: %s", exc)
+            self._send_json_error(400, "Request metadata cannot be represented safely")
+            return
+        except Exception:
+            # Forwarding would leave the exchange unrecorded, so any input that
+            # broke event construction could pass unseen.
+            log.exception("Request events could not be built")
+            self._send_json_error(500, "The request could not be recorded")
+            return
+        if hooks is not None:
+            run = self._enter_exchange(
+                method=method,
+                path=path,
+                raw_path=raw_path,
+                target=(scheme, host, port),
+                req_headers=req_headers,
+                body=body,
+                req_body=req_body,
+                req_events=req_events,
+                exchange_ctx=exchange_ctx,
+                query_credentials=query_credentials,
+                t0=t0,
+                hooks=hooks,
+                writer=writer,
+            )
+            if not self._run_before_forward(run):
+                return
+            req_events, exchange_ctx = run.events, run.ctx
+            request_recorded = True
+        else:
+            # Make the request intent durable before it leaves the process.
+            # A storage outage is logged; it does not stop the request.
             try:
-                req_events, exchange_ctx = writer.build_request_events(
-                    path=path,
-                    method=method,
-                    req_headers=req_headers,
-                    req_body=req_body,
-                    hook_mode=hooks is not None,
-                )
-                self._exchange_ctx = exchange_ctx
-            except (ValidationError, SSEParseError, ValueError) as exc:
-                log.warning("Rejected invalid proxy audit context: %s", exc)
-                self._send_json_error(
-                    400, "Request metadata cannot be represented safely"
-                )
-                return
-            except Exception:
-                # Forwarding would leave the exchange unrecorded, so any input
-                # that broke event construction could pass unseen.
-                log.exception("Request events could not be built")
-                self._send_json_error(500, "The request could not be recorded")
-                return
-            if hooks is not None:
-                run = self._enter_exchange(
-                    method=method,
-                    path=path,
-                    raw_path=raw_path,
-                    target=(scheme, host, port),
-                    req_headers=req_headers,
-                    body=body,
-                    req_body=req_body,
-                    req_events=req_events,
-                    exchange_ctx=exchange_ctx,
-                    query_credentials=query_credentials,
-                    t0=t0,
-                    hooks=hooks,
-                    writer=writer,
-                )
-                if not self._run_before_forward(run):
-                    return
-                req_events, exchange_ctx = run.events, run.ctx
-                self._exchange_ctx = exchange_ctx
-            elif req_events:
-                # Make the request intent durable before it leaves the process.
-                # A storage outage is logged; it does not stop the request.
-                try:
-                    writer.write(req_events)
-                    exchange_ctx["_request_events_persisted"] = True
-                except AuditWriteError:
-                    log.exception("Request-intent audit could not be persisted")
+                writer.write(req_events)
+                request_recorded = True
+            except AuditWriteError:
+                log.exception("Request-intent audit could not be persisted")
 
         # 4. Forward to upstream (streaming decided by the provider — body
         #    flag for OpenAI/Anthropic, URL path for Gemini)
@@ -946,6 +941,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             req_body=req_body,
             req_events=req_events,
             exchange_ctx=exchange_ctx,
+            request_recorded=request_recorded,
             t0=t0,
         )
 
@@ -961,7 +957,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         body: bytes,
         req_body: dict | None,
         req_events: list[dict],
-        exchange_ctx: dict,
+        exchange_ctx: ExchangeContext,
+        request_recorded: bool,
         t0: float,
     ) -> None:
         """Relay a streamed model response and record it after delivery."""
@@ -1005,13 +1002,10 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
 
         try:
             resp_events = writer.build_response_events(
-                path=path,
-                req_body=req_body,
-                resp_status=resp_status,
-                resp_headers=resp_headers_raw,
-                resp_body=resp_body,
+                exchange_ctx,
+                status=resp_status,
+                body=resp_body,
                 duration_ms=duration_ms,
-                exchange_ctx=exchange_ctx,
             )
             if inspection_error:
                 _mark_inspection_failure(
@@ -1023,13 +1017,13 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             if run is not None:
                 self._note_response(
                     resp_events,
-                    exchange_ctx,
+                    resp_status,
                     resp_body,
                     read_in_full=not audit_truncated,
                     inspection_error=inspection_error,
                 )
             writer.write(
-                _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
+                _unpersisted_exchange_events(req_events, resp_events, request_recorded)
             )
         except ValidationError as exc:
             message = (
@@ -1038,20 +1032,17 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             log.warning("%s: %s", message, exc)
             try:
                 fallback_events = writer.build_response_events(
-                    path=path,
-                    req_body=req_body,
-                    resp_status=resp_status,
-                    resp_headers=resp_headers_raw,
-                    resp_body=None,
+                    exchange_ctx,
+                    status=resp_status,
+                    body=None,
                     duration_ms=duration_ms,
-                    exchange_ctx=exchange_ctx,
                 )
                 _mark_inspection_failure(
                     fallback_events, f"{message}: {exc}", blocked=False
                 )
                 writer.write(
                     _unpersisted_exchange_events(
-                        req_events, fallback_events, exchange_ctx
+                        req_events, fallback_events, request_recorded
                     )
                 )
             except Exception:
@@ -1073,7 +1064,8 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
         body: bytes,
         req_body: dict | None,
         req_events: list[dict],
-        exchange_ctx: dict,
+        exchange_ctx: ExchangeContext,
+        request_recorded: bool,
         t0: float,
     ) -> None:
         """Buffered path: forward the whole reply, record it, then deliver it."""
@@ -1089,13 +1081,10 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             truncated: bool = False,
         ) -> list[dict]:
             events = writer.build_response_events(
-                path=path,
-                req_body=req_body,
-                resp_status=status,
-                resp_headers=headers,
-                resp_body=None,
+                exchange_ctx,
+                status=status,
+                body=None,
                 duration_ms=duration_ms,
-                exchange_ctx=exchange_ctx,
             )
             _mark_inspection_failure(
                 events, message, blocked=blocked, truncated=truncated
@@ -1131,7 +1120,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 try:
                     writer.write(
                         _unpersisted_exchange_events(
-                            req_events, resp_events, exchange_ctx
+                            req_events, resp_events, request_recorded
                         )
                     )
                 except AuditWriteError:
@@ -1194,7 +1183,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 try:
                     writer.write(
                         _unpersisted_exchange_events(
-                            req_events, denial_events, exchange_ctx
+                            req_events, denial_events, request_recorded
                         )
                     )
                 except AuditWriteError:
@@ -1206,13 +1195,10 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
             resp_events = []
             try:
                 resp_events = writer.build_response_events(
-                    path=path,
-                    req_body=req_body,
-                    resp_status=resp_status,
-                    resp_headers=resp_headers_raw,
-                    resp_body=resp_body_parsed,
+                    exchange_ctx,
+                    status=resp_status,
+                    body=resp_body_parsed,
                     duration_ms=duration_ms,
-                    exchange_ctx=exchange_ctx,
                 )
                 if inspection_error:
                     _mark_inspection_failure(
@@ -1222,13 +1208,15 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                 if run is not None:
                     self._note_response(
                         resp_events,
-                        exchange_ctx,
+                        resp_status,
                         resp_body_parsed,
                         read_in_full=True,
                         inspection_error="unparsed" if parse_failed else None,
                     )
                 writer.write(
-                    _unpersisted_exchange_events(req_events, resp_events, exchange_ctx)
+                    _unpersisted_exchange_events(
+                        req_events, resp_events, request_recorded
+                    )
                 )
             except AuditWriteError:
                 log.exception("Response audit could not be persisted")
@@ -1247,7 +1235,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     )
                     writer.write(
                         _unpersisted_exchange_events(
-                            req_events, fallback_events, exchange_ctx
+                            req_events, fallback_events, request_recorded
                         )
                     )
                 except Exception:
@@ -1278,7 +1266,7 @@ class ProxyHandler(HookedExchangeMixin, http.server.BaseHTTPRequestHandler):
                     )
                     writer.write(
                         _unpersisted_exchange_events(
-                            req_events, fallback_events, exchange_ctx
+                            req_events, fallback_events, request_recorded
                         )
                     )
                 except Exception:

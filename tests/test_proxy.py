@@ -119,11 +119,9 @@ def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
 
     with pytest.raises(SSEParseError, match="cross-dialect"):
         writer.build_response_events(
-            path="/v1/chat/completions",
-            req_body=req_body,
-            resp_status=200,
-            resp_headers={},
-            resp_body={
+            exchange_ctx,
+            status=200,
+            body={
                 "object": "response",
                 "output": [
                     {
@@ -134,7 +132,6 @@ def test_proxy_binds_openai_tool_extraction_to_requested_dialect():
                 ],
             },
             duration_ms=20,
-            exchange_ctx=exchange_ctx,
         )
 
 
@@ -319,8 +316,8 @@ def test_proxy_does_not_merge_headerless_requests_into_one_session():
         run_id="run-3",
     )
 
-    assert first["session_id"] != second["session_id"]
-    assert explicit["session_id"] == "session-explicit"
+    assert first.session_id != second.session_id
+    assert explicit.session_id == "session-explicit"
 
 
 def test_proxy_does_not_forward_internal_identity_headers():
@@ -428,7 +425,7 @@ def test_turn_number_in_context():
         run_id=uuid.uuid4().hex,
     )
 
-    assert ctx["turn_number"] == 2, f"Expected turn_number=2, got {ctx['turn_number']}"
+    assert ctx.turn_number == 2
     for e in req_events:
         assert e["context"]["turn_number"] == 2
 
@@ -485,13 +482,7 @@ def test_call_id_on_tool_events():
         run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/chat/completions",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body=resp_body,
-        duration_ms=100,
-        exchange_ctx=ctx,
+        ctx, status=200, body=resp_body, duration_ms=100
     )
 
     tool_results = [e for e in req_events if e["event_type"] == "tool_result"]
@@ -600,11 +591,9 @@ def test_provider_hosted_action_records_upstream_execution_truth():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1/responses",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "object": "response",
             "output": [
                 {
@@ -616,7 +605,6 @@ def test_provider_hosted_action_records_upstream_execution_truth():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -636,11 +624,9 @@ def test_provider_hosted_result_is_redacted_and_bounded():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1/messages",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "content": [
                 {
                     "type": "server_tool_use",
@@ -656,7 +642,6 @@ def test_provider_hosted_result_is_redacted_and_bounded():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -679,11 +664,9 @@ def test_protocols_without_call_ids_remain_valid():
         req_body=req_body,
     )
     events = writer.build_response_events(
-        path="/v1beta/models/gemini-test:generateContent",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body={
+        exchange_ctx,
+        status=200,
+        body={
             "candidates": [
                 {
                     "content": {
@@ -700,7 +683,6 @@ def test_protocols_without_call_ids_remain_valid():
             ],
         },
         duration_ms=20,
-        exchange_ctx=exchange_ctx,
     )
 
     tool_call = next(event for event in events if event["event_type"] == "tool_call")
@@ -1250,6 +1232,7 @@ def test_an_uninspectable_response_is_delivered_and_recorded_as_incomplete(
         req_body=request_body,
         req_events=req_events,
         exchange_ctx=exchange_ctx,
+        request_recorded=False,
         t0=time.monotonic(),
     )
 
@@ -1483,7 +1466,6 @@ def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery():
         req_headers={},
         req_body=req_body,
     )
-    exchange_ctx["_request_events_persisted"] = True
     ambiguous = (
         b'{"object":"response","output":[],'
         b'"output":[{"type":"function_call","name":"hidden",'
@@ -1522,6 +1504,7 @@ def test_buffered_proxy_rejects_duplicate_response_keys_before_delivery():
         req_body=req_body,
         req_events=req_events,
         exchange_ctx=exchange_ctx,
+        request_recorded=True,
         t0=time.monotonic(),
     )
 
@@ -1544,7 +1527,6 @@ def test_response_event_construction_failure_gets_explicit_fallback(monkeypatch)
         req_headers={},
         req_body=req_body,
     )
-    exchange_ctx["_request_events_persisted"] = True
 
     def _fail_extraction(self, resp_body, *, path=None):
         raise RuntimeError("provider extraction exploded")
@@ -1587,6 +1569,7 @@ def test_response_event_construction_failure_gets_explicit_fallback(monkeypatch)
         req_body=req_body,
         req_events=req_events,
         exchange_ctx=exchange_ctx,
+        request_recorded=True,
         t0=time.monotonic(),
     )
 
@@ -1644,13 +1627,7 @@ def test_request_and_response_events_are_written_together():
         run_id=run_id,
     )
     resp_events = writer.build_response_events(
-        path="/v1/messages",
-        req_body=req_body,
-        resp_status=200,
-        resp_headers={},
-        resp_body=resp_body,
-        duration_ms=200,
-        exchange_ctx=ctx,
+        ctx, status=200, body=resp_body, duration_ms=200
     )
     writer.write(req_events + resp_events)
 
