@@ -350,11 +350,13 @@ a smoke test on the installed wheel.
 ```bash
 git clone https://github.com/miggy-code/Panoptes.git
 cd Panoptes
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev,release]"
-python -m pytest -q
+uv sync
+uv run pytest -q
 ```
+
+`uv sync` creates `.venv` and installs the locked dev tools from `uv.lock`.
+Without uv, run `pip install -e ".[proxy,otel]" --group dev` (pip 25.1 or
+newer).
 
 The tests run locally and need no network. A change is ready for review when
 the full suite passes and `git diff --check` is clean. The release process is

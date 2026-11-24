@@ -34,16 +34,6 @@ otel = [
     "opentelemetry-sdk>=1.30,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
 ]
-dev = [
-    "pytest>=8,<9",
-    "httpx>=0.27,<1",
-    "opentelemetry-sdk>=1.30,<2",
-    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
-]
-release = [
-    "build>=1.2,<2",
-    "twine>=6,<7",
-]
 
 [project.urls]
 Homepage = "https://github.com/miggy-code/Panoptes"
@@ -60,3 +50,35 @@ include = ["panoptes*"]
 
 [tool.setuptools.package-data]
 panoptes = ["py.typed"]
+
+[dependency-groups]
+# Contributor tooling (PEP 735). `uv sync` installs `dev` by default; with pip,
+# use `pip install -e ".[proxy,otel]" --group dev` (pip 25.1 or newer).
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<3",
+    "httpx>=0.27,<1",
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+]
+release = [
+    "twine>=6,<7",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]  # the formatter owns line length
+
+[tool.mypy]
+python_version = "3.10"
+files = ["panoptes"]
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*"]
+ignore_missing_imports = true

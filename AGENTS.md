@@ -49,8 +49,8 @@ voice, one idea per sentence.
 ## Tests
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q
+uv sync
+uv run pytest -q
 ```
 
 A change is mergeable only when the full suite passes.

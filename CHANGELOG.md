@@ -17,6 +17,13 @@ All notable changes to Panoptes are recorded here. Releases follow
   `docs/lifecycle-invariants.md`.
 - Remove the internal implementation record.
 
+### Development
+
+- Manage contributor tooling with uv. Dev and release tools are PEP 735
+  dependency groups pinned in `uv.lock`, and CI installs with
+  `uv sync --locked`. The `dev` and `release` extras are removed; users install
+  the package as before.
+
 ## [0.3.0] - 2026-11-06
 
 ### Breaking
