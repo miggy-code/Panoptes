@@ -337,7 +337,7 @@ def cmd_verify(args):
                 f"Cannot read checkpoint {checkpoint_path}: {exc}",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(2) from exc
         result = db.verify_checkpoint(checkpoint)
     else:
         result = db.verify_chain()
@@ -371,12 +371,12 @@ def cmd_export_otel(args):
         )
 
         from panoptes.otel import ExportError, export_events
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as exc:
         print(
             "Install OpenTelemetry output with: pip install 'panoptes-observe[otel]'",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     db = _open_existing_db(args.db_path)
     try:
         filters = {
@@ -555,7 +555,7 @@ def main(argv=None):
                 "pip install 'panoptes-observe[proxy]'",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(2) from exc
 
         pricing = None
         if getattr(args, "pricing", None):
@@ -565,7 +565,7 @@ def main(argv=None):
                 pricing = PricingTable.load(args.pricing)
             except PricingError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
-                raise SystemExit(2)
+                raise SystemExit(2) from exc
 
         start_proxy(
             port=args.port,

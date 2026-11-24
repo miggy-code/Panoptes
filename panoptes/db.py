@@ -314,7 +314,7 @@ def _canonical_payload_from_values(values: tuple) -> dict[str, Any]:
     v5 columns that are unset are left out entirely, which is what makes a
     v5 writer's hash of a field-less event identical to v4's.
     """
-    payload: dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values))
+    payload: dict[str, Any] = dict(zip(_ALL_PAYLOAD_COLUMNS, values, strict=True))
     for column in _EVENT_JSON_COLUMNS:
         payload[column] = json.loads(payload[column])
     for column in _V5_PAYLOAD_COLUMNS:

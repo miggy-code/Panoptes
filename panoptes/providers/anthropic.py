@@ -160,7 +160,7 @@ class AnthropicProvider(Provider):
                     "result_type": block_type,
                 }
 
-        for index, block in enumerate(content):
+        for block in content:
             block_type = block["type"]
             if (
                 block_type in _BENIGN_CONTENT_TYPES
