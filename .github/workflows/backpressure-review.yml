@@ -11,7 +11,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: write
-    uses: miggy-code/backpressure-gent/.github/workflows/review.yml@6b64da1fbcf5ca54de25bc2c4ab400297a076c63
+    uses: miggy-code/backpressure-gent/.github/workflows/review.yml@6245a00b6125cb044ea20f35565b098ef2d46a4c
     with:
       head_sha: ${{ github.event.pull_request.head.sha }}
     secrets:
