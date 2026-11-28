@@ -1,0 +1,19 @@
+name: Backpressure review
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+permissions: {}
+jobs:
+  review:
+    if: ${{ github.event.pull_request.head.repo.id == github.event.repository.id && !github.event.pull_request.draft }}
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: miggy-code/backpressure-gent/.github/workflows/review.yml@6b64da1fbcf5ca54de25bc2c4ab400297a076c63
+    with:
+      head_sha: ${{ github.event.pull_request.head.sha }}
+    secrets:
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      HOLDOUTS_DEPLOY_KEY: ${{ secrets.HOLDOUTS_DEPLOY_KEY }}
